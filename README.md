@@ -1,4 +1,4 @@
-# OrchCaml 🐪🤖
+# OrchCaml
 
 **OrchCaml** is a functional, type-safe LLM orchestration framework for OCaml. It provides a structured way to build, compose, and deploy LLM pipelines with strong compile-time guarantees.
 
