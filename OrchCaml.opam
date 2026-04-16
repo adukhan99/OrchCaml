@@ -5,7 +5,7 @@ description:
   "OrchCaml provides a functional, type-safe interface for composing LLM pipelines with typed message passing, pluggable providers (Ollama, OpenAI-compatible), output parsers, prompt templates, conversation memory, and an interactive TUI."
 maintainer: ["OrchCaml Contributors"]
 authors: ["OrchCaml Contributors"]
-license: "MIT"
+license: "GPL-3.0"
 tags: ["llm" "orchestration" "ai" "langchain" "ollama" "openai"]
 homepage: "https://github.com/adukhan99/OrchCaml"
 bug-reports: "https://github.com/adukhan99/OrchCaml/issues"
