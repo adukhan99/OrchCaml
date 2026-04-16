@@ -143,7 +143,8 @@ module Ollama = struct
                     (wrap_result ~raw_response:full ~model:cfg.model
                        ~provider:"ollama" ?finish_reason:finish full)
                 end
-              with _ -> ())
+              with exn -> 
+                Printf.eprintf "[Ollama Stream Parse Error]: %s\nLine: %s\n%!" (Printexc.to_string exn) line)
             end
           ) lines
         ) body_stream in
@@ -163,15 +164,24 @@ module Ollama = struct
     let open Lwt.Syntax in
     let url = base_url cfg ^ "/api/tags" in
     let uri = Uri.of_string url in
-    let* (_resp, body) = Cohttp_lwt_unix.Client.get uri in
-    let* body_str = Cohttp_lwt.Body.to_string body in
-    let json = Yojson.Safe.from_string body_str in
-    let open Yojson.Safe.Util in
-    let models =
-      json |> member "models" |> to_list
-      |> List.map (fun m -> m |> member "name" |> to_string)
-    in
-    Lwt.return models
+    Lwt.catch
+      (fun () ->
+        let* (resp, body) = Cohttp_lwt_unix.Client.get uri in
+        let status = Cohttp.Response.status resp in
+        let* body_str = Cohttp_lwt.Body.to_string body in
+        if Cohttp.Code.is_success (Cohttp.Code.code_of_status status) then
+          try
+            let json = Yojson.Safe.from_string body_str in
+            let open Yojson.Safe.Util in
+            let models =
+              json |> member "models" |> to_list
+              |> List.map (fun m -> m |> member "name" |> to_string)
+            in
+            Lwt.return models
+          with _ -> Lwt.fail_with "cannot query remote provider"
+        else
+          Lwt.fail_with "cannot query remote provider")
+      (fun _ -> Lwt.fail_with "cannot query remote provider")
 
 end
 

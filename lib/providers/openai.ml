@@ -18,26 +18,31 @@ open OrchCaml.Provider
 let load_api_key_from_env () =
   match Sys.getenv_opt "OPENAI_API_KEY" with
   | Some k when k <> "" -> k
-  | _ ->
-    let config_path =
-      Filename.concat (Sys.getenv "HOME") ".orchcaml/config.toml"
-    in
-    if Sys.file_exists config_path then begin
+  | _ -> 
+    let config_path = Filename.concat (Sys.getenv "HOME") ".orchcaml/config.toml" in
+    if not (Sys.file_exists config_path) then
+      failwith "OPENAI_API_KEY environment variable is not set, and config.toml missing."
+    else
       let ic = open_in config_path in
-      let content = really_input_string ic (in_channel_length ic) in
+      let rec loop () =
+        try
+          let line = String.trim (input_line ic) in
+          if String.starts_with ~prefix:"openai_api_key" line then
+            match String.split_on_char '=' line with
+            | [_; v] ->
+              let v = String.trim v in
+              if String.length v >= 2 && v.[0] = '"' && v.[String.length v - 1] = '"' then
+                String.sub v 1 (String.length v - 2)
+              else loop ()
+            | _ -> loop ()
+          else loop ()
+        with End_of_file ->
+          close_in_noerr ic;
+          failwith "OPENAI_API_KEY not found in env or ~/.orchcaml/config.toml"
+      in
+      let key = loop () in
       close_in ic;
-      let re = Re.compile (Re.seq [
-        Re.str "openai_api_key";
-        Re.rep Re.space; Re.char '='; Re.rep Re.space;
-        Re.char '"';
-        Re.group (Re.rep1 (Re.compl [Re.char '"']));
-        Re.char '"';
-      ]) in
-      match Re.exec_opt re content with
-      | Some m -> Re.Group.get m 1
-      | None   -> failwith "OPENAI_API_KEY not found in env or ~/.orchcaml/config.toml"
-    end else
-      failwith "OPENAI_API_KEY not set. Export it or add openai_api_key = \"...\" to ~/.orchcaml/config.toml"
+      key
 
 (** (* API_KEY_SOURCE: env OPENAI_ORG_ID *) *)
 let load_org_id () = Sys.getenv_opt "OPENAI_ORG_ID"
@@ -188,7 +193,8 @@ module Openai = struct
                      Buffer.add_string buf token;
                      safe_push (Some token)
                    | _ -> ())
-                with _ -> ())
+                with exn -> 
+                  Printf.eprintf "[OpenAI Stream Parse Error]: %s\nData: %s\n%!" (Printexc.to_string exn) data)
               end
             end
           ) lines
@@ -209,15 +215,25 @@ module Openai = struct
     let open Lwt.Syntax in
     let uri  = Uri.of_string (cfg.base_url ^ "/models") in
     let hdrs = Cohttp.Header.of_list (auth_headers cfg) in
-    let* (_resp, body_lwt) = Cohttp_lwt_unix.Client.get ~headers:hdrs uri in
-    let* body_str = Cohttp_lwt.Body.to_string body_lwt in
-    let json = Yojson.Safe.from_string body_str in
-    let open Yojson.Safe.Util in
-    let models =
-      json |> member "data" |> to_list
-      |> List.map (fun m -> m |> member "id" |> to_string)
-    in
-    Lwt.return models
+    Lwt.catch
+      (fun () ->
+        let* (resp, body_lwt) = Cohttp_lwt_unix.Client.get ~headers:hdrs uri in
+        let status = Cohttp.Response.status resp in
+        let* body_str = Cohttp_lwt.Body.to_string body_lwt in
+        if Cohttp.Code.is_success (Cohttp.Code.code_of_status status) then
+          try
+            let json = Yojson.Safe.from_string body_str in
+            let open Yojson.Safe.Util in
+            let models =
+              json |> member "data" |> to_list
+              |> List.map (fun m -> m |> member "id" |> to_string)
+            in
+            Lwt.return models
+          with _ ->
+            Lwt.fail_with "cannot query remote provider"
+        else
+          Lwt.fail_with "cannot query remote provider")
+      (fun _ -> Lwt.fail_with "cannot query remote provider")
 
 end
 

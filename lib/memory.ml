@@ -44,39 +44,38 @@ module Buffer : sig
   val create : ?window:int -> unit -> t
 end = struct
   type t = {
-    mutable messages : chat_message Queue.t;
-    window           : int;
+    system_msgs : chat_message Queue.t;
+    messages    : chat_message Queue.t;
+    window      : int;
   }
 
   let create ?(window = 20) () =
-    { messages = Queue.create (); window }
+    { system_msgs = Queue.create (); messages = Queue.create (); window }
 
   let add mem msg =
-    Queue.push msg mem.messages;
-    (* Trim to window, but always keep system messages. *)
-    while Queue.length mem.messages > mem.window do
-      (* Pop from the front; discard unless it's a system message. *)
-      let oldest = Queue.pop mem.messages in
-      match oldest.role with
-      | System ->
-        (* Re-insert system message at the front — it must always be kept. *)
-        let q = Queue.create () in
-        Queue.push oldest q;
-        Queue.transfer mem.messages q;
-        Queue.transfer q mem.messages
-      | _ -> ()
-    done
+    match msg.role with
+    | System -> Queue.push msg mem.system_msgs
+    | _ ->
+      Queue.push msg mem.messages;
+      while Queue.length mem.messages > mem.window do
+        ignore (Queue.pop mem.messages)
+      done
 
   let get mem =
-    Queue.fold (fun acc m -> acc @ [m]) [] mem.messages
+    let sys = Queue.fold (fun acc m -> m :: acc) [] mem.system_msgs |> List.rev in
+    let msgs = Queue.fold (fun acc m -> m :: acc) [] mem.messages |> List.rev in
+    sys @ msgs
 
   let clear mem =
+    Queue.clear mem.system_msgs;
     Queue.clear mem.messages
 
-  let length mem = Queue.length mem.messages
+  let length mem = Queue.length mem.system_msgs + Queue.length mem.messages
 
   let to_json mem =
-    `List (Queue.fold (fun acc m -> acc @ [chat_message_to_json m]) [] mem.messages)
+    `List (Queue.fold (fun acc m -> (chat_message_to_json m) :: acc) [] mem.system_msgs 
+           @ Queue.fold (fun acc m -> (chat_message_to_json m) :: acc) [] mem.messages 
+           |> List.rev)
 
   let of_json json =
     let msgs = Yojson.Safe.Util.to_list json |> List.map chat_message_of_json in

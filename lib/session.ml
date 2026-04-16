@@ -46,8 +46,10 @@ let create ?(config = fun m -> default_config m) model provider =
 
 (** [set_system sess text] updates the system prompt. *)
 let set_system sess text =
-  sess.cfg <- { sess.cfg with system = Some text };
-  (* Inject a system message at the head of memory on the next turn. *)
+  if String.trim text = "" then
+    sess.cfg <- { sess.cfg with system = None }
+  else
+    sess.cfg <- { sess.cfg with system = Some text };
   ()
 
 (** [clear sess] clears conversation history (not the config). *)

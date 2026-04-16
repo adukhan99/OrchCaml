@@ -48,31 +48,11 @@ let println_ansi s = print_ansi s; print_char '\n'
 
 let print_banner () =
   if is_tty then begin
-    println_ansi (cyan "╔══════════════════════════════════════════════════════════╗");
-    println_ansi (cyan "║  " ^ bold (white "OrchCaml") ^ white "  v0.1  —  Typed LLM Orchestration  " ^ cyan "║");
-    println_ansi (cyan "╚══════════════════════════════════════════════════════════╝");
+    println_ansi (cyan "╔═════════════════════════════════════════════════╗");
+    println_ansi (cyan "║  " ^ bold (white "OrchCaml") ^ white "  v0.1  —  Typed LLM Orchestration     " ^ cyan "║");
+    println_ansi (cyan "╚═════════════════════════════════════════════════╝");
     print_newline ()
   end
-
-(* ────────────────────────────────────────────────────────────────────────────
-   Input ring buffer (arrow-key history)
-   ──────────────────────────────────────────────────────────────────────────── *)
-
-module History = struct
-  let buf : string array = Array.make 500 ""
-  let head = ref 0   (* next write position *)
-  let size = ref 0
-
-  let push s =
-    if s <> "" && ((!size = 0) || buf.((!head + 499) mod 500) <> s) then begin
-      buf.(!head) <- s;
-      head := (!head + 1) mod 500;
-      if !size < 500 then incr size
-    end
-
-  let get i = buf.((!head - 1 - i + 500 * 2) mod 500)
-  let length () = !size
-end
 
 (* ────────────────────────────────────────────────────────────────────────────
    Slash command help
@@ -152,7 +132,7 @@ let handle_slash_command st line =
   match parts with
 
   | ["/quit"] | ["/exit"] | ["/q"] ->
-    println_ansi (dim "\nГодвечер. Goodbye.");
+    println_ansi (dim "\nGoodbye.");
     exit 0
 
   | ["/help"] | ["/?"] ->
@@ -235,13 +215,22 @@ let handle_slash_command st line =
     Lwt.return_unit
 
   | ["/models"] ->
-    let* models = Provider.list_models_packed st.provider in
-    println_ansi (bold (yellow (Printf.sprintf "  Models on %s:" st.provider_name)));
-    List.iter (fun m ->
-      let mark = if m = st.model then green " ✓ " else dim "   " in
-      println_ansi (mark ^ white m)
-    ) models;
-    Lwt.return_unit
+    Lwt.catch
+      (fun () ->
+        let* models = Provider.list_models_packed st.provider in
+        println_ansi (bold (yellow (Printf.sprintf "  Models on %s:" st.provider_name)));
+        List.iter (fun m ->
+          let mark = if m = st.model then green " ✓ " else dim "   " in
+          println_ansi (mark ^ white m)
+        ) models;
+        Lwt.return_unit)
+      (fun exn ->
+        let msg = match exn with
+          | Failure s -> s
+          | _ -> Printexc.to_string exn
+        in
+        println_ansi (red (Printf.sprintf "  Error: %s" msg));
+        Lwt.return_unit)
 
   | ["/provider"] ->
     println_ansi (Printf.sprintf "  %s  %s  %s"
@@ -253,10 +242,10 @@ let handle_slash_command st line =
     (match float_of_string_opt v_str with
      | None -> println_ansi (red "Usage: /temp <float 0.0-2.0>"); Lwt.return_unit
      | Some temp ->
-       (* Rebuild session config with new temperature — sessions are cheap. *)
-       let _new_opts = Types.options ~temperature:temp () in
+       st.session <- Session.create
+         ~config:(fun m -> { (Session.default_config m) with options = { (Session.default_config m).options with temperature = Some temp } })
+         st.model st.provider;
        println_ansi (yellow (Printf.sprintf "  ✓ Temperature → %.2f" temp));
-       (* TODO: propagate to provider config in a future refactor — for now noted *)
        Lwt.return_unit)
 
   | cmd :: _ ->
@@ -282,19 +271,16 @@ let repl st =
   in
   let rec loop () =
     prompt ();
-    let line =
-      try
-        let l = input_line stdin in
-        String.trim l
-      with End_of_file -> "/quit"
+    let* line_opt = Lwt_io.(read_line_opt stdin) in
+    let line = match line_opt with
+      | Some l -> String.trim l
+      | None -> "/quit"
     in
     if line = "" then loop ()
     else if String.length line > 0 && line.[0] = '/' then begin
-      History.push line;
       let* () = handle_slash_command st line in
       loop ()
     end else begin
-      History.push line;
       (* Print assistant label *)
       if is_tty then
         println_ansi (Printf.sprintf "\n%s" (bold (green "Assistant:")));
@@ -313,7 +299,7 @@ let repl st =
    ──────────────────────────────────────────────────────────────────────────── *)
 
 (** [cmd_complete] — single non-interactive completion. *)
-let cmd_complete ~provider_name ~model ~use_openai ~openai_base ~system prompt_text =
+let cmd_complete ~model ~use_openai ~openai_base ~system prompt_text =
   let open Lwt.Syntax in
   let provider =
     if use_openai then make_openai_provider ~base_url:openai_base model
@@ -331,8 +317,7 @@ let cmd_complete ~provider_name ~model ~use_openai ~openai_base ~system prompt_t
       | Lwt_stream.Closed -> Lwt.return_unit
       | exn ->
         Printf.eprintf "[OrchCaml] Error: %s\n%!" (Printexc.to_string exn);
-        Lwt.return_unit);
-  |> (fun t -> ignore provider_name; t)
+        Lwt.return_unit)
 
 (** [cmd_models] — list models for a provider. *)
 let cmd_models ~use_openai ~openai_base ~model () =
@@ -341,11 +326,20 @@ let cmd_models ~use_openai ~openai_base ~model () =
     if use_openai then make_openai_provider ~base_url:openai_base model
     else make_ollama_provider model
   in
-  let* models = Provider.list_models_packed provider in
-  List.iter (fun m ->
-    print_endline (if m = model then "> " ^ m else "  " ^ m)
-  ) models;
-  Lwt.return_unit
+  Lwt.catch
+    (fun () ->
+      let* models = Provider.list_models_packed provider in
+      List.iter (fun m ->
+        print_endline (if m = model then "> " ^ m else "  " ^ m)
+      ) models;
+      Lwt.return_unit)
+    (fun exn ->
+      let msg = match exn with
+        | Failure s -> s
+        | _ -> Printexc.to_string exn
+      in
+      Printf.eprintf "[OrchCaml] Error: %s\n%!" msg;
+      exit 1)
 
 (* ────────────────────────────────────────────────────────────────────────────
    Cmdliner CLI setup
@@ -372,43 +366,43 @@ let system_arg =
   let doc = "System prompt to use for the session or completion." in
   Arg.(value & opt (some string) None & info ["s"; "system"] ~docv:"PROMPT" ~doc)
 
+let run_repl model provider_str openai_base system =
+  let use_openai = provider_str = "openai" in
+  let provider_name = provider_str in
+  let provider =
+    if use_openai then make_openai_provider ~base_url:openai_base model
+    else make_ollama_provider model
+  in
+  let sess = Session.create model provider in
+  (match system with Some s -> Session.set_system sess s | None -> ());
+  let st = {
+    session      = sess;
+    provider_name;
+    model;
+    provider;
+    use_openai;
+    openai_base;
+  } in
+  print_banner ();
+  if is_tty then begin
+    println_ansi (Printf.sprintf "  %s %s  %s %s"
+      (bold (blue "Provider:")) (white provider_name)
+      (bold (blue "Model:"))    (white model));
+    (match system with
+     | Some s -> println_ansi (Printf.sprintf "  %s %s"
+                   (bold (yellow "System:")) (dim s))
+     | None -> ());
+    println_ansi (dim "  Type a message and press Enter. Use /help for commands.");
+    print_newline ()
+  end;
+  (try Lwt_main.run (repl st)
+   with Lwt_stream.Closed -> ())
+
 (* ── Interactive REPL command ── *)
 let repl_cmd =
-  let run model provider_str openai_base system =
-    let use_openai = provider_str = "openai" in
-    let provider_name = provider_str in
-    let provider =
-      if use_openai then make_openai_provider ~base_url:openai_base model
-      else make_ollama_provider model
-    in
-    let sess = Session.create model provider in
-    (match system with Some s -> Session.set_system sess s | None -> ());
-    let st = {
-      session      = sess;
-      provider_name;
-      model;
-      provider;
-      use_openai;
-      openai_base;
-    } in
-    print_banner ();
-    if is_tty then begin
-      println_ansi (Printf.sprintf "  %s %s  %s %s"
-        (bold (blue "Provider:")) (white provider_name)
-        (bold (blue "Model:"))    (white model));
-      (match system with
-       | Some s -> println_ansi (Printf.sprintf "  %s %s"
-                     (bold (yellow "System:")) (dim s))
-       | None -> ());
-      println_ansi (dim "  Type a message and press Enter. Use /help for commands.");
-      print_newline ()
-    end;
-    (try Lwt_main.run (repl st)
-     with Lwt_stream.Closed -> ())
-  in
   let doc = "Start an interactive chat session (default command)." in
   let info = Cmd.info "repl" ~doc in
-  Cmd.v info Term.(const run $ model_arg $ provider_arg $ openai_base_arg $ system_arg)
+  Cmd.v info Term.(const run_repl $ model_arg $ provider_arg $ openai_base_arg $ system_arg)
 
 (* ── Single completion command ── *)
 let complete_cmd =
@@ -419,7 +413,7 @@ let complete_cmd =
   let run model provider_str openai_base system prompt =
     let use_openai = provider_str = "openai" in
     (try Lwt_main.run (cmd_complete
-      ~provider_name:provider_str ~model ~use_openai ~openai_base ~system prompt)
+      ~model ~use_openai ~openai_base ~system prompt)
      with Lwt_stream.Closed -> ())
   in
   let doc = "Send a single prompt and print the response (non-interactive)." in
@@ -464,40 +458,7 @@ let () =
     ]
   in
   (* Default to 'repl' if no subcommand is given *)
-  let default_cmd =
-    let run model provider_str openai_base system =
-      let use_openai = provider_str = "openai" in
-      let provider_name = provider_str in
-      let provider =
-        if use_openai then make_openai_provider ~base_url:openai_base model
-        else make_ollama_provider model
-      in
-      let sess = Session.create model provider in
-      (match system with Some s -> Session.set_system sess s | None -> ());
-      let st = {
-        session      = sess;
-        provider_name;
-        model;
-        provider;
-        use_openai;
-        openai_base;
-      } in
-      print_banner ();
-      if is_tty then begin
-        println_ansi (Printf.sprintf "  %s %s  %s %s"
-          (bold (blue "Provider:")) (white provider_name)
-          (bold (blue "Model:"))    (white model));
-        (match system with
-         | Some s -> println_ansi (Printf.sprintf "  %s %s"
-                       (bold (yellow "System:")) (dim s))
-         | None -> ());
-        println_ansi (dim "  Type a message and press Enter. Use /help for commands.");
-        print_newline ()
-      end;
-      (try Lwt_main.run (repl st)
-       with Lwt_stream.Closed -> ())
-    in
-    Term.(const run $ model_arg $ provider_arg $ openai_base_arg $ system_arg)
+  let default_cmd = Term.(const run_repl $ model_arg $ provider_arg $ openai_base_arg $ system_arg)
   in
   let cmd = Cmd.group ~default:default_cmd info
     [ repl_cmd; complete_cmd; models_cmd ]
