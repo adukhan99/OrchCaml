@@ -3,9 +3,15 @@
     Supports [{{variable}}] interpolation with optional variable schema
     validation. Pure OCaml, no external dependencies. *)
 
-(** A compiled template (the raw string with extracted variable names). *)
+(** An AST node for prompt templates. *)
+type ast_node =
+  | Text of string
+  | Var of string
+
+(** A compiled template with an AST and extracted variable names. *)
 type t = {
   source    : string;
+  ast       : ast_node list;
   variables : string list;
 }
 
@@ -18,14 +24,22 @@ let var_re = Re.compile (Re.seq [
   Re.str "}}";
 ])
 
-(** Parse a template string, extracting the names of all variables. *)
+(** Parse a template string into an AST, extracting the names of all variables. *)
 let of_string source =
+  let ast =
+    Re.split_full var_re source
+    |> List.map (function
+        | `Text t -> Text t
+        | `Delim d ->
+          let var_name = Re.Group.get d 1 in
+          Var var_name
+      )
+  in
   let variables =
-    Re.all var_re source
-    |> List.map (fun m -> Re.Group.get m 1)
+    ast |> List.filter_map (function Var v -> Some v | Text _ -> None)
     |> List.sort_uniq String.compare
   in
-  { source; variables }
+  { source; ast; variables }
 
 (** [render ~vars tmpl] substitutes each [{{key}}] with its value from [vars].
     Raises [Invalid_argument] if a required variable is missing. *)
@@ -35,12 +49,11 @@ let render ~vars tmpl =
   in
   if missing <> [] then
     invalid_arg ("Template: missing variables: " ^ String.concat ", " missing);
-  Re.replace var_re tmpl.source ~f:(fun m ->
-    let key = Re.Group.get m 1 in
-    match List.assoc_opt key vars with
-    | Some v -> v
-    | None   -> "{{" ^ key ^ "}}"   (* unreachable due to check above *)
-  )
+  List.map (function
+    | Text t -> t
+    | Var v -> List.assoc v vars
+  ) tmpl.ast
+  |> String.concat ""
 
 (** [render_string ~vars src] compiles and renders in one step. *)
 let render_string ~vars src = render ~vars (of_string src)

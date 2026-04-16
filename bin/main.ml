@@ -156,13 +156,13 @@ let handle_slash_command st line =
     if text = "" then
       (println_ansi (red "Usage: /system <prompt text>"); Lwt.return_unit)
     else begin
-      Session.set_system st.session text;
+      st.session <- Session.set_system st.session text;
       println_ansi (yellow (Printf.sprintf "  ✓ System prompt set (%d chars)" (String.length text)));
       Lwt.return_unit
     end
 
   | ["/nosystem"] ->
-    Session.set_system st.session "";
+    st.session <- Session.set_system st.session "";
     println_ansi (yellow "  ✓ System prompt cleared");
     Lwt.return_unit
 
@@ -179,7 +179,7 @@ let handle_slash_command st line =
        Lwt.return_unit)
 
   | ["/clear"] ->
-    Session.clear st.session;
+    st.session <- Session.clear st.session;
     println_ansi (yellow "  ✓ History cleared");
     Lwt.return_unit
 
@@ -286,7 +286,8 @@ let repl st =
       if is_tty then
         println_ansi (Printf.sprintf "\n%s" (bold (green "Assistant:")));
       (* Stream response *)
-      let* response = Session.turn_stream st.session line ~on_token in
+      let* (new_sess, response) = Session.turn_stream st.session line ~on_token in
+      st.session <- new_sess;
       if is_tty then print_newline ();
       (* If not a TTY (piped), print the full response after *)
       if not is_tty then print_endline response;
@@ -307,10 +308,10 @@ let cmd_complete ~model ~use_openai ~openai_base ~system prompt_text =
     else make_ollama_provider model
   in
   let sess = Session.create model provider in
-  (match system with Some s -> Session.set_system sess s | None -> ());
+  let sess = match system with Some s -> Session.set_system sess s | None -> sess in
   Lwt.catch
     (fun () ->
-      let* _result = Session.turn_stream sess prompt_text ~on_token in
+      let* (_sess, _result) = Session.turn_stream sess prompt_text ~on_token in
       print_newline ();
       (* Yield briefly so background async task finishes before scheduler exits *)
       Lwt_unix.sleep 0.05)
@@ -379,7 +380,7 @@ let run_repl model provider_str openai_base system =
     else make_ollama_provider model
   in
   let sess = Session.create model provider in
-  (match system with Some s -> Session.set_system sess s | None -> ());
+  let sess = match system with Some s -> Session.set_system sess s | None -> sess in
   let st = {
     session      = sess;
     provider_name;

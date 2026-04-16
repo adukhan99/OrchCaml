@@ -129,25 +129,25 @@ let try_parse (p : 'a Parser.t) : string -> 'a parse_result Lwt.t =
     2. Adds the user's messages and the assistant response to memory.
 
     Input: [chat_message list] (the new user turn).
-    Output: [string] (the assistant response).
+    Output: [(m * string)] (the new memory state and the assistant response).
 *)
 let with_memory
     (type m)
     (module Mem : Memory.MEMORY with type t = m)
     (mem : m)
     (provider : Provider.packed_provider)
-  : chat_message list -> string Lwt.t =
+  : chat_message list -> (m * string) Lwt.t =
   fun new_msgs ->
     let open Lwt.Syntax in
     (* Add new user messages to memory *)
-    List.iter (Mem.add mem) new_msgs;
+    let mem_with_user = List.fold_left Mem.add mem new_msgs in
     (* Build full history *)
-    let history = Mem.get mem in
+    let history = Mem.get mem_with_user in
     (* Call the LLM *)
     let* result = Provider.complete_packed provider history in
     (* Store assistant response *)
-    Mem.add mem (assistant_msg result.value);
-    Lwt.return result.value
+    let final_mem = Mem.add mem_with_user (assistant_msg result.value) in
+    Lwt.return (final_mem, result.value)
 
 (** --- Sequence combinators --- *)
 

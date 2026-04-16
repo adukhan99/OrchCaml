@@ -17,14 +17,14 @@ module type MEMORY = sig
   (** Create a new empty memory store. *)
   val create : unit -> t
 
-  (** Add a message to memory. *)
-  val add : t -> chat_message -> unit
+  (** Add a message to memory. Returns the new state. *)
+  val add : t -> chat_message -> t
 
   (** Retrieve the current message history to prepend to the next LLM call. *)
   val get : t -> chat_message list
 
-  (** Clear all stored messages. *)
-  val clear : t -> unit
+  (** Clear all stored messages. Returns the new state. *)
+  val clear : t -> t
 
   (** Number of messages currently stored. *)
   val length : t -> int
@@ -44,44 +44,43 @@ module Buffer : sig
   val create : ?window:int -> unit -> t
 end = struct
   type t = {
-    system_msgs : chat_message Queue.t;
-    messages    : chat_message Queue.t;
+    system_msgs : chat_message list;
+    messages    : chat_message list;
     window      : int;
+    len         : int;
   }
 
   let create ?(window = 20) () =
-    { system_msgs = Queue.create (); messages = Queue.create (); window }
+    { system_msgs = []; messages = []; window; len = 0 }
 
   let add mem msg =
     match msg.role with
-    | System -> Queue.push msg mem.system_msgs
+    | System -> { mem with system_msgs = msg :: mem.system_msgs }
     | _ ->
-      Queue.push msg mem.messages;
-      while Queue.length mem.messages > mem.window do
-        ignore (Queue.pop mem.messages)
-      done
+      let new_msgs = msg :: mem.messages in
+      let new_len = mem.len + 1 in
+      if new_len > mem.window then
+        { mem with messages = List.rev (List.tl (List.rev new_msgs)); len = mem.len }
+      else
+        { mem with messages = new_msgs; len = new_len }
 
   let get mem =
-    let sys = Queue.fold (fun acc m -> m :: acc) [] mem.system_msgs |> List.rev in
-    let msgs = Queue.fold (fun acc m -> m :: acc) [] mem.messages |> List.rev in
+    let sys = List.rev mem.system_msgs in
+    let msgs = List.rev mem.messages in
     sys @ msgs
 
   let clear mem =
-    Queue.clear mem.system_msgs;
-    Queue.clear mem.messages
+    { mem with system_msgs = []; messages = []; len = 0 }
 
-  let length mem = Queue.length mem.system_msgs + Queue.length mem.messages
+  let length mem = List.length mem.system_msgs + mem.len
 
   let to_json mem =
-    `List (Queue.fold (fun acc m -> (chat_message_to_json m) :: acc) [] mem.system_msgs 
-           @ Queue.fold (fun acc m -> (chat_message_to_json m) :: acc) [] mem.messages 
-           |> List.rev)
+    `List (List.map chat_message_to_json (get mem))
 
   let of_json json =
     let msgs = Yojson.Safe.Util.to_list json |> List.map chat_message_of_json in
     let mem = create () in
-    List.iter (add mem) msgs;
-    mem
+    List.fold_left add mem msgs
 end
 
 (** --- No-op Memory --- *)
@@ -107,7 +106,7 @@ module Summary = struct
   type t = {
     buf          : Buffer.t;
     max_messages : int;
-    mutable summary : string option;
+    summary      : string option;
   }
 
   let create ?(max_messages = 40) () =
@@ -116,7 +115,7 @@ module Summary = struct
       summary = None }
 
   let add mem msg =
-    Buffer.add mem.buf msg
+    { mem with buf = Buffer.add mem.buf msg }
 
   let get mem =
     let msgs = Buffer.get mem.buf in
@@ -128,8 +127,7 @@ module Summary = struct
       sum_msg :: msgs
 
   let clear mem =
-    Buffer.clear mem.buf;
-    mem.summary <- None
+    { mem with buf = Buffer.clear mem.buf; summary = None }
 
   let length mem = Buffer.length mem.buf
 
@@ -147,9 +145,7 @@ module Summary = struct
         Printf.sprintf "[%s]: %s" (role_to_string m.role) m.content) msgs));
     ] in
     let* summary = complete prompt in
-    mem.summary <- Some summary;
-    Buffer.clear mem.buf;
-    Lwt.return_unit
+    Lwt.return { mem with summary = Some summary; buf = Buffer.clear mem.buf }
 
   let to_json mem =
     `Assoc [
@@ -161,12 +157,13 @@ module Summary = struct
 
   let of_json json =
     let open Yojson.Safe.Util in
-    let mem = create () in
     let msgs = json |> member "messages" |> to_list |> List.map chat_message_of_json in
-    List.iter (add mem) msgs;
-    mem.summary <- (match json |> member "summary" with
-                    | `Null     -> None
-                    | `String s -> Some s
-                    | _         -> None);
-    mem
+    let mem = create () in
+    let mem = List.fold_left add mem msgs in
+    let summary = match json |> member "summary" with
+                  | `Null     -> None
+                  | `String s -> Some s
+                  | _         -> None
+    in
+    { mem with summary }
 end

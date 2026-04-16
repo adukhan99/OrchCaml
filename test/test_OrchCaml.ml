@@ -6,10 +6,10 @@ let test_memory_buffer () =
   let m1 = Types.user_msg "Hello!" in
   let m2 = Types.assistant_msg "Hi!" in
   let m3 = Types.user_msg "Next" in
-  Memory.Buffer.add mem s1;
-  Memory.Buffer.add mem m1;
-  Memory.Buffer.add mem m2;
-  Memory.Buffer.add mem m3;
+  let mem = Memory.Buffer.add mem s1 in
+  let mem = Memory.Buffer.add mem m1 in
+  let mem = Memory.Buffer.add mem m2 in
+  let mem = Memory.Buffer.add mem m3 in
   
   let hist = Memory.Buffer.get mem in
   (* Note: we configured window=2, so m1 is expelled but s1 is safely isolated and prepended! *)

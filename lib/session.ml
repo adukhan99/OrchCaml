@@ -27,10 +27,10 @@ let default_config model = {
 
 (** A live session. *)
 type t = {
-  mutable cfg      : config;
-  provider         : Provider.packed_provider;
-  memory           : Memory.Buffer.t;
-  mutable turn_idx : int;
+  cfg      : config;
+  provider : Provider.packed_provider;
+  memory   : Memory.Buffer.t;
+  turn_idx : int;
 }
 
 (** Create a new session. *)
@@ -44,60 +44,61 @@ let create ?(config = fun m -> default_config m) model provider =
     turn_idx = 0;
   }
 
-(** [set_system sess text] updates the system prompt. *)
+(** [set_system sess text] updates the system prompt and returns the new session. *)
 let set_system sess text =
-  if String.trim text = "" then
-    sess.cfg <- { sess.cfg with system = None }
-  else
-    sess.cfg <- { sess.cfg with system = Some text };
-  ()
+  let cfg =
+    if String.trim text = "" then
+      { sess.cfg with system = None }
+    else
+      { sess.cfg with system = Some text }
+  in
+  { sess with cfg }
 
-(** [clear sess] clears conversation history (not the config). *)
+(** [clear sess] clears conversation history (not the config) and returns the new session. *)
 let clear sess =
-  Memory.Buffer.clear sess.memory;
-  sess.turn_idx <- 0
+  { sess with memory = Memory.Buffer.clear sess.memory; turn_idx = 0 }
 
 (** [history sess] returns the current message history. *)
 let history sess = Memory.Buffer.get sess.memory
 
-(** [turn sess user_input] sends a user message and returns the assistant
-    response as a plain string (non-streaming). *)
+(** [turn sess user_input] sends a user message and returns the updated session and 
+    the assistant response as a plain string (non-streaming). *)
 let turn sess user_input =
   let open Lwt.Syntax in
   let user = user_msg user_input in
-  Memory.Buffer.add sess.memory user;
-  let history =
+  let memory_with_user = Memory.Buffer.add sess.memory user in
+  let history_for_llm =
     match sess.cfg.system with
-    | None     -> Memory.Buffer.get sess.memory
+    | None     -> Memory.Buffer.get memory_with_user
     | Some sys ->
       let sm = system_msg sys in
       (* Only add system message if not already at head *)
-      (match Memory.Buffer.get sess.memory with
-       | { role = System; _ } :: _ -> Memory.Buffer.get sess.memory
+      (match Memory.Buffer.get memory_with_user with
+       | { role = System; _ } :: _ -> Memory.Buffer.get memory_with_user
        | rest -> sm :: rest)
   in
-  let* result = Provider.complete_packed sess.provider history in
+  let* result = Provider.complete_packed sess.provider history_for_llm in
   let reply = assistant_msg result.value in
-  Memory.Buffer.add sess.memory reply;
-  sess.turn_idx <- sess.turn_idx + 1;
-  Lwt.return result.value
+  let final_memory = Memory.Buffer.add memory_with_user reply in
+  let new_sess = { sess with memory = final_memory; turn_idx = sess.turn_idx + 1 } in
+  Lwt.return (new_sess, result.value)
 
 (** [turn_stream sess user_input ~on_token] is like [turn] but streams
-    tokens via [on_token] as they arrive. Returns the full response
-    when the stream is exhausted. *)
+    tokens via [on_token] as they arrive. Returns the updated session and 
+    full response when the stream is exhausted. *)
 let turn_stream sess user_input ~on_token =
   let open Lwt.Syntax in
   let user = user_msg user_input in
-  Memory.Buffer.add sess.memory user;
-  let history =
+  let memory_with_user = Memory.Buffer.add sess.memory user in
+  let history_for_llm =
     match sess.cfg.system with
-    | None     -> Memory.Buffer.get sess.memory
+    | None     -> Memory.Buffer.get memory_with_user
     | Some sys ->
-      (match Memory.Buffer.get sess.memory with
-       | { role = System; _ } :: _ -> Memory.Buffer.get sess.memory
+      (match Memory.Buffer.get memory_with_user with
+       | { role = System; _ } :: _ -> Memory.Buffer.get memory_with_user
        | rest -> system_msg sys :: rest)
   in
-  let stream, _meta_promise = Provider.stream_packed sess.provider history in
+  let stream, _meta_promise = Provider.stream_packed sess.provider history_for_llm in
   let buf = Buffer.create 4096 in
   let* () = Lwt_stream.iter (fun token ->
     Buffer.add_string buf token;
@@ -105,9 +106,9 @@ let turn_stream sess user_input ~on_token =
   ) stream in
   let full_response = Buffer.contents buf in
   let reply = assistant_msg full_response in
-  Memory.Buffer.add sess.memory reply;
-  sess.turn_idx <- sess.turn_idx + 1;
-  Lwt.return full_response
+  let final_memory = Memory.Buffer.add memory_with_user reply in
+  let new_sess = { sess with memory = final_memory; turn_idx = sess.turn_idx + 1 } in
+  Lwt.return (new_sess, full_response)
 
 (** Serialise the session history to JSON. *)
 let export_json sess =
