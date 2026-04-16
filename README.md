@@ -91,4 +91,4 @@ Inside the REPL, use these commands to control the session:
 
 ## License
 
-MIT
+GPLv3
