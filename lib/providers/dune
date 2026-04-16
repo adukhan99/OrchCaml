@@ -1,0 +1,11 @@
+(library
+ (name OrchCamlProviders)
+ (libraries
+  OrchCaml
+  lwt
+  lwt.unix
+  cohttp-lwt-unix
+  uri
+  yojson
+  re)
+ (modules Ollama Openai))

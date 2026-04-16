@@ -1,0 +1,20 @@
+(library
+ (name OrchCaml)
+ (libraries
+  unix
+  lwt
+  lwt.unix
+  lwt_ppx
+  cohttp-lwt-unix
+  uri
+  yojson
+  re
+  fmt)
+ (modules
+  Types
+  Provider
+  Template
+  Parser
+  Memory
+  Chain
+  Session))

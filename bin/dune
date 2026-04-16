@@ -1,0 +1,14 @@
+(executable
+ (public_name orchcaml)
+ (name main)
+ (libraries
+  OrchCaml
+  OrchCamlProviders
+  lwt
+  lwt.unix
+  lwt_ppx
+  cmdliner
+  re
+  fmt
+  unix
+  yojson))
