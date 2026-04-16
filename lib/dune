@@ -9,8 +9,10 @@
   uri
   yojson
   re
+  otoml
   fmt)
  (modules
+  Config
   Types
   Provider
   Template

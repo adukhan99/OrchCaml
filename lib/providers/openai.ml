@@ -9,6 +9,7 @@
 
 open OrchCaml.Types
 open OrchCaml.Provider
+open OrchCaml.Config
 
 (* ------------------------------------------------------------------
    API key loading
@@ -16,33 +17,9 @@ open OrchCaml.Provider
    ------------------------------------------------------------------ *)
 
 let load_api_key_from_env () =
-  match Sys.getenv_opt "OPENAI_API_KEY" with
-  | Some k when k <> "" -> k
-  | _ -> 
-    let config_path = Filename.concat (Sys.getenv "HOME") ".orchcaml/config.toml" in
-    if not (Sys.file_exists config_path) then
-      failwith "OPENAI_API_KEY environment variable is not set, and config.toml missing."
-    else
-      let ic = open_in config_path in
-      let rec loop () =
-        try
-          let line = String.trim (input_line ic) in
-          if String.starts_with ~prefix:"openai_api_key" line then
-            match String.split_on_char '=' line with
-            | [_; v] ->
-              let v = String.trim v in
-              if String.length v >= 2 && v.[0] = '"' && v.[String.length v - 1] = '"' then
-                String.sub v 1 (String.length v - 2)
-              else loop ()
-            | _ -> loop ()
-          else loop ()
-        with End_of_file ->
-          close_in_noerr ic;
-          failwith "OPENAI_API_KEY not found in env or ~/.orchcaml/config.toml"
-      in
-      let key = loop () in
-      close_in ic;
-      key
+  match get_string_opt (Some "OPENAI_API_KEY") "openai_api_key" with
+  | Some k -> k
+  | None -> failwith "OPENAI_API_KEY not found in env or ~/.orchcaml/config.toml"
 
 (** (* API_KEY_SOURCE: env OPENAI_ORG_ID *) *)
 let load_org_id () = Sys.getenv_opt "OPENAI_ORG_ID"

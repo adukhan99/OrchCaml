@@ -13,6 +13,7 @@
 
 open OrchCaml
 open OrchCaml.Types
+open OrchCaml.Config
 
 (* ────────────────────────────────────────────────────────────────────────────
    ANSI colour helpers
@@ -350,21 +351,25 @@ open Cmdliner
 let model_arg =
   let doc = "Model name to use. For Ollama: the model tag (e.g. llama3.2, gpt-oss:20b). \
              For OpenAI: the model ID (e.g. gpt-4o)." in
-  Arg.(value & opt string "gpt-oss:20b" & info ["m"; "model"] ~docv:"MODEL" ~doc)
+  let default = match get_string "model" with Some v -> v | None -> "gpt-oss:20b" in
+  Arg.(value & opt string default & info ["m"; "model"] ~docv:"MODEL" ~doc)
 
 let provider_arg =
   let doc = "Provider to use: 'ollama' (default, local) or 'openai'." in
-  Arg.(value & opt string "ollama" & info ["p"; "provider"] ~docv:"PROVIDER" ~doc)
+  let default = match get_string "provider" with Some v -> v | None -> "ollama" in
+  Arg.(value & opt string default & info ["p"; "provider"] ~docv:"PROVIDER" ~doc)
 
 let openai_base_arg =
   let doc = "Base URL for OpenAI-compatible API. Default: https://api.openai.com/v1. \
              Override for Groq, Together, local proxies, etc." in
-  Arg.(value & opt string "https://api.openai.com/v1"
+  let default = match get_string "base_url" with Some v -> v | None -> "https://api.openai.com/v1" in
+  Arg.(value & opt string default
        & info ["base-url"] ~docv:"URL" ~doc)
 
 let system_arg =
   let doc = "System prompt to use for the session or completion." in
-  Arg.(value & opt (some string) None & info ["s"; "system"] ~docv:"PROMPT" ~doc)
+  let default = get_string "system" in
+  Arg.(value & opt (some string) default & info ["s"; "system"] ~docv:"PROMPT" ~doc)
 
 let run_repl model provider_str openai_base system =
   let use_openai = provider_str = "openai" in
@@ -455,6 +460,8 @@ let () =
       `Pre "  orchcaml models";
       `P "Use OpenAI:";
       `Pre "  OPENAI_API_KEY=sk-... orchcaml --provider openai --model gpt-4o";
+      `P "Use a generic OpenAI-compatible API (e.g. OpenRouter):";
+      `Pre "  OPENAI_API_KEY=sk-... orchcaml --provider openai --base-url https://openrouter.ai/api/v1 --model meta-llama/llama-3-8b-instruct";
     ]
   in
   (* Default to 'repl' if no subcommand is given *)

@@ -37,6 +37,8 @@
   (fmt
    (>= 0.9))
   (re
-   (>= 1.10)))
+   (>= 1.10))
+  (otoml
+   (>= 1.0)))
  (tags
   ("llm" "orchestration" "ai" "langchain" "ollama" "openai")))
