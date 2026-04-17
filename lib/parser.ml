@@ -1,7 +1,7 @@
 (** OrchCaml.Parser — Typed output parsers for LLM responses.
 
     Each parser is a function [string -> ('a, string) result].
-    Parsers compose with [and_then] and [map]. *)
+    Parsers compose with [and_then], [map], and the applicative [<*>]. *)
 
 (** The result of a parser: either a value or an error message. *)
 type 'a parse_result = ('a, string) result
@@ -9,7 +9,7 @@ type 'a parse_result = ('a, string) result
 (** A parser is simply a function from string to a typed result. *)
 type 'a t = string -> 'a parse_result
 
-(** --- Combinators --- *)
+(** --- Monad / Functor combinators --- *)
 
 let map f p s = Result.map f (p s)
 
@@ -27,6 +27,46 @@ let fail msg _s = Error msg
 let or_else p1 p2 s = match p1 s with
   | Ok _ as ok -> ok
   | Error _    -> p2 s
+
+(** --- Applicative --- *)
+
+(** [ap pf pa] applies a parser of functions to a parser of values,
+    both fed the *same* input string.  This is the standard Applicative
+    [<*>] for the [(string ->) Result] functor.
+
+    Example:
+    {[
+      (* Build a record from two JSON fields in one expression *)
+      let make_point x y = {x; y} in
+      let point_parser =
+        Parser.return make_point
+        <*> Parser.json_string_field "x" >|= float_of_string
+        <*> Parser.json_string_field "y" >|= float_of_string
+      in
+    ]}
+
+    Note: both parsers receive the full original string, so [<*>] is
+    most useful when each sub-parser extracts an independent piece of
+    information from the same response (e.g. different JSON fields).
+*)
+let ap pf pa s =
+  match pf s with
+  | Error e -> Error e
+  | Ok f    ->
+    match pa s with
+    | Error e -> Error e
+    | Ok a    -> Ok (f a)
+
+let (<*>) = ap
+
+(** [product pa pb] runs both parsers and collects their results as a pair. *)
+let product pa pb s =
+  match pa s with
+  | Error e -> Error e
+  | Ok a    ->
+    match pb s with
+    | Error e -> Error e
+    | Ok b    -> Ok (a, b)
 
 (** --- Base parsers --- *)
 

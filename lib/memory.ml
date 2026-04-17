@@ -38,39 +38,62 @@ end
 
 (** --- Buffer Memory --- *)
 
-(** Keeps the system prompt (if any) plus the [window] most recent turns. *)
+(** Purely functional deque — two-list representation.
+    - [front]: oldest messages, in order oldest→newest.
+    - [rear] : newest messages, in *reverse* order newest→oldest.
+    Invariant: [List.length rear <= List.length front + 1] (loose).
+    [add] is O(1) amortised; [get] is O(n) but allocation-free. *)
+
+(** Keeps the system prompt (if any) plus the [window] most recent turns.
+
+    Uses a functional deque so [add] is O(1) amortised and no intermediate 
+    lists are allocated on every insertion. *)
 module Buffer : sig
   include MEMORY
   val create : ?window:int -> unit -> t
 end = struct
+  (** [front] is oldest→newest; [rear] is newest→oldest (reversed). *)
   type t = {
-    system_msgs : chat_message list;
-    messages    : chat_message list;
+    system_msgs : chat_message list;  (** stored oldest→newest *)
+    front       : chat_message list;
+    rear        : chat_message list;
     window      : int;
-    len         : int;
+    len         : int;                (** = length front + length rear *)
   }
 
   let create ?(window = 20) () =
-    { system_msgs = []; messages = []; window; len = 0 }
+    { system_msgs = []; front = []; rear = []; window; len = 0 }
+
+  (** Rebalance when [rear] is longer than [front]: reverse [rear] onto [front]. *)
+  let rebalance dq =
+    match dq.front with
+    | [] -> { dq with front = List.rev dq.rear; rear = [] }
+    | _  -> dq
+
+  (** Drop the oldest message (the head of [front]).  Caller must ensure
+      [len > 0]. *)
+  let drop_oldest dq =
+    let dq = rebalance dq in
+    match dq.front with
+    | []     -> dq   (* should not happen if len > 0 *)
+    | _ :: t -> rebalance { dq with front = t; len = dq.len - 1 }
 
   let add mem msg =
     match msg.role with
-    | System -> { mem with system_msgs = msg :: mem.system_msgs }
+    | System -> { mem with system_msgs = mem.system_msgs @ [msg] }
     | _ ->
-      let new_msgs = msg :: mem.messages in
-      let new_len = mem.len + 1 in
-      if new_len > mem.window then
-        { mem with messages = List.rev (List.tl (List.rev new_msgs)); len = mem.len }
-      else
-        { mem with messages = new_msgs; len = new_len }
+      (* Append to rear (O(1)). *)
+      let dq = { mem with rear = msg :: mem.rear; len = mem.len + 1 } in
+      (* Trim to window. *)
+      if dq.len > dq.window then drop_oldest dq
+      else dq
 
+  (** Reconstruct ordered history: front @ rev(rear) = oldest→newest. *)
   let get mem =
-    let sys = List.rev mem.system_msgs in
-    let msgs = List.rev mem.messages in
-    sys @ msgs
+    mem.system_msgs @ mem.front @ List.rev mem.rear
 
   let clear mem =
-    { mem with system_msgs = []; messages = []; len = 0 }
+    { mem with system_msgs = []; front = []; rear = []; len = 0 }
 
   let length mem = List.length mem.system_msgs + mem.len
 
