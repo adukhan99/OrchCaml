@@ -1,0 +1,8 @@
+(library
+ (name OrchCamlTools)
+ (libraries
+  OrchCaml
+  unix
+  yojson
+  re)
+ (modules Read_file Write_file Sed Grep Mkdir Touch))

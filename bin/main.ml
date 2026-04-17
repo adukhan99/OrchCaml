@@ -59,6 +59,35 @@ let print_banner () =
    Slash command help
    ──────────────────────────────────────────────────────────────────────────── *)
 
+let get_available_tools () =
+  let tools_dir = "lib/tools" in
+  if Sys.file_exists tools_dir && Sys.is_directory tools_dir then
+    let files = Array.to_list (Sys.readdir tools_dir) in
+    let ml_files = List.filter (fun f -> Filename.check_suffix f ".ml") files in
+    let desc_re = Re.compile (Re.seq [
+      Re.str "let description"; Re.rep Re.space; Re.char '='; Re.rep Re.space;
+      Re.char '"'; Re.group (Re.rep (Re.compl [Re.char '"'])); Re.char '"'
+    ]) in
+    List.map (fun f ->
+      let path = Filename.concat tools_dir f in
+      let name = Filename.chop_suffix f ".ml" in
+      let desc =
+        try
+          let ic = open_in path in
+          let rec loop () =
+            let line = input_line ic in
+            match Re.exec_opt desc_re line with
+            | Some g -> Re.Group.get g 1
+            | None -> loop ()
+          in
+          let d = loop () in
+          close_in ic; d
+        with _ -> "No description available"
+      in
+      (name, desc)
+    ) ml_files
+  else []
+
 let print_help () =
   println_ansi (bold (yellow " Slash Commands:"));
   let cmds = [
@@ -70,6 +99,7 @@ let print_help () =
     "/history",         "Print conversation history";
     "/export [file]",   "Export session JSON to stdout or file";
     "/models",          "List available models";
+    "/tools",           "List available tools";
     "/provider",        "Show current provider info";
     "/temp <0.0-2.0>",  "Set temperature";
     "/help",            "Show this help";
@@ -232,6 +262,20 @@ let handle_slash_command st line =
         in
         println_ansi (red (Printf.sprintf "  Error: %s" msg));
         Lwt.return_unit)
+
+  | ["/tools"] ->
+    let tools = get_available_tools () in
+    if tools = [] then
+      println_ansi (yellow "  No tools found loosely in lib/tools/")
+    else begin
+      println_ansi (bold (yellow "  Available Tools:"));
+      List.iter (fun (name, desc) ->
+        println_ansi (Printf.sprintf "  %s  %s" 
+          (cyan (Printf.sprintf "%-15s" name))
+          (dim desc))
+      ) tools
+    end;
+    Lwt.return_unit
 
   | ["/provider"] ->
     println_ansi (Printf.sprintf "  %s  %s  %s"

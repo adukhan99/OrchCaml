@@ -31,3 +31,11 @@ module type TOOL = sig
       Typically this will construct the `Exec` effect and perform it. *)
   val execute : input -> output
 end
+
+(** A packed (existential) tool — lets you store tools of different
+    input/output types in the same data structure. *)
+type packed_tool =
+  | Tool : (module TOOL with type input = 'i and type output = 'o) -> packed_tool
+
+let name_of_packed (Tool (module T)) = T.name
+let description_of_packed (Tool (module T)) = T.description

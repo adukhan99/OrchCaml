@@ -4,6 +4,7 @@
  (libraries
   OrchCaml
   OrchCamlProviders
+  OrchCamlTools
   lwt
   lwt.unix
   lwt_ppx
