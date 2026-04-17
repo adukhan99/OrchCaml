@@ -69,15 +69,29 @@ let msg_to_openai_json msg =
     ("content", `String msg.content);
   ]
 
-let make_body cfg msgs ~stream =
-  `Assoc (List.concat [
+let make_body cfg ?tools msgs ~stream =
+  let base_fields = List.concat [
     [
       ("model",    `String cfg.model);
       ("messages", `List (List.map msg_to_openai_json msgs));
       ("stream",   `Bool stream);
     ];
     options_to_json_fields cfg.options;
-  ])
+  ] in
+  match tools with
+  | None | Some [] -> `Assoc base_fields
+  | Some ts ->
+      let tools_json = `List (List.map (fun t ->
+        `Assoc [
+          ("type", `String "function");
+          ("function", `Assoc [
+            ("name", `String (OrchCaml.Tool.name_of_packed t));
+            ("description", `String (OrchCaml.Tool.description_of_packed t));
+            ("parameters", OrchCaml.Tool.schema_of_packed t);
+          ])
+        ]) ts)
+      in
+      `Assoc (("tools", tools_json) :: base_fields)
 
 let auth_headers cfg =
   let h = [
@@ -91,10 +105,30 @@ let auth_headers cfg =
 let parse_complete_response body_str model =
   let json = Yojson.Safe.from_string body_str in
   let open Yojson.Safe.Util in
-  let choice  = json |> member "choices" |> index 0 in
-  let content = choice |> member "message" |> member "content" |> to_string in
-  let finish  = choice |> member "finish_reason" |> to_string_option in
-  wrap_result ~raw_response:body_str ~model ~provider:"openai" ?finish_reason:finish content
+  let choice = json |> member "choices" |> index 0 in
+  let msg_json = choice |> member "message" in
+  let content =
+    match msg_json |> member "content" with
+    | `String s -> s
+    | `Null -> ""
+    | s -> to_string s
+  in
+  let finish = choice |> member "finish_reason" |> to_string_option in
+  let tool_calls =
+    match msg_json |> member "tool_calls" with
+    | `Null -> None
+    | `List l ->
+      Some (List.map (fun tc ->
+        let id = tc |> member "id" |> to_string in
+        let func = tc |> member "function" in
+        let name = func |> member "name" |> to_string in
+        let args = func |> member "arguments" |> to_string in
+        { id; name; args }
+      ) l)
+    | _ -> None
+  in
+  let reply_msg = OrchCaml.Types.make_message ?tool_calls Assistant content in
+  wrap_result ~raw_response:body_str ~model ~provider:"openai" ?finish_reason:finish reply_msg
 
 (* ------------------------------------------------------------------
    PROVIDER module
@@ -105,12 +139,12 @@ module Openai = struct
 
   let name = "openai"
 
-  let complete cfg msgs =
+  let complete cfg ?tools msgs =
     let open Lwt.Syntax in
     let uri  = Uri.of_string (cfg.base_url ^ "/chat/completions") in
     let hdrs = Cohttp.Header.of_list (auth_headers cfg) in
     let body = Cohttp_lwt.Body.of_string
-      (Yojson.Safe.to_string (make_body cfg msgs ~stream:false)) in
+      (Yojson.Safe.to_string (make_body cfg ?tools msgs ~stream:false)) in
     let* (resp, body_lwt) = Cohttp_lwt_unix.Client.post ~headers:hdrs ~body uri in
     let status = Cohttp.Response.status resp in
     let* body_str = Cohttp_lwt.Body.to_string body_lwt in
@@ -120,11 +154,11 @@ module Openai = struct
       Lwt.fail_with (Printf.sprintf "OpenAI error %s: %s"
         (Cohttp.Code.string_of_status status) body_str)
 
-  let stream cfg msgs =
+  let stream cfg ?tools msgs =
     let uri      = Uri.of_string (cfg.base_url ^ "/chat/completions") in
     let hdrs     = Cohttp.Header.of_list
       (("Accept", "text/event-stream") :: auth_headers cfg) in
-    let body_str = Yojson.Safe.to_string (make_body cfg msgs ~stream:true) in
+    let body_str = Yojson.Safe.to_string (make_body cfg ?tools msgs ~stream:true) in
     let token_stream, token_push = Lwt_stream.create () in
     let safe_push v = try token_push v with Lwt_stream.Closed -> () in
     let meta_promise, meta_resolver = Lwt.wait () in
@@ -153,10 +187,10 @@ module Openai = struct
               let data = String.sub line 6 (String.length line - 6) in
               if data = "[DONE]" then begin
                 safe_push None;
-                let full = Buffer.contents buf in
-                Lwt.wakeup meta_resolver
-                  (wrap_result ~raw_response:full ~model:cfg.model
-                     ~provider:"openai" full)
+                  let full = Buffer.contents buf in
+                  Lwt.wakeup meta_resolver
+                    (wrap_result ~raw_response:full ~model:cfg.model
+                       ~provider:"openai" (OrchCaml.Types.assistant_msg full))
               end else begin
                 (try
                   let json = Yojson.Safe.from_string data in
@@ -181,7 +215,7 @@ module Openai = struct
           Lwt.wakeup meta_resolver
             (wrap_result ~raw_response:(Buffer.contents buf)
                ~model:cfg.model ~provider:"openai"
-               (Buffer.contents buf)));
+               (OrchCaml.Types.assistant_msg (Buffer.contents buf))));
         Lwt.return_unit
       end
     in

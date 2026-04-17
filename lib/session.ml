@@ -31,10 +31,11 @@ type t = {
   provider : Provider.packed_provider;
   memory   : Memory.Buffer.t;
   turn_idx : int;
+  tools    : Tool.packed_tool list;
 }
 
 (** Create a new session. *)
-let create ?(config = fun m -> default_config m) model provider =
+let create ?(config = fun m -> default_config m) ?(tools=[]) model provider =
   let cfg = config model in
   let window = if cfg.memory_size = 0 then max_int else cfg.memory_size in
   {
@@ -42,6 +43,7 @@ let create ?(config = fun m -> default_config m) model provider =
     provider;
     memory = Memory.Buffer.create ~window ();
     turn_idx = 0;
+    tools;
   }
 
 (** [set_system sess text] updates the system prompt and returns the new session. *)
@@ -61,54 +63,86 @@ let clear sess =
 (** [history sess] returns the current message history. *)
 let history sess = Memory.Buffer.get sess.memory
 
+let rec run_conversations sess =
+  let open Lwt.Syntax in
+  let history_for_llm =
+    match sess.cfg.system with
+    | None     -> Memory.Buffer.get sess.memory
+    | Some sys ->
+      let sm = system_msg sys in
+      (match Memory.Buffer.get sess.memory with
+       | { role = System; _ } :: _ -> Memory.Buffer.get sess.memory
+       | rest -> sm :: rest)
+  in
+  let* result = Provider.complete_packed ~tools:sess.tools sess.provider history_for_llm in
+  let reply = result.value in
+  let final_memory = Memory.Buffer.add sess.memory reply in
+  let new_sess = { sess with memory = final_memory; turn_idx = sess.turn_idx + 1 } in
+  match reply.tool_calls with
+  | Some tcs when tcs <> [] ->
+      let* tool_responses = 
+        Lwt_list.map_s (fun tc ->
+          match List.find_opt (fun t -> Tool.name_of_packed t = tc.name) sess.tools with
+          | None -> Lwt.return (tool_msg tc.id (Printf.sprintf "Tool %s not found" tc.name))
+          | Some packed ->
+              let* output_str = Tool.dispatch packed tc.args in
+              Lwt.return (tool_msg tc.id output_str)
+        ) tcs
+      in
+      let memory_with_tools = List.fold_left Memory.Buffer.add new_sess.memory tool_responses in
+      let sess_with_tools = { new_sess with memory = memory_with_tools } in
+      run_conversations sess_with_tools
+  | _ ->
+      Lwt.return (new_sess, reply.content)
+
 (** [turn sess user_input] sends a user message and returns the updated session and 
     the assistant response as a plain string (non-streaming). *)
 let turn sess user_input =
-  let open Lwt.Syntax in
   let user = user_msg user_input in
-  let memory_with_user = Memory.Buffer.add sess.memory user in
+  let sess' = { sess with memory = Memory.Buffer.add sess.memory user } in
+  run_conversations sess'
+
+let rec run_conversations_stream sess ~on_token =
+  let open Lwt.Syntax in
   let history_for_llm =
     match sess.cfg.system with
-    | None     -> Memory.Buffer.get memory_with_user
+    | None     -> Memory.Buffer.get sess.memory
     | Some sys ->
       let sm = system_msg sys in
-      (* Only add system message if not already at head *)
-      (match Memory.Buffer.get memory_with_user with
-       | { role = System; _ } :: _ -> Memory.Buffer.get memory_with_user
+      (match Memory.Buffer.get sess.memory with
+       | { role = System; _ } :: _ -> Memory.Buffer.get sess.memory
        | rest -> sm :: rest)
   in
-  let* result = Provider.complete_packed sess.provider history_for_llm in
-  let reply = assistant_msg result.value in
-  let final_memory = Memory.Buffer.add memory_with_user reply in
+  let stream, meta_promise = Provider.stream_packed ~tools:sess.tools sess.provider history_for_llm in
+  let* () = Lwt_stream.iter (fun token -> on_token token) stream in
+  let* result_with_meta = meta_promise in
+  let reply = result_with_meta.value in
+  let final_memory = Memory.Buffer.add sess.memory reply in
   let new_sess = { sess with memory = final_memory; turn_idx = sess.turn_idx + 1 } in
-  Lwt.return (new_sess, result.value)
+  match reply.tool_calls with
+  | Some tcs when tcs <> [] ->
+      let* tool_responses = 
+        Lwt_list.map_s (fun tc ->
+          match List.find_opt (fun t -> Tool.name_of_packed t = tc.name) sess.tools with
+          | None -> Lwt.return (tool_msg tc.id (Printf.sprintf "Tool %s not found" tc.name))
+          | Some packed ->
+              let* output_str = Tool.dispatch packed tc.args in
+              Lwt.return (tool_msg tc.id output_str)
+        ) tcs
+      in
+      let memory_with_tools = List.fold_left Memory.Buffer.add new_sess.memory tool_responses in
+      let sess_with_tools = { new_sess with memory = memory_with_tools } in
+      run_conversations_stream sess_with_tools ~on_token
+  | _ ->
+      Lwt.return (new_sess, reply.content)
 
 (** [turn_stream sess user_input ~on_token] is like [turn] but streams
     tokens via [on_token] as they arrive. Returns the updated session and 
     full response when the stream is exhausted. *)
 let turn_stream sess user_input ~on_token =
-  let open Lwt.Syntax in
   let user = user_msg user_input in
-  let memory_with_user = Memory.Buffer.add sess.memory user in
-  let history_for_llm =
-    match sess.cfg.system with
-    | None     -> Memory.Buffer.get memory_with_user
-    | Some sys ->
-      (match Memory.Buffer.get memory_with_user with
-       | { role = System; _ } :: _ -> Memory.Buffer.get memory_with_user
-       | rest -> system_msg sys :: rest)
-  in
-  let stream, _meta_promise = Provider.stream_packed sess.provider history_for_llm in
-  let buf = Buffer.create 4096 in
-  let* () = Lwt_stream.iter (fun token ->
-    Buffer.add_string buf token;
-    on_token token
-  ) stream in
-  let full_response = Buffer.contents buf in
-  let reply = assistant_msg full_response in
-  let final_memory = Memory.Buffer.add memory_with_user reply in
-  let new_sess = { sess with memory = final_memory; turn_idx = sess.turn_idx + 1 } in
-  Lwt.return (new_sess, full_response)
+  let sess' = { sess with memory = Memory.Buffer.add sess.memory user } in
+  run_conversations_stream sess' ~on_token
 
 (** Serialise the session history to JSON. *)
 let export_json sess =

@@ -32,6 +32,18 @@ module Sed : Tool.TOOL with type input = sed_input and type output = (unit, stri
       "required", `List [`String "path"; `String "pattern"; `String "replacement"]
     ]
 
+  let parse_args json =
+    let open Yojson.Safe.Util in
+    try
+      Ok {
+        path = json |> member "path" |> to_string;
+        pattern = json |> member "pattern" |> to_string;
+        replacement = json |> member "replacement" |> to_string;
+      }
+    with Type_error (s, _) -> Error s
+
+  let format_output = function Ok () -> "Replaced occurrences successfully." | Error e -> e
+
   type _ Effect.t += Exec : input -> output Effect.t
 
   let execute { path; pattern; replacement } =

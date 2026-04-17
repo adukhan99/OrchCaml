@@ -22,6 +22,12 @@ module type TOOL = sig
   (** Generates the JSON Schema describing the inputs for LLM discovery. *)
   val json_schema : unit -> Yojson.Safe.t
 
+  (** Parses the JSON arguments into the tool's input type. *)
+  val parse_args : Yojson.Safe.t -> (input, string) result
+
+  (** Formats the output of the tool into a string for the LLM. *)
+  val format_output : output -> string
+
   (** The effect that represents execution of this tool.
       By tracking this as an effect, handlers can manage logging, retries,
       or mocks around tool execution without polluting the business logic. *)
@@ -39,3 +45,25 @@ type packed_tool =
 
 let name_of_packed (Tool (module T)) = T.name
 let description_of_packed (Tool (module T)) = T.description
+let schema_of_packed (Tool (module T)) = T.json_schema ()
+
+let dispatch (Tool (module T)) (args_json : string) : string Lwt.t =
+  let json =
+    try Yojson.Safe.from_string args_json
+    with _ -> `Null
+  in
+  match T.parse_args json with
+  | Error err -> Lwt.return (Printf.sprintf "Error parsing arguments: %s" err)
+  | Ok input ->
+      let output =
+        Effect.Deep.try_with
+          (fun () -> Effect.perform (T.Exec input))
+          ()
+          { effc = fun (type a) (eff : a Effect.t) ->
+              match eff with
+              | T.Exec i -> Some (fun (k : (a, _) Effect.Deep.continuation) ->
+                  Effect.Deep.continue k (T.execute i))
+              | _ -> None
+          }
+      in
+      Lwt.return (T.format_output output)

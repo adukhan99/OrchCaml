@@ -135,6 +135,15 @@ type repl_state = {
   mutable openai_base : string;
 }
 
+let all_tools : OrchCaml.Tool.packed_tool list = [
+  Tool (module OrchCamlTools.Grep.Grep);
+  Tool (module OrchCamlTools.Mkdir.Mkdir);
+  Tool (module OrchCamlTools.Read_file.Read_file);
+  Tool (module OrchCamlTools.Sed.Sed);
+  Tool (module OrchCamlTools.Touch.Touch);
+  Tool (module OrchCamlTools.Write_file.Write_file);
+]
+
 let rebuild_session st =
   let provider =
     if st.use_openai then
@@ -143,7 +152,7 @@ let rebuild_session st =
       make_ollama_provider st.model
   in
   st.provider <- provider;
-  st.session  <- Session.create st.model provider
+  st.session  <- Session.create ~tools:all_tools st.model provider
 
 (* ────────────────────────────────────────────────────────────────────────────
    Token streaming callback — prints with colour, no newline
@@ -201,7 +210,7 @@ let handle_slash_command st line =
      | None   -> println_ansi (red "Usage: /memory <n>  (integer)"); Lwt.return_unit
      | Some n ->
        let window = if n = 0 then max_int else n in
-       st.session <- Session.create
+       st.session <- Session.create ~tools:all_tools
          ~config:(fun m -> { (Session.default_config m) with memory_size = window })
          st.model st.provider;
        println_ansi (yellow (Printf.sprintf "  ✓ Memory window → %s"
@@ -287,7 +296,7 @@ let handle_slash_command st line =
     (match float_of_string_opt v_str with
      | None -> println_ansi (red "Usage: /temp <float 0.0-2.0>"); Lwt.return_unit
      | Some temp ->
-       st.session <- Session.create
+       st.session <- Session.create ~tools:all_tools
          ~config:(fun m -> { (Session.default_config m) with options = { (Session.default_config m).options with temperature = Some temp } })
          st.model st.provider;
        println_ansi (yellow (Printf.sprintf "  ✓ Temperature → %.2f" temp));
@@ -351,7 +360,7 @@ let cmd_complete ~model ~use_openai ~openai_base ~system prompt_text =
     if use_openai then make_openai_provider ~base_url:openai_base model
     else make_ollama_provider model
   in
-  let sess = Session.create model provider in
+  let sess = Session.create ~tools:all_tools model provider in
   let sess = match system with Some s -> Session.set_system sess s | None -> sess in
   Lwt.catch
     (fun () ->
@@ -423,7 +432,7 @@ let run_repl model provider_str openai_base system =
     if use_openai then make_openai_provider ~base_url:openai_base model
     else make_ollama_provider model
   in
-  let sess = Session.create model provider in
+  let sess = Session.create ~tools:all_tools model provider in
   let sess = match system with Some s -> Session.set_system sess s | None -> sess in
   let st = {
     session      = sess;

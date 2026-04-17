@@ -21,42 +21,94 @@ let role_of_string = function
   | "system"    -> System
   | "user"      -> User
   | "assistant" -> Assistant
+  | "tool"      -> Tool ""
   | s when String.length s > 5 && String.sub s 0 5 = "tool:" ->
     Tool (String.sub s 5 (String.length s - 5))
   | s           -> failwith ("Unknown role: " ^ s)
 
-(** A single message in a conversation. *)
-type chat_message = {
-  role      : role;
-  content   : string;
-  timestamp : float;
+type tool_call = {
+  id   : string;
+  name : string;
+  args : string;
 }
 
-let make_message role content = {
+(** A single message in a conversation. *)
+type chat_message = {
+  role       : role;
+  content    : string;
+  timestamp  : float;
+  tool_calls : tool_call list option;
+}
+
+let make_message ?tool_calls role content = {
   role;
   content;
   timestamp = Unix.gettimeofday ();
+  tool_calls;
 }
 
-let system_msg content    = make_message System content
-let user_msg content      = make_message User content
-let assistant_msg content = make_message Assistant content
+let system_msg = make_message System
+let user_msg = make_message User
+let assistant_msg = make_message Assistant
+let tool_msg name content = make_message (Tool name) content
+
+(** Serialise a chat message to a Yojson value. *)
+let tool_call_to_json tc =
+  `Assoc [
+    ("id", `String tc.id);
+    ("type", `String "function");
+    ("function", `Assoc [
+      ("name", `String tc.name);
+      ("arguments", `String tc.args);
+    ]);
+  ]
 
 (** Serialise a chat message to a Yojson value. *)
 let chat_message_to_json msg =
-  `Assoc [
-    ("role",      `String (role_to_string msg.role));
-    ("content",   `String msg.content);
+  let base = [
+    ("role",      `String (match msg.role with Tool _ -> "tool" | r -> role_to_string r));
+    ("content",   if msg.content = "" && msg.tool_calls <> None then `Null else `String msg.content);
     ("timestamp", `Float  msg.timestamp);
-  ]
+  ] in
+  let base = match msg.tool_calls with
+    | Some tcs -> ("tool_calls", `List (List.map tool_call_to_json tcs)) :: base
+    | None -> base
+  in
+  let base = match msg.role with
+    | Tool id -> ("tool_call_id", `String id) :: base
+    | _ -> base
+  in
+  `Assoc base
+
+let tool_call_of_json json =
+  let open Yojson.Safe.Util in
+  let func = json |> member "function" in
+  {
+    id   = json |> member "id" |> to_string;
+    name = func |> member "name" |> to_string;
+    args = func |> member "arguments" |> to_string;
+  }
 
 (** Deserialise a chat message from a Yojson value. *)
 let chat_message_of_json json =
   let open Yojson.Safe.Util in
+  let role_str = json |> member "role" |> to_string in
+  let role = 
+    if role_str = "tool" then
+      match json |> member "tool_call_id" with
+      | `String id -> Tool id
+      | _ -> role_of_string role_str
+    else
+      role_of_string role_str
+  in
   {
-    role      = json |> member "role"      |> to_string |> role_of_string;
-    content   = json |> member "content"   |> to_string;
-    timestamp = json |> member "timestamp" |> to_float;
+    role;
+    content    = (match json |> member "content" with `String s -> s | `Null -> "" | _ -> "");
+    timestamp  = json |> member "timestamp" |> to_float;
+    tool_calls = (match json |> member "tool_calls" with
+                  | `Null -> None
+                  | `List l -> Some (List.map tool_call_of_json l)
+                  | _ -> None);
   }
 
 (** Serialise a list of chat messages (e.g. for the Ollama/OpenAI API). *)

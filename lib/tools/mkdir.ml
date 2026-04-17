@@ -18,6 +18,13 @@ module Mkdir : Tool.TOOL with type input = string and type output = (unit, strin
       "required", `List [`String "path"]
     ]
 
+  let parse_args json =
+    let open Yojson.Safe.Util in
+    try Ok (json |> member "path" |> to_string)
+    with Type_error (s, _) -> Error s
+
+  let format_output = function Ok () -> "Directory created successfully." | Error e -> e
+
   type _ Effect.t += Exec : input -> output Effect.t
 
   let rec mkdir_p path =

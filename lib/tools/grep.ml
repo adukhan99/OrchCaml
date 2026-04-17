@@ -27,6 +27,17 @@ module Grep : Tool.TOOL with type input = grep_input and type output = (string, 
       "required", `List [`String "pattern"; `String "path"]
     ]
 
+  let parse_args json =
+    let open Yojson.Safe.Util in
+    try
+      Ok {
+        pattern = json |> member "pattern" |> to_string;
+        path = json |> member "path" |> to_string;
+      }
+    with Type_error (s, _) -> Error s
+
+  let format_output = function Ok s -> s | Error e -> e
+
   type _ Effect.t += Exec : input -> output Effect.t
 
   let execute { pattern; path } =

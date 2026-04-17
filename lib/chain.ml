@@ -83,12 +83,12 @@ let llm (provider : Provider.packed_provider) : chat_message list -> string Lwt.
   fun msgs ->
     let open Lwt.Syntax in
     let* result = Provider.complete_packed provider msgs in
-    Lwt.return result.value
+    Lwt.return result.value.content
 
 (** [llm_with_meta provider] like [llm] but returns the full result
     with metadata (model, provider, finish reason). *)
 let llm_with_meta (provider : Provider.packed_provider)
-  : chat_message list -> string result_with_meta Lwt.t =
+  : chat_message list -> chat_message result_with_meta Lwt.t =
   fun msgs -> Provider.complete_packed provider msgs
 
 (** [llm_stream provider ~on_token] streams tokens via [on_token] and
@@ -146,8 +146,8 @@ let with_memory
     (* Call the LLM *)
     let* result = Provider.complete_packed provider history in
     (* Store assistant response *)
-    let final_mem = Mem.add mem_with_user (assistant_msg result.value) in
-    Lwt.return (final_mem, result.value)
+    let final_mem = Mem.add mem_with_user result.value in
+    Lwt.return (final_mem, result.value.content)
 
 (** --- Sequence combinators --- *)
 

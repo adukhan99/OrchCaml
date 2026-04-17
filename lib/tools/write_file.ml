@@ -24,6 +24,17 @@ module Write_file : Tool.TOOL with type input = write_input and type output = (u
       "required", `List [`String "path"; `String "content"]
     ]
 
+  let parse_args json =
+    let open Yojson.Safe.Util in
+    try
+      Ok {
+        path = json |> member "path" |> to_string;
+        content = json |> member "content" |> to_string;
+      }
+    with Type_error (s, _) -> Error s
+
+  let format_output = function Ok () -> "File written successfully." | Error e -> e
+
   type _ Effect.t += Exec : input -> output Effect.t
 
   let execute { path; content } =

@@ -49,13 +49,27 @@ let options_to_json (o : gen_options) =
      else [("stop", `List (List.map (fun s -> `String s) o.stop))]);
   ])
 
-let make_body cfg msgs ~stream =
-  `Assoc [
+let make_body cfg ?tools msgs ~stream =
+  let base = [
     ("model",    `String cfg.model);
     ("messages", messages_to_json msgs);
     ("stream",   `Bool stream);
     ("options",  options_to_json cfg.options);
-  ]
+  ] in
+  match tools with
+  | None | Some [] -> `Assoc base
+  | Some ts ->
+      let tools_json = `List (List.map (fun t ->
+        `Assoc [
+          ("type", `String "function");
+          ("function", `Assoc [
+            ("name", `String (OrchCaml.Tool.name_of_packed t));
+            ("description", `String (OrchCaml.Tool.description_of_packed t));
+            ("parameters", OrchCaml.Tool.schema_of_packed t);
+          ])
+        ]) ts)
+      in
+      `Assoc (("tools", tools_json) :: base)
 
 let post_json url body =
   let open Lwt.Syntax in
@@ -74,9 +88,23 @@ let post_json url body =
 let parse_complete_response body_str model =
   let json = Yojson.Safe.from_string body_str in
   let open Yojson.Safe.Util in
-  let content = json |> member "message" |> member "content" |> to_string in
+  let msg_json = json |> member "message" in
+  let content = msg_json |> member "content" |> to_string in
   let finish   = json |> member "done_reason" |> to_string_option in
-  wrap_result ~raw_response:body_str ~model ~provider:"ollama" ?finish_reason:finish content
+  let tool_calls =
+    match msg_json |> member "tool_calls" with
+    | `Null -> None
+    | `List l ->
+      Some (List.map (fun tc ->
+        let func = tc |> member "function" in
+        let name = func |> member "name" |> to_string in
+        let args = func |> member "arguments" |> Yojson.Safe.to_string in
+        { OrchCaml.Types.id = "call_" ^ name; name; args }
+      ) l)
+    | _ -> None
+  in
+  let reply_msg = OrchCaml.Types.make_message ?tool_calls Assistant content in
+  wrap_result ~raw_response:body_str ~model ~provider:"ollama" ?finish_reason:finish reply_msg
 
 (* ------------------------------------------------------------------
    PROVIDER module — constrained to the signature after definition
@@ -87,10 +115,10 @@ module Ollama = struct
 
   let name = "ollama"
 
-  let complete cfg msgs =
+  let complete cfg ?tools msgs =
     let open Lwt.Syntax in
     let url  = base_url cfg ^ "/api/chat" in
-    let body = make_body cfg msgs ~stream:false in
+    let body = make_body cfg ?tools msgs ~stream:false in
     let* (status, resp_body) = post_json url body in
     if Cohttp.Code.is_success (Cohttp.Code.code_of_status status) then
       Lwt.return (parse_complete_response resp_body cfg.model)
@@ -98,9 +126,9 @@ module Ollama = struct
       Lwt.fail_with (Printf.sprintf "Ollama error %s: %s"
         (Cohttp.Code.string_of_status status) resp_body)
 
-  let stream cfg msgs =
+  let stream cfg ?tools msgs =
     let url      = base_url cfg ^ "/api/chat" in
-    let body_str = Yojson.Safe.to_string (make_body cfg msgs ~stream:true) in
+    let body_str = Yojson.Safe.to_string (make_body cfg ?tools msgs ~stream:true) in
     let uri      = Uri.of_string url in
     let headers  = Cohttp.Header.of_list [("Content-Type", "application/json")] in
     let token_stream, token_push = Lwt_stream.create () in
@@ -141,7 +169,7 @@ module Ollama = struct
                   let finish = json |> member "done_reason" |> to_string_option in
                   Lwt.wakeup meta_resolver
                     (wrap_result ~raw_response:full ~model:cfg.model
-                       ~provider:"ollama" ?finish_reason:finish full)
+                       ~provider:"ollama" ?finish_reason:finish (OrchCaml.Types.assistant_msg full))
                 end
               with exn -> 
                 Printf.eprintf "[Ollama Stream Parse Error]: %s\nLine: %s\n%!" (Printexc.to_string exn) line)
@@ -151,9 +179,9 @@ module Ollama = struct
         safe_push None;
         (if Lwt.is_sleeping meta_promise then
           Lwt.wakeup meta_resolver
-            (wrap_result ~raw_response:(Buffer.contents buf)
-               ~model:cfg.model ~provider:"ollama"
-               (Buffer.contents buf)));
+             (wrap_result ~raw_response:(Buffer.contents buf)
+                ~model:cfg.model ~provider:"ollama"
+                (OrchCaml.Types.assistant_msg (Buffer.contents buf))));
         Lwt.return_unit
       end
     in
