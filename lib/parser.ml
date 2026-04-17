@@ -28,6 +28,8 @@ let or_else p1 p2 s = match p1 s with
   | Ok _ as ok -> ok
   | Error _    -> p2 s
 
+let (<|>) = or_else
+
 (** --- Applicative --- *)
 
 (** [ap pf pa] applies a parser of functions to a parser of values,
@@ -49,112 +51,104 @@ let or_else p1 p2 s = match p1 s with
     most useful when each sub-parser extracts an independent piece of
     information from the same response (e.g. different JSON fields).
 *)
-let ap pf pa s =
-  match pf s with
-  | Error e -> Error e
-  | Ok f    ->
-    match pa s with
-    | Error e -> Error e
-    | Ok a    -> Ok (f a)
+let ap pf pa =
+  pf >>= fun f ->
+  pa >|= fun a ->
+  f a
 
 let (<*>) = ap
 
 (** [product pa pb] runs both parsers and collects their results as a pair. *)
-let product pa pb s =
-  match pa s with
-  | Error e -> Error e
-  | Ok a    ->
-    match pb s with
-    | Error e -> Error e
-    | Ok b    -> Ok (a, b)
+let product pa pb =
+  pa >>= fun a ->
+  pb >|= fun b ->
+  (a, b)
+
 
 (** --- Base parsers --- *)
 
 (** [string] passes through the raw LLM output unchanged. *)
-let string : string t = fun s -> Ok s
+let string : string t = fun s -> return s s
 
 (** [trimmed] strips leading/trailing whitespace. *)
-let trimmed : string t = fun s -> Ok (String.trim s)
+let trimmed : string t = fun s -> return (String.trim s) s
 
 (** [json] parses the output as a JSON value. *)
 let json : Yojson.Safe.t t = fun s ->
-  match Yojson.Safe.from_string (String.trim s) with
-  | v               -> Ok v
-  | exception Yojson.Json_error msg -> Error ("JSON parse error: " ^ msg)
+  try return (Yojson.Safe.from_string (String.trim s)) s
+  with Yojson.Json_error msg -> fail ("JSON parse error: " ^ msg) s
 
 (** [json_field key] extracts a single field from a JSON object response. *)
-let json_field key : Yojson.Safe.t t = fun s ->
-  match json s with
-  | Error e -> Error e
-  | Ok j ->
-    (match Yojson.Safe.Util.member key j with
-     | `Null  -> Error (Printf.sprintf "Field '%s' not found in JSON" key)
-     | v      -> Ok v)
+let json_field key : Yojson.Safe.t t =
+  json >>= fun j s ->
+  match Yojson.Safe.Util.member key j with
+  | `Null  -> fail (Printf.sprintf "Field '%s' not found in JSON" key) s
+  | v      -> return v s
 
 (** [json_string_field key] extracts a string field from a JSON object. *)
-let json_string_field key : string t = fun s ->
-  match json_field key s with
-  | Error e -> Error e
-  | Ok (`String v) -> Ok v
-  | Ok other -> Error (Printf.sprintf "Field '%s' is not a string: %s"
-                  key (Yojson.Safe.to_string other))
+let json_string_field key : string t =
+  json_field key >>= function
+  | `String v -> return v
+  | other -> fun s -> fail (Printf.sprintf "Field '%s' is not a string: %s"
+                  key (Yojson.Safe.to_string other)) s
 
 (** [list] splits the output into lines, filtering blank lines. *)
 let list : string list t = fun s ->
-  Ok (s
+  return (s
       |> String.split_on_char '\n'
       |> List.map String.trim
-      |> List.filter (fun l -> l <> ""))
+      |> List.filter (fun l -> l <> "")) s
 
 (** [numbered_list] parses "1. item" or "1) item" formatted lists. *)
 let numbered_list : string list t = fun s ->
-  let re = Re.compile (Re.seq [
-    Re.bos |> Re.opt;
-    Re.rep Re.space;
-    Re.rep1 Re.digit;
-    Re.alt [Re.char '.'; Re.char ')'];
-    Re.rep1 Re.space;
-    Re.group (Re.rep1 Re.any);
-  ]) in
-  let lines = String.split_on_char '\n' s in
-  let items = List.filter_map (fun line ->
-    match Re.exec_opt re (String.trim line) with
-    | Some m -> Some (String.trim (Re.Group.get m 1))
-    | None   -> None
-  ) lines in
-  if items = [] then
-    (* fall back to plain line splitting *)
-    list s
-  else
-    Ok items
+  let parse_numbered s =
+    let re = Re.compile (Re.seq [
+      Re.bos |> Re.opt;
+      Re.rep Re.space;
+      Re.rep1 Re.digit;
+      Re.alt [Re.char '.'; Re.char ')'];
+      Re.rep1 Re.space;
+      Re.group (Re.rep1 Re.any);
+    ]) in
+    let lines = String.split_on_char '\n' s in
+    let items = List.filter_map (fun line ->
+      match Re.exec_opt re (String.trim line) with
+      | Some m -> Some (String.trim (Re.Group.get m 1))
+      | None   -> None
+    ) lines in
+    if items = [] then Error "No numbered items found"
+    else Ok items
+  in
+  (parse_numbered <|> list) s
+
 
 (** [bool] parses yes/no/true/false responses. *)
 let bool : bool t = fun s ->
   match String.lowercase_ascii (String.trim s) with
-  | "yes" | "true"  | "1" | "y" -> Ok true
-  | "no"  | "false" | "0" | "n" -> Ok false
-  | other -> Error ("Cannot parse bool from: " ^ other)
+  | "yes" | "true"  | "1" | "y" -> return true s
+  | "no"  | "false" | "0" | "n" -> return false s
+  | other -> fail ("Cannot parse bool from: " ^ other) s
 
 (** [int_val] parses an integer from the response. *)
 let int_val : int t = fun s ->
-  let s = String.trim s in
+  let s_trim = String.trim s in
   (* grab first run of digits, possibly preceded by a sign *)
   let re = Re.compile (Re.seq [Re.opt (Re.char '-'); Re.rep1 Re.digit]) in
-  match Re.exec_opt re s with
-  | None   -> Error ("No integer found in: " ^ s)
-  | Some m -> Ok (int_of_string (Re.Group.get m 0))
+  match Re.exec_opt re s_trim with
+  | None   -> fail ("No integer found in: " ^ s_trim) s
+  | Some m -> return (int_of_string (Re.Group.get m 0)) s
 
 (** [float_val] parses a float from the response. *)
 let float_val : float t = fun s ->
-  let s = String.trim s in
+  let s_trim = String.trim s in
   let re = Re.compile (Re.seq [
     Re.opt (Re.char '-');
     Re.rep1 Re.digit;
     Re.opt (Re.seq [Re.char '.'; Re.rep1 Re.digit]);
   ]) in
-  match Re.exec_opt re s with
-  | None   -> Error ("No float found in: " ^ s)
-  | Some m -> Ok (float_of_string (Re.Group.get m 0))
+  match Re.exec_opt re s_trim with
+  | None   -> fail ("No float found in: " ^ s_trim) s
+  | Some m -> return (float_of_string (Re.Group.get m 0)) s
 
 (** [extract_code ?lang] strips markdown code fences from the response.
     If [lang] is given (e.g. "ocaml"), only strips fences of that language.
@@ -172,7 +166,7 @@ let extract_code ?lang : string t = fun s ->
     Re.str "```";
   ]) in
   match Re.exec_opt re s with
-  | Some m -> Ok (String.trim (Re.Group.get m 1))
+  | Some m -> return (String.trim (Re.Group.get m 1)) s
   | None   ->
     (* no fence found — try to strip a single-backtick inline *)
     let re2 = Re.compile (Re.seq [
@@ -181,37 +175,36 @@ let extract_code ?lang : string t = fun s ->
       Re.char '`';
     ]) in
     (match Re.exec_opt re2 s with
-     | Some m -> Ok (Re.Group.get m 1)
-     | None   -> Ok (String.trim s))   (* return as-is if no fence *)
+     | Some m -> return (Re.Group.get m 1) s
+     | None   -> return (String.trim s) s)   (* return as-is if no fence *)
 
 (** [first_line] returns only the first non-empty line. *)
-let first_line : string t = fun s ->
-  match list s with
-  | Error e -> Error e
-  | Ok []   -> Ok ""
-  | Ok (h::_) -> Ok h
+let first_line : string t =
+  list >>= function
+  | [] -> return ""
+  | h :: _ -> return h
 
 (** [regex_capture ~pattern] extracts the first capture group matching [pattern]. *)
 let regex_capture ~pattern : string t = fun s ->
   let re = Re.compile (Re.Pcre.re pattern) in
   match Re.exec_opt re s with
-  | None   -> Error (Printf.sprintf "Pattern /%s/ did not match" pattern)
+  | None   -> fail (Printf.sprintf "Pattern /%s/ did not match" pattern) s
   | Some m ->
-    (try Ok (Re.Group.get m 1)
+    (try return (Re.Group.get m 1) s
      with Not_found ->
-       try Ok (Re.Group.get m 0)
-       with Not_found -> Error "No capture group in match")
+       try return (Re.Group.get m 0) s
+       with Not_found -> fail "No capture group in match" s)
 
 (** [json_array_strings] parses a JSON array of strings from the response. *)
-let json_array_strings : string list t = fun s ->
-  match json s with
-  | Error e -> Error e
-  | Ok (`List items) ->
-    let strings = List.filter_map (function
+let json_array_strings : string list t =
+  json >>= function
+  | `List items ->
+    return (List.filter_map (function
       | `String s -> Some s
-      | _ -> None) items in
-    Ok strings
-  | Ok _ -> Error "Expected a JSON array"
+      | _ -> None) items)
+  | _ -> fail "Expected a JSON array"
+
+
 
 (** --- Running parsers --- *)
 

@@ -33,6 +33,9 @@ let role_of_string s =
   | Ok r    -> r
   | Error e -> failwith e
 
+let ( >>= ) r f = Result.bind r f
+let ( >|= ) r f = Result.map f r
+
 (* ------------------------------------------------------------------ *)
 (*  Refined message ADT                                                 *)
 (* ------------------------------------------------------------------ *)
@@ -142,29 +145,26 @@ let chat_message_of_json_result json =
       else
         role_of_string_result role_str
     in
-    match role_r with
-    | Error e -> Error e
-    | Ok role ->
-      let tool_calls =
-        match json |> member "tool_calls" with
-        | `Null  -> Ok None
-        | `List l ->
-          let results = List.map tool_call_of_json_result l in
-          let errs = List.filter_map (function Error e -> Some e | Ok _ -> None) results in
-          if errs <> [] then Error (String.concat "; " errs)
-          else Ok (Some (List.filter_map (function Ok tc -> Some tc | _ -> None) results))
-        | _ -> Ok None
-      in
-      (match tool_calls with
-       | Error e -> Error e
-       | Ok tcs ->
-         Ok {
-           role;
-           content    = (match json |> member "content" with `String s -> s | `Null -> "" | _ -> "");
-           timestamp  = (match json |> member "timestamp" with `Float f -> f | _ -> 0.0);
-           tool_calls = tcs;
-         })
+    role_r >>= fun role ->
+    let tool_calls_r =
+      match json |> member "tool_calls" with
+      | `Null  -> Ok None
+      | `List l ->
+        let results = List.map tool_call_of_json_result l in
+        let errs = List.filter_map (function Error e -> Some e | Ok _ -> None) results in
+        if errs <> [] then Error (String.concat "; " errs)
+        else Ok (Some (List.filter_map (function Ok tc -> Some tc | _ -> None) results))
+      | _ -> Ok None
+    in
+    tool_calls_r >|= fun tcs ->
+    {
+      role;
+      content    = (match json |> member "content" with `String s -> s | `Null -> "" | _ -> "");
+      timestamp  = (match json |> member "timestamp" with `Float f -> f | _ -> 0.0);
+      tool_calls = tcs;
+    }
   with Yojson.Safe.Util.Type_error (msg, _) -> Error ("chat_message parse: " ^ msg)
+
 
 let chat_message_of_json json =
   match chat_message_of_json_result json with

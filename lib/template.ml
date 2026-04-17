@@ -92,17 +92,15 @@ let chat_template ?system human = {
 (** [render_chat ~vars tmpl] produces [(chat_message list, string) result]. *)
 let render_chat ~vars tmpl =
   let open Types in
-  match render ~vars tmpl.human_tmpl with
-  | Error e -> Error e
-  | Ok human_content ->
-    let human_msg = user_msg human_content in
-    match tmpl.system_tmpl with
-    | None     -> Ok [ human_msg ]
-    | Some sys ->
-      let sys_vars = List.filter (fun (k, _) -> List.mem k sys.variables) vars in
-      (match render ~vars:sys_vars sys with
-       | Error e    -> Error e
-       | Ok sys_str -> Ok [ system_msg sys_str; human_msg ])
+  render ~vars tmpl.human_tmpl >>= fun human_content ->
+  let human_msg = user_msg human_content in
+  match tmpl.system_tmpl with
+  | None     -> Ok [ human_msg ]
+  | Some sys ->
+    let sys_vars = List.filter (fun (k, _) -> List.mem k sys.variables) vars in
+    render ~vars:sys_vars sys >|= fun sys_str ->
+    [ system_msg sys_str; human_msg ]
+
 
 (** [render_chat_exn ~vars tmpl] like [render_chat] but raises on error. *)
 let render_chat_exn ~vars tmpl =
