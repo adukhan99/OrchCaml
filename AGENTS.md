@@ -545,6 +545,11 @@ let get_provider ctx =
 **Wrong**: Tracking whether `on_token` was called (`tokens_emitted`) to decide if a stream "succeeded" before triggering a fallback. Tool-call-only responses from the LLM emit zero content tokens, so this flag stays `false` on every agentic tool-use turn — causing the fallback to fire silently on every tool call, doubling request volume and producing no streamed output.
 **Right**: Set a `stream_succeeded` flag immediately after receiving an HTTP 2xx response header. The fallback should only fire when the *connection* failed (before any SSE data), not when the response body happened to contain no text.
 
+### ❌ Hand-rolled JSON record parsing / destructuring
+
+**Wrong**: Manually extracting fields from JSON records via verbose `member "field"` and custom `member_opt` helper chains instead of deriving type-safe JSON conversion.
+**Right**: Annotate simple round-trippable records with `[@@deriving yojson]` (using `yojson_safe` for embedded `Yojson.Safe.t` AST fields) to generate automatic, type-safe serialization and deserialization.
+
 ### ❌ Ignoring reasoning/thinking fields in SSE streaming
 
 **Wrong**: Only parsing `"content"` from delta chunks in streaming providers. Reasoning models (like DeepSeek-R1 or OpenRouter stealth models) stream their reasoning steps inside `"reasoning"` or `"reasoning_content"` keys while sending empty `"content"`. Ignoring these keys makes the CLI appear frozen/stuck for minutes before any text appears.

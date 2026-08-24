@@ -28,6 +28,7 @@ val default_config : unit -> agent_config
 val run :
   ?config:agent_config ->
   ?on_turn:(Session.t -> chat_message result_with_meta -> unit) ->
+  ?on_step:(Session.t -> unit) ->
   _ Eio.Net.t ->
   _ Eio.Time.clock ->
   Session.t ->
@@ -37,6 +38,7 @@ val run :
 val run_stream :
   ?config:agent_config ->
   ?on_turn:(Session.t -> chat_message result_with_meta -> unit) ->
+  ?on_step:(Session.t -> unit) ->
   _ Eio.Net.t ->
   _ Eio.Time.clock ->
   Session.t ->
@@ -77,10 +79,19 @@ end
 
 ### `Caravan.Session`
 
-Multi-turn session history, system prompt management, and execution state.
+Multi-turn session history, system prompt management, and state persistence.
 
 ```ocaml
 type t
+
+type config = {
+  model               : string;
+  system              : string option;
+  options             : gen_options;
+  memory_size         : int;
+  max_tool_output_len : int option;
+  auto_summarize      : bool;
+} [@@deriving yojson]
 
 val create : ?tools:Tool.packed_tool list -> string -> Provider.packed_provider -> t
 val set_system : t -> string -> t
@@ -89,13 +100,10 @@ val add_assistant : t -> string -> t
 val turn_idx : t -> int
 val history : t -> chat_message list
 
-val run_conversations :
-  ?max_turns:int ->
-  ?on_turn:(t -> chat_message result_with_meta -> unit) ->
-  _ Eio.Net.t ->
-  _ Eio.Time.clock ->
-  t ->
-  t * chat_message result_with_meta
+val export_json : t -> Yojson.Safe.t
+val of_json : provider:Provider.packed_provider -> ?tools:Tool.packed_tool list -> Yojson.Safe.t -> (t, string) result
+val save_checkpoint : ?path:string -> t -> (string, string) result
+val load_checkpoint : provider:Provider.packed_provider -> ?tools:Tool.packed_tool list -> ?path:string -> unit -> (t, string) result
 ```
 
 ---

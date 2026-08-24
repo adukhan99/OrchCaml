@@ -33,6 +33,7 @@ Typing `/` opens a live palette (Tab completes). Highlights:
 | Command | Effect |
 |---------|--------|
 | `/agent <task>` | autonomous loop with tools |
+| `/resume [path]` | restore session state from a saved checkpoint |
 | `/nudge <text>` | steering note injected before the next model call |
 | `/lisp <program>` | evaluate a [Slip](slip.md) expression |
 | `/model` · `/models` · `/provider` · `/providers` | switching |
