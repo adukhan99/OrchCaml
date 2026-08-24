@@ -2,12 +2,13 @@
 
 open Types
 open Tool
+open Ppx_yojson_conv_lib.Yojson_conv.Primitives
 
 type mcp_tool_def = {
   name : string;
   description : string;
-  schema : Yojson.Safe.t;
-}
+  schema : yojson_safe; [@key "inputSchema"]
+} [@@deriving yojson]
 
 type mcp_client = {
   name : string;
@@ -188,18 +189,15 @@ let list_tools client =
     try
       let tools_list = json |> member "result" |> member "tools" |> to_list in
       List.filter_map (fun t_json ->
-        let name_opt = t_json |> member "name" |> to_string_option in
-        let desc_opt = t_json |> member "description" |> to_string_option in
-        let schema = t_json |> member "inputSchema" in
-        match name_opt, desc_opt with
-        | Some name, Some desc -> Some { name; description = desc; schema }
-        | _ -> None
+        try Some (mcp_tool_def_of_yojson t_json)
+        with _ -> None
       ) tools_list
     with
     | Eio.Cancel.Cancelled _ as exn -> raise exn
     | exn ->
       Trace.log "error" "MCP: error parsing tools for %s: %s" client.name (Printexc.to_string exn);
       []
+
 
 let parse_call_response json =
   let open Yojson.Safe.Util in

@@ -2,6 +2,12 @@
 
 open Ppx_yojson_conv_lib.Yojson_conv.Primitives
 
+(** Identity converter for raw Yojson ASTs in PPX records. *)
+type yojson_safe = Yojson.Safe.t
+let yojson_of_yojson_safe (x : yojson_safe) : Yojson.Safe.t = x
+let yojson_safe_of_yojson (x : Yojson.Safe.t) : yojson_safe = x
+
+
 type role =
   | System
   | User

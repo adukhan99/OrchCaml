@@ -55,14 +55,20 @@ let continue_prompt_for config ~task ~used =
     end else base
   end
 
-let run_generic ?config ?on_turn run_fn sess task =
+let run_generic ?config ?on_turn ?on_step run_fn sess task =
   let config = match config with Some c -> c | None -> default_config () in
   let max_turns = if config.max_turns <= 0 then None else Some config.max_turns in
+  let notify_step s =
+    match on_step with
+    | Some f -> (try f s with _ -> ())
+    | None -> ()
+  in
   let rec loop sess =
     if config.max_turns > 0 && Session.turn_idx sess >= config.max_turns then
       Error "Maximum turns reached without completion."
     else begin
       let (sess', result) = run_fn ?max_turns ?on_turn sess in
+      notify_step sess';
       if is_finished result then
         Ok (sess', result)
       else if config.max_turns > 0 && Session.turn_idx sess' >= config.max_turns then
@@ -70,18 +76,21 @@ let run_generic ?config ?on_turn run_fn sess task =
       else
         let prompt = continue_prompt_for config ~task ~used:(Session.turn_idx sess') in
         let sess'' = Prompt.(exec_in_session (user prompt) sess') in
+        notify_step sess'';
         loop sess''
     end
   in
   let sess_with_task = Prompt.(exec_in_session (user task) sess) in
+  notify_step sess_with_task;
   loop sess_with_task
 
-let run ?config ?on_turn net clock sess task =
-  run_generic ?config ?on_turn
+let run ?config ?on_turn ?on_step net clock sess task =
+  run_generic ?config ?on_turn ?on_step
     (fun ?max_turns ?on_turn s -> Session.run_conversations ?max_turns ?on_turn net clock s)
     sess task
 
-let run_stream ?config ?on_turn net clock sess task ~on_token =
-  run_generic ?config ?on_turn
+let run_stream ?config ?on_turn ?on_step net clock sess task ~on_token =
+  run_generic ?config ?on_turn ?on_step
     (fun ?max_turns ?on_turn s -> Session.run_conversations_stream ?max_turns ?on_turn net clock s ~on_token)
     sess task
+

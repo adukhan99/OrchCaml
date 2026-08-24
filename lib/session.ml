@@ -1,6 +1,7 @@
 (** Stateful multi-turn conversation sessions. *)
 
 open Types
+open Ppx_yojson_conv_lib.Yojson_conv.Primitives
 
 type config = {
   model               : string;
@@ -9,7 +10,7 @@ type config = {
   memory_size         : int;
   max_tool_output_len : int option;
   auto_summarize      : bool;
-}
+} [@@deriving yojson]
 
 let default_config model = {
   model;
@@ -340,12 +341,80 @@ let turn_stream net clock sess user_input ~on_token =
 let export_json sess =
   let Memory.Mem ((module M), mem) = sess.memory in
   `Assoc [
-    ("model",    `String sess.cfg.model);
+    ("config",   yojson_of_config sess.cfg);
     ("turn_idx", `Int sess.turn_idx);
-    ("system",   (match sess.cfg.system with
-                  | None -> `Null | Some s -> `String s));
     ("history",  M.to_json mem);
   ]
+
+let of_json ~provider ?(tools = []) json =
+  match json with
+  | `Assoc _ ->
+    (try
+       let open Yojson.Safe.Util in
+       let cfg =
+         match json |> member "config" with
+         | `Null ->
+           (* Backwards compatibility for legacy checkpoints without full config *)
+           let model = json |> member "model" |> to_string in
+           let system = json |> member "system" |> to_string_option in
+           { (default_config model) with system }
+         | cfg_json -> config_of_yojson cfg_json
+       in
+       let turn_idx =
+         match json |> member "turn_idx" with
+         | `Int i -> i
+         | _ -> 0
+       in
+       let history_json =
+         match json |> member "history" with
+         | `List _ as l -> l
+         | _ -> `List []
+       in
+       let ring_mem = Memory.Ring.of_json history_json in
+       let sess = create ~tools cfg.model provider in
+       let sess = {
+         sess with
+         cfg;
+         turn_idx;
+         memory = Memory.Mem ((module Memory.Ring), ring_mem);
+       } in
+       Ok sess
+     with exn ->
+       Error (Printf.sprintf "Failed to parse session JSON: %s" (Caravan_error.humanize exn)))
+  | _ -> Error "Invalid session JSON: expected JSON object"
+
+let default_checkpoint_path () =
+  let dir = Config.log_dir () in
+  let rec mkdir_p path =
+    if not (Sys.file_exists path) then begin
+      mkdir_p (Filename.dirname path);
+      (try Unix.mkdir path 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
+    end
+  in
+  mkdir_p dir;
+  Filename.concat dir "last_checkpoint.json"
+
+let save_checkpoint ?path sess =
+  let p = match path with Some path -> path | None -> default_checkpoint_path () in
+  try
+    let oc = open_out_gen [Open_creat; Open_trunc; Open_wronly] 0o600 p in
+    output_string oc (Yojson.Safe.pretty_to_string (export_json sess));
+    output_char oc '\n';
+    close_out oc;
+    Ok p
+  with exn ->
+    Error (Printf.sprintf "Failed to save checkpoint to '%s': %s" p (Caravan_error.humanize exn))
+
+let load_checkpoint ~provider ?tools ?path () =
+  let p = match path with Some path -> path | None -> default_checkpoint_path () in
+  if not (Sys.file_exists p) then
+    Error (Printf.sprintf "Checkpoint file '%s' does not exist." p)
+  else
+    try
+      let json = Yojson.Safe.from_file p in
+      of_json ~provider ?tools json
+    with exn ->
+      Error (Printf.sprintf "Failed to load checkpoint from '%s': %s" p (Caravan_error.humanize exn))
 
 let pp_history fmt sess =
   let Memory.Mem ((module M), mem) = sess.memory in
@@ -353,4 +422,5 @@ let pp_history fmt sess =
     let role_str = role_to_string msg.role in
     Format.fprintf fmt "@[<v>[%s]: %s@]@." role_str msg.content
   ) (M.get mem)
+
 

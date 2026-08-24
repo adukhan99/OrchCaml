@@ -1,5 +1,7 @@
 (** Centralized TOML configuration reader and writer. *)
 
+open Ppx_yojson_conv_lib.Yojson_conv.Primitives
+
 let config_path () =
   match Sys.getenv_opt "CARAVAN_CONFIG" with
   | Some p when p <> "" -> p
@@ -211,7 +213,7 @@ type gres = {
   vision     : bool;  (** Image / multi-modal input *)
   gen_image  : bool;  (** Image generation output *)
   extra      : (string * bool) list;  (** Forward-compatible catch-all *)
-}
+} [@@deriving yojson]
 
 let default_gres = {
   thinking  = true;
@@ -224,18 +226,18 @@ let default_gres = {
 (** Config for a single subagent worker, read from a [[subagents]] table. *)
 type subagent_config = {
   name          : string;
-  worker_role    : string;   (** "atomic" | "parallel" *)
-  provider_ref  : string;   (** key into [providers.*] table *)
+  worker_role   : string; [@key "role"]
+  provider_ref  : string; [@key "provider"]
   model         : string;
   max_tokens    : int option;
   temperature   : float option;
-  tool_names    : string list; (** validated against registered tools at startup *)
+  tool_names    : string list; [@key "tools"]
   system_prompt : string;
   realm         : string option;
   (** Optional plugin-toolset sandbox realm: plugins registered into the
       named realm add worker-only tools resolved at delegation time. *)
   gres          : gres;
-}
+} [@@deriving yojson]
 
 (** Config for a named provider endpoint, read from [providers.<name>]. *)
 type provider_config = {
@@ -759,15 +761,5 @@ let delete_subagent name : (string, string) result =
 
 (** Serialize a [subagent_config] to a JSON object for the web API. *)
 let subagent_to_json (cfg : subagent_config) : Yojson.Safe.t =
-  `Assoc [
-    ("name",          `String cfg.name);
-    ("provider",      `String cfg.provider_ref);
-    ("model",         `String cfg.model);
-    ("role",          `String cfg.worker_role);
-    ("system_prompt", `String cfg.system_prompt);
-    ("tools",         `List (List.map (fun t -> `String t) cfg.tool_names));
-    ("max_tokens",    (match cfg.max_tokens with Some n -> `Int n | None -> `Null));
-    ("temperature",   (match cfg.temperature with Some f -> `Float f | None -> `Null));
-    ("realm",         (match cfg.realm with Some r -> `String r | None -> `Null));
-  ]
+  yojson_of_subagent_config cfg
 

@@ -1653,6 +1653,94 @@ let%test_unit "parse_provider_error_openrouter_and_openai" =
      assert (detail.message = "Incorrect API key")
    | None -> failwith "Failed to parse OpenAI provider error")
 
+let%test_unit "session_of_json_roundtrip_and_checkpoint" =
+  let module MockProvider : Provider.PROVIDER with type config = unit = struct
+    type config = unit
+    let name = "mock"
+    let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+      Types.wrap_result ~raw_response:"ok" ~model:"mock" ~provider:"mock" (Types.assistant_msg "ok")
+    let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token:_ =
+      Types.wrap_result ~raw_response:"ok" ~model:"mock" ~provider:"mock" (Types.assistant_msg "ok")
+    let list_models _net _cfg = ["mock"]
+  end in
+  let provider = Provider.Provider ((module MockProvider), ()) in
+  let sess = Session.create ~tools:[] "test-model" provider in
+  let sess = Session.set_system sess "Custom System Instructions" in
+  let sess = Session.add_messages sess [
+    Types.user_msg "Hello turn 1";
+    Types.assistant_msg "Reply turn 1";
+    Types.tool_msg "call_123" "Tool output data";
+  ] in
+  
+  let json = Session.export_json sess in
+  (match Session.of_json ~provider json with
+   | Ok sess' ->
+     let cfg = Session.config sess' in
+     assert (cfg.model = "test-model");
+     assert (cfg.system = Some "Custom System Instructions");
+     let hist = Session.history sess' in
+     assert (List.length hist = 3);
+     let last_msg = List.nth hist 2 in
+     assert (last_msg.content = "Tool output data")
+   | Error err -> failwith ("Session.of_json failed: " ^ err));
+
+  let tmp_checkpoint = "test_session_checkpoint.json" in
+  (match Session.save_checkpoint ~path:tmp_checkpoint sess with
+   | Ok p -> assert (p = tmp_checkpoint)
+   | Error e -> failwith ("Session.save_checkpoint failed: " ^ e));
+
+  (match Session.load_checkpoint ~provider ~path:tmp_checkpoint () with
+   | Ok loaded ->
+     Sys.remove tmp_checkpoint;
+     let cfg = Session.config loaded in
+     assert (cfg.model = "test-model");
+     assert (cfg.system = Some "Custom System Instructions");
+     let hist = Session.history loaded in
+     assert (List.length hist = 3)
+   | Error e ->
+     if Sys.file_exists tmp_checkpoint then Sys.remove tmp_checkpoint;
+     failwith ("Session.load_checkpoint failed: " ^ e))
+
+let%test_unit "agent_on_step_callback_preserves_context" =
+  Eio_main.run (fun env ->
+    let step_sessions = ref [] in
+    let call_count = ref 0 in
+    let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+    let read_tool = Tool.Tool (module CaravanTools.Read_file.Read_file) in
+    let module StepTestProvider : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "step_test"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        incr call_count;
+        if !call_count = 1 then
+          let tc = Types.{ id = "c1"; name = "read_file"; args = {|{"path": "dune"}|}; extra_content = None } in
+          let reply = Types.assistant_tool_msg ~tool_calls:[tc] "Reading..." in
+          Types.wrap_result ~raw_response:"ok" ~model:"step" ~provider:"step" reply
+        else
+          let tc = Types.{ id = "c2"; name = "finish"; args = {|{"summary": "Done"}|}; extra_content = None } in
+          let reply = Types.assistant_tool_msg ~tool_calls:[tc] "Finished step test" in
+          Types.wrap_result ~raw_response:"ok" ~model:"step" ~provider:"step" reply
+      let stream _net _cfg ?model:_ ?options:_ ?tools:_ msgs ~on_token:_ =
+        complete _net _cfg msgs
+      let list_models _net _cfg = ["step_test"]
+    end in
+    let provider = Provider.Provider ((module StepTestProvider), ()) in
+    let sess = Session.create ~tools:[finish_tool; read_tool] "step" provider
+               |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
+    
+    let on_step s = step_sessions := s :: !step_sessions in
+    let agent_cfg = Agent.{ max_turns = 5; continue_prompt = "continue"; nudge = false } in
+    let res = Agent.run ~config:agent_cfg ~on_step env#net env#clock sess "Run step callback test" in
+    (match res with
+     | Ok (final_sess, _meta) ->
+       assert (List.length !step_sessions >= 2);
+       let intermediate_sess = List.hd (List.rev !step_sessions) in
+       assert (List.length (Session.history intermediate_sess) >= 1);
+       assert (Session.turn_idx final_sess = 2)
+     | Error msg -> failwith ("Agent.run with on_step failed: " ^ msg))
+  )
+
+
 
 
 

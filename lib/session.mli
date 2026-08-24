@@ -1,4 +1,5 @@
 open Types
+open Ppx_yojson_conv_lib.Yojson_conv.Primitives
 
 type config = {
   model               : string;
@@ -7,7 +8,8 @@ type config = {
   memory_size         : int;
   max_tool_output_len : int option;
   auto_summarize      : bool;
-}
+} [@@deriving yojson]
+
 
 val default_config : string -> config
 
@@ -53,4 +55,8 @@ val turn_stream : _ Eio.Net.t -> _ Eio.Time.clock -> t -> string -> on_token:(st
 val summarise : ?prompt_fn:(chat_message list -> string) -> _ Eio.Net.t -> _ Eio.Time.clock -> t -> t * string
 
 val export_json : t -> Yojson.Safe.t
+val of_json : provider:Provider.packed_provider -> ?tools:Tool.packed_tool list -> Yojson.Safe.t -> (t, string) result
+val save_checkpoint : ?path:string -> t -> (string, string) result
+val load_checkpoint : provider:Provider.packed_provider -> ?tools:Tool.packed_tool list -> ?path:string -> unit -> (t, string) result
 val pp_history : Format.formatter -> t -> unit
+

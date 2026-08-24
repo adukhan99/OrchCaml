@@ -154,6 +154,7 @@ let help_groups = [
     commands = [
       ("/history", "Show conversation so far", None);
       ("/export [file]", "Save conversation to a file", None);
+      ("/resume [file]", "Restore conversation from a checkpoint", None);
       ("/tools", "List available tools for the agent", None);
       ("/plugins", "List composed plugins; enable/disable by id", None);
       ("/config", "Show current settings", None);
@@ -284,18 +285,23 @@ let handle_slash_command net clock st line =
         let max_str = if max <= 0 then "∞" else string_of_int max in
         println_ansi (dim (Printf.sprintf "  ── turn %d/%s ──" current max_str))
       in
+      let on_step step_sess =
+        st.session <- step_sess;
+        ignore (Session.save_checkpoint step_sess)
+      in
       (try
         let stream_enabled = Config.get_stream () in
         let result =
           with_permissions (fun () ->
             if stream_enabled then
-              Agent.run_stream ~on_turn net clock st.session task ~on_token
+              Agent.run_stream ~on_turn ~on_step net clock st.session task ~on_token
             else
-              Agent.run ~on_turn net clock st.session task)
+              Agent.run ~on_turn ~on_step net clock st.session task)
         in
         match result with
         | Ok (new_sess, res) ->
           st.session <- new_sess;
+          ignore (Session.save_checkpoint new_sess);
           print_newline ();
           println_ansi (rule ~title:"Result" ());
           if String.trim res.value.content <> "" then begin
@@ -304,9 +310,11 @@ let handle_slash_command net clock st line =
           end;
           println_ansi (dim ("  " ^ Monitor.format_usage res))
         | Error e ->
+          ignore (Session.save_checkpoint st.session);
           Trace.error "repl-agent" "%s" e;
           println_ansi (red (Printf.sprintf "  ✗ agent: %s" e))
       with exn ->
+        ignore (Session.save_checkpoint st.session);
         Trace.error "repl-agent" "%s" (Caravan_error.humanize exn);
         println_ansi (red (Printf.sprintf "  ✗ %s" (Caravan_error.humanize exn))))
     end
@@ -420,6 +428,23 @@ let handle_slash_command net clock st line =
        with exn -> println_ansi (red (Printf.sprintf "  ✗ %s" (Caravan_error.humanize exn))))
      | [] -> print_endline (Yojson.Safe.pretty_to_string (Session.export_json st.session))
      | _ -> usage "/export" "[file]")
+
+  | "/resume" :: rest ->
+    let path = match rest with [] -> None | [file] -> Some file | _ -> None in
+    (match Session.load_checkpoint ~provider:st.provider ~tools:(Session.tools st.session) ?path () with
+     | Ok sess ->
+       let turns = List.length (Session.history sess) in
+       let resume_note =
+         Printf.sprintf
+           "[Caravan system note]: Previous task execution was interrupted. \
+            The conversation history above contains all completed steps and tool outputs up to turn %d. \
+            Please review the previous tool execution history and resume working on the task."
+           (Session.turn_idx sess)
+       in
+       let sess' = Session.add_messages sess [system_msg resume_note] in
+       st.session <- sess';
+       confirm "Resumed session checkpoint (%d messages, turn %d)" turns (Session.turn_idx sess')
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
 
   | ["/models"] ->
     (try
@@ -690,6 +715,7 @@ let palette : Editor.command_info list =
     c "/summarise" "" "compact the conversation now";
     c "/history" "" "show the conversation so far";
     c "/export" "[file]" "save the conversation as JSON";
+    c "/resume" "[file]" "restore conversation from a checkpoint";
     c "/tools" "" "available tools (✎ = mutating)";
     c "/plugins" "[enable|disable <id>]" "plugin composition and lifecycle states";
     c "/config" "[set k v | get k | keys]" "show or edit settings";
