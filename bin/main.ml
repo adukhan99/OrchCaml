@@ -156,6 +156,8 @@ let help_groups = [
       ("/export [file]", "Save conversation to a file", None);
       ("/resume [file]", "Restore conversation from a checkpoint", None);
       ("/tools", "List available tools for the agent", None);
+      ("/mcp [list|add|get|remove]", "Manage MCP server connections and tools",
+       Some "Example: /mcp add github -- npx -y @modelcontextprotocol/server-github");
       ("/plugins", "List composed plugins; enable/disable by id", None);
       ("/config", "Show current settings", None);
       ("/config set <k> <v>", "Change a setting, saved to the config file",
@@ -572,6 +574,82 @@ let handle_slash_command net clock st line =
         | Error e -> println_ansi (red ("  ✗ " ^ e)))
      | _ -> usage "/plugins" "[enable|disable <id>]")
 
+  | "/mcp" :: rest ->
+    let h = Lazy.force host in
+    (match rest with
+     | [] | ["list"] ->
+       let mcp_servers = Config.get_mcp_servers () in
+       if mcp_servers = [] then println_ansi (dim "  No MCP servers configured.")
+       else begin
+         println_ansi (rule ~title:"MCP Servers" ());
+         List.iter (fun (cfg : Config.mcp_server_config) ->
+           let id = "mcp:" ^ cfg.name in
+           let fiber = Plugin_host.fiber h id in
+           let status_mark, status_str = match fiber with
+             | Some f when Plugin.Fiber.state f = Plugin.Fiber.Active -> (green "●", "active")
+             | Some f when Plugin.Fiber.state f = Plugin.Fiber.Failed -> (red "✗", "failed")
+             | _ -> (yellow "○", "inactive")
+           in
+           println_ansi (Printf.sprintf "  %s %s  %s  %s %s (%s)"
+             status_mark
+             (bold (Printf.sprintf "%-14s" cfg.name))
+             (cyan (Printf.sprintf "%-6s" cfg.transport))
+             (white cfg.command)
+             (dim (String.concat " " cfg.args))
+             (dim status_str))
+         ) mcp_servers;
+         println_ansi (dim "\n  /mcp get <name> · /mcp add <name> -- <cmd> · /mcp remove <name>")
+       end
+     | ["get"; name] ->
+       (match Config.get_mcp_server name with
+        | None -> println_ansi (red (Printf.sprintf "  ✗ MCP server '%s' not found." name))
+        | Some cfg ->
+          println_ansi (rule ~title:(Printf.sprintf "MCP Server: %s" cfg.name) ());
+          println_ansi (kv_line "Name" cfg.name);
+          println_ansi (kv_line "Transport" cfg.transport);
+          println_ansi (kv_line "Command" (cfg.command ^ " " ^ String.concat " " cfg.args));
+          let prefix = cfg.name ^ "_" in
+          let mcp_tools = List.filter (fun t ->
+            let n = Tool.name_of_packed t in
+            String.length n > String.length prefix && String.sub n 0 (String.length prefix) = prefix
+          ) (Session.tools st.session) in
+          println_ansi (kv_line "Tools" (string_of_int (List.length mcp_tools)));
+          List.iter (fun t ->
+            println_ansi (Printf.sprintf "    %s  %s"
+              (cyan (Tool.name_of_packed t))
+              (dim (truncate_visible (Tool.description_of_packed t) 60)))
+          ) mcp_tools)
+     | "add" :: name :: rest_args ->
+       let (command, args) =
+         match rest_args with
+         | "--" :: cmd :: a -> (cmd, a)
+         | cmd :: a -> (cmd, a)
+         | [] -> ("", [])
+       in
+       if command = "" then usage "/mcp add" "<name> [--transport stdio] -- <command> [args...]"
+       else begin
+         println_ansi (dim (Printf.sprintf "  Probing MCP server '%s'..." name));
+         match Mcp.probe_server name command args with
+         | Error err -> println_ansi (red (Printf.sprintf "  ✗ Probe failed: %s" err))
+         | Ok (client, tools) ->
+           (try client.close () with _ -> ());
+           let cfg = { Config.name; transport = "stdio"; command; args } in
+           (match Config.add_mcp_server cfg with
+            | Ok path ->
+              Plugin_host.load h;
+              st.session <- Session.with_tools st.session (Subagents.session_tools ~net ~clock ~host:h (all_tools ()));
+              confirm "MCP server '%s' added (%d tools registered, saved to %s)" name (List.length tools) path
+            | Error e -> println_ansi (red ("  ✗ " ^ e)))
+       end
+     | ["remove"; name] | ["rm"; name] ->
+       (match Config.delete_mcp_server name with
+        | Ok path ->
+          Plugin_host.load h;
+          st.session <- Session.with_tools st.session (Subagents.session_tools ~net ~clock ~host:h (all_tools ()));
+          confirm "MCP server '%s' removed (saved to %s)" name path
+        | Error e -> println_ansi (red ("  ✗ " ^ e)))
+     | _ -> usage "/mcp" "[list | get <name> | add <name> -- <cmd> [args...] | remove <name>]")
+
   | "/config" :: "set" :: key :: rest when rest <> [] ->
     let value = String.concat " " rest in
     (match Config.set_value key value with
@@ -717,6 +795,7 @@ let palette : Editor.command_info list =
     c "/export" "[file]" "save the conversation as JSON";
     c "/resume" "[file]" "restore conversation from a checkpoint";
     c "/tools" "" "available tools (✎ = mutating)";
+    c "/mcp" "[list|add|get|remove]" "manage MCP tool servers";
     c "/plugins" "[enable|disable <id>]" "plugin composition and lifecycle states";
     c "/config" "[set k v | get k | keys]" "show or edit settings";
     c "/key" "<provider>" "store an API key (hidden input)";
@@ -1335,6 +1414,126 @@ let web_cmd =
   Cmd.v info Term.(const run_web $ model_arg $ provider_arg $ base_url_arg
                    $ system_arg $ port_arg)
 
+(* ── mcp command ──────────────────────────────────────────────────────── *)
+
+let run_mcp_list () =
+  init_plugins ();
+  let mcp_servers = Config.get_mcp_servers () in
+  if mcp_servers = [] then
+    println_ansi (dim "No MCP servers configured.")
+  else begin
+    println_ansi (rule ~title:"MCP Servers" ());
+    let h = Lazy.force host in
+    List.iter (fun (cfg : Config.mcp_server_config) ->
+      let id = "mcp:" ^ cfg.name in
+      let fiber = Plugin_host.fiber h id in
+      let status_mark, status_str = match fiber with
+        | Some f when Plugin.Fiber.state f = Plugin.Fiber.Active -> (green "●", "active")
+        | Some f when Plugin.Fiber.state f = Plugin.Fiber.Failed -> (red "✗", "failed")
+        | _ -> (yellow "○", "inactive")
+      in
+      println_ansi (Printf.sprintf "  %s %s  %s  %s %s (%s)"
+        status_mark
+        (bold (Printf.sprintf "%-14s" cfg.name))
+        (cyan (Printf.sprintf "%-6s" cfg.transport))
+        (white cfg.command)
+        (dim (String.concat " " cfg.args))
+        (dim status_str))
+    ) mcp_servers
+  end
+
+let run_mcp_get name =
+  init_plugins ();
+  match Config.get_mcp_server name with
+  | None ->
+    Printf.eprintf "MCP server '%s' not found.\n%!" name;
+    exit 1
+  | Some cfg ->
+    println_ansi (rule ~title:(Printf.sprintf "MCP Server: %s" cfg.name) ());
+    println_ansi (kv_line "Name" cfg.name);
+    println_ansi (kv_line "Transport" cfg.transport);
+    println_ansi (kv_line "Command" (cfg.command ^ " " ^ String.concat " " cfg.args));
+    let h = Lazy.force host in
+    let prefix = cfg.name ^ "_" in
+    let tools = List.filter (fun t ->
+      let n = Tool.name_of_packed t in
+      String.length n > String.length prefix && String.sub n 0 (String.length prefix) = prefix
+    ) (Plugin_host.tools h) in
+    println_ansi (kv_line "Tools" (string_of_int (List.length tools)));
+    List.iter (fun t ->
+      println_ansi (Printf.sprintf "  %s  %s"
+        (cyan (Tool.name_of_packed t))
+        (dim (truncate_visible (Tool.description_of_packed t) 60)))
+    ) tools
+
+let run_mcp_add transport no_probe name command args =
+  let transport = Option.value ~default:"stdio" transport in
+  if not no_probe then begin
+    println_ansi (dim (Printf.sprintf "Probing MCP server '%s' (%s %s)..." name command (String.concat " " args)));
+    match Mcp.probe_server name command args with
+    | Error err ->
+      Printf.eprintf "Error: Probe failed for '%s': %s\n%!" name err;
+      exit 1
+    | Ok (client, tools) ->
+      (try client.close () with _ -> ());
+      println_ansi (green (Printf.sprintf "✓ Probe successful (%d tools discovered)" (List.length tools)))
+  end;
+  let cfg = { Config.name; transport; command; args } in
+  match Config.add_mcp_server cfg with
+  | Ok path ->
+    println_ansi (green (Printf.sprintf "✓ Added MCP server '%s' to %s" name path))
+  | Error err ->
+    Printf.eprintf "Error: %s\n%!" err;
+    exit 1
+
+let run_mcp_remove name =
+  match Config.delete_mcp_server name with
+  | Ok path ->
+    println_ansi (green (Printf.sprintf "✓ Removed MCP server '%s' from %s" name path))
+  | Error err ->
+    Printf.eprintf "Error: %s\n%!" err;
+    exit 1
+
+let mcp_cmd =
+  let name_pos = Arg.(required & pos 0 (some string) None & info [] ~docv:"NAME" ~doc:"Server name.") in
+  let cmd_pos = Arg.(required & pos 1 (some string) None & info [] ~docv:"COMMAND" ~doc:"Command to execute.") in
+  let args_pos = Arg.(value & pos_right 1 string [] & info [] ~docv:"ARGS" ~doc:"Arguments to pass to command.") in
+  let transport_opt = Arg.(value & opt (some string) None & info ["transport"] ~docv:"TRANSPORT" ~doc:"Transport type (stdio).") in
+  let no_probe_flag = Arg.(value & flag & info ["no-probe"] ~doc:"Skip probing connection before saving.") in
+
+  let list_cmd =
+    let doc = "List configured MCP servers and their health status." in
+    let info = Cmd.info "list" ~doc in
+    Cmd.v info Term.(const run_mcp_list $ const ())
+  in
+  let get_cmd =
+    let doc = "Show details and tools for an MCP server." in
+    let info = Cmd.info "get" ~doc in
+    Cmd.v info Term.(const run_mcp_get $ name_pos)
+  in
+  let add_cmd =
+    let doc = "Add an MCP server configuration." in
+    let man = [
+      `S Manpage.s_examples;
+      `P "caravan mcp add github -- npx -y @modelcontextprotocol/server-github";
+      `P "caravan mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp";
+    ] in
+    let info = Cmd.info "add" ~doc ~man in
+    Cmd.v info Term.(const run_mcp_add $ transport_opt $ no_probe_flag $ name_pos $ cmd_pos $ args_pos)
+  in
+  let remove_cmd =
+    let doc = "Remove an MCP server configuration." in
+    let info = Cmd.info "remove" ~doc in
+    Cmd.v info Term.(const run_mcp_remove $ name_pos)
+  in
+  let rm_cmd =
+    let doc = "Alias of $(b,caravan mcp remove)." in
+    let info = Cmd.info "rm" ~doc in
+    Cmd.v info Term.(const run_mcp_remove $ name_pos)
+  in
+  let info = Cmd.info "mcp" ~doc:"Manage Model Context Protocol (MCP) servers." in
+  Cmd.group ~default:Term.(const run_mcp_list $ const ()) info [list_cmd; get_cmd; add_cmd; remove_cmd; rm_cmd]
+
 (* ── Entry point ──────────────────────────────────────────────────────── *)
 
 let () =
@@ -1355,6 +1554,7 @@ let () =
   let default_cmd = Term.(const run_repl $ model_arg $ provider_arg $ base_url_arg $ system_arg $ verbose_arg) in
   let cmd = Cmd.group ~default:default_cmd info
     [ repl_cmd; agent_cmd; run_cmd; complete_cmd; models_cmd; providers_cmd;
-      init_cmd; doctor_cmd; config_cmd; web_cmd ]
+      init_cmd; doctor_cmd; config_cmd; web_cmd; mcp_cmd ]
   in
   exit (Cmd.eval cmd)
+

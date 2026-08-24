@@ -100,6 +100,38 @@ let%test_unit "config_extended" =
   let _ = Config.get_mcp_servers () in
   ()
 
+let%test_unit "mcp_config_crud_table_driven" =
+  with_tmp_config ~name:"test_mcp_config" ~toml_content:"" (fun _ ->
+    let check ~cfg ~expected_count =
+      let res = Config.add_mcp_server cfg in
+      assert (Result.is_ok res);
+      let servers = Config.get_mcp_servers () in
+      assert (List.length servers = expected_count);
+      let fetched = Config.get_mcp_server cfg.Config.name in
+      assert (Option.is_some fetched);
+      let f = Option.get fetched in
+      assert (f.Config.name = cfg.Config.name);
+      assert (f.Config.command = cfg.Config.command);
+      assert (f.Config.args = cfg.Config.args)
+    in
+    check ~cfg:{ name = "github"; transport = "stdio"; command = "npx"; args = ["-y"; "@modelcontextprotocol/server-github"] } ~expected_count:1;
+    check ~cfg:{ name = "fs"; transport = "stdio"; command = "npx"; args = ["-y"; "@modelcontextprotocol/server-filesystem"; "/tmp"] } ~expected_count:2;
+
+    (* Test duplicate addition failure *)
+    let dup_res = Config.add_mcp_server { name = "github"; transport = "stdio"; command = "npx"; args = [] } in
+    assert (Result.is_error dup_res);
+
+    (* Test deletion *)
+    let del_res = Config.delete_mcp_server "github" in
+    assert (Result.is_ok del_res);
+    assert (List.length (Config.get_mcp_servers ()) = 1);
+    assert (Config.get_mcp_server "github" = None);
+
+    (* Test deleting non-existent server *)
+    let del_err = Config.delete_mcp_server "nonexistent" in
+    assert (Result.is_error del_err)
+  )
+
 let%test_unit "config_orchestrator_parsing" =
   let tmp_config = "test_work_config.toml" in
   let oc = open_out tmp_config in

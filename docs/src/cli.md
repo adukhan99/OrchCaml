@@ -15,8 +15,16 @@ Every command accepts `-p/--provider`, `-m/--model`, `--base-url`,
 | `caravan providers [--ladder]` | provider table / model ladder |
 | `caravan models` | models on the current provider |
 | `caravan config show\|path\|keys\|get K\|set K V` | inspect or edit the config |
+| `caravan mcp add\|remove\|list\|get` | manage Model Context Protocol (MCP) servers |
 | `caravan init` | setup wizard |
 | `caravan doctor` | diagnostics (exit 1 on failure) |
+
+### `caravan mcp`
+
+- `caravan mcp list` — list configured MCP servers and their health status
+- `caravan mcp get <name>` — inspect an MCP server and its discovered tools
+- `caravan mcp add <name> [--transport stdio] [--no-probe] -- <command> [args...]` — probe connection, register tools, and save to config
+- `caravan mcp remove <name>` (or `rm`) — remove an MCP server configuration
 
 ### `caravan agent`
 
@@ -44,6 +52,7 @@ Typing `/` opens a live palette (Tab completes). Highlights:
 | `/system` `/temp` `/top_p` `/top_k` `/max_tokens` `/seed` `/stop` | generation |
 | `/memory <n>` · `/summarise` | context window / compact now |
 | `/history` · `/export [file]` · `/tools` | inspect the session |
+| `/mcp [list\|add\|get\|remove]` | manage MCP tool servers and dynamic tool bindings |
 | `/plugins [enable\|disable <id>]` | plugin composition and lifecycle states |
 | `/doctor` · `/init` | pre-run commands, callable in-session |
 | `/clear` · `/help` · `/quit` | housekeeping |

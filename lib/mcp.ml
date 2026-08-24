@@ -198,6 +198,13 @@ let list_tools client =
       Trace.log "error" "MCP: error parsing tools for %s: %s" client.name (Printexc.to_string exn);
       []
 
+let probe_server ?mgr ?sw name command args =
+  match connect ?mgr ?sw name command args with
+  | Error err -> Error err
+  | Ok client ->
+    let tools = list_tools client in
+    Ok (client, tools)
+
 
 let parse_call_response json =
   let open Yojson.Safe.Util in

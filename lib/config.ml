@@ -299,6 +299,81 @@ let assoc_int_opt fields key =
   | Some (Otoml.TomlInteger n) -> Some n
   | _ -> None
 
+(** Get a single MCP server config by name. *)
+let get_mcp_server name =
+  List.find_opt (fun (s : mcp_server_config) -> s.name = name) (get_mcp_servers ())
+
+(** Append a new [[mcp.servers]] entry to the config file. *)
+let add_mcp_server (cfg : mcp_server_config) : (string, string) result =
+  if String.trim cfg.name = "" then Error "server name must not be empty"
+  else if String.trim cfg.command = "" then Error "command must not be empty"
+  else begin
+    let path = config_path () in
+    try
+      let ast =
+        if Sys.file_exists path then
+          (try Otoml.Parser.from_file path with _ -> Otoml.TomlTable [])
+        else Otoml.TomlTable []
+      in
+      let existing = get_mcp_servers () in
+      if List.exists (fun (s : mcp_server_config) -> s.name = cfg.name) existing then
+        Error (Printf.sprintf "mcp server '%s' already exists" cfg.name)
+      else begin
+        let entry = Otoml.TomlTable [
+          ("name",      Otoml.string cfg.name);
+          ("transport", Otoml.string cfg.transport);
+          ("command",   Otoml.string cfg.command);
+          ("args",      Otoml.TomlArray (List.map Otoml.string cfg.args));
+        ] in
+        let existing_nodes =
+          try match Otoml.find ast (fun x -> x) ["mcp"; "servers"] with
+            | Otoml.TomlArray l | Otoml.TomlTableArray l -> l
+            | _ -> []
+          with _ -> []
+        in
+        let new_arr = Otoml.TomlTableArray (existing_nodes @ [entry]) in
+        let ast' = Otoml.update ast ["mcp"; "servers"] (Some new_arr) in
+        let ast'' = ensure_orchestrator_in_ast ast' in
+        write_ast ast''
+      end
+    with exn -> Error (Printexc.to_string exn)
+  end
+
+(** Remove a [[mcp.servers]] entry by name. *)
+let delete_mcp_server name : (string, string) result =
+  let path = config_path () in
+  try
+    let ast =
+      if Sys.file_exists path then
+        (try Otoml.Parser.from_file path with _ -> Otoml.TomlTable [])
+      else Otoml.TomlTable []
+    in
+    let existing_nodes =
+      try match Otoml.find ast (fun x -> x) ["mcp"; "servers"] with
+        | Otoml.TomlArray l | Otoml.TomlTableArray l -> l
+        | _ -> []
+      with _ -> []
+    in
+    let filtered =
+      List.filter (fun item ->
+        match item with
+        | Otoml.TomlTable fs | Otoml.TomlInlineTable fs ->
+          assoc_string_opt fs "name" <> Some name
+        | _ -> true
+      ) existing_nodes
+    in
+    if List.length filtered = List.length existing_nodes then
+      Error (Printf.sprintf "mcp server '%s' not found" name)
+    else begin
+      let value =
+        if filtered = [] then None
+        else Some (Otoml.TomlTableArray filtered)
+      in
+      let ast' = Otoml.update ast ["mcp"; "servers"] value in
+      write_ast ast'
+    end
+  with exn -> Error (Printexc.to_string exn)
+
 (** Read a TOML float field. Accepts both TomlFloat and TomlInteger. *)
 let assoc_float_opt fields key =
   match List.assoc_opt key fields with
