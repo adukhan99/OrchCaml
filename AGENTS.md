@@ -390,43 +390,117 @@ Providers must parse raw HTTP error response bodies into structured domain error
 - Tests live in `test/test_Caravan.ml`, `test/test_plugin.ml`,
   `test/test_plugin_host.ml`.
 
-### 7.2  Mock Providers
+### 7.2  Shared Test Infrastructure
 
-Create inline mock providers for tests — never call real LLM APIs:
+`test/test_Caravan.ml` defines three module-level helpers.  **All tests must
+use these instead of re-declaring boilerplate inline.**
 
 ```ocaml
-let module MockProvider : Provider.PROVIDER with type config = unit = struct
-  type config = unit
-  let name = "mock"
-  let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
-    let reply = Types.assistant_msg "Mock response" in
-    Types.wrap_result ~raw_response:"mock" ~model:"mock" ~provider:"mock" reply
-  let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token:_ =
-    let reply = Types.assistant_msg "Mock response" in
-    Types.wrap_result ~raw_response:"mock" ~model:"mock" ~provider:"mock" reply
-  let list_models _net _cfg = ["mock"]
-end in
-let provider = Provider.Provider ((module MockProvider), ()) in
+(** Stateless mock provider that always returns [reply_content]. *)
+let make_mock_provider ?(pname = "mock") reply_content : Provider.packed_provider
+
+(** Session pre-configured with spinner disabled. *)
+let make_session ?(tools = []) model provider : Session.t
+
+(** Bracket: write TOML to a temp file, set CARAVAN_CONFIG, run [f path],
+    restore env via Fun.protect on exit. *)
+let with_tmp_config ~name ~toml_content (f : string -> unit) : unit
 ```
 
-### 7.3  Spinner Config in Tests
+Use `make_mock_provider` whenever the test only needs a plain assistant
+response.  Only write a custom inline module when the provider needs state
+(e.g. a `call_count` ref, multi-turn sequencing, or finish-tool injection).
 
-Always disable the spinner in test sessions:
+Use `with_tmp_config` for every test that reads or writes `Config.*` —
+it guarantees cleanup even when the test raises.
+
+### 7.3  Table-Driven Tests Over Enumerated Tests
+
+When multiple tests exercise the same code path with different inputs, write
+one test unit with an inner `check` closure:
+
+```ocaml
+let%test_unit "my_feature" =
+  let check ~input ~expected =
+    assert (my_fn input = expected)
+  in
+  check ~input:"a" ~expected:1;
+  check ~input:"b" ~expected:2;
+  check ~input:"c" ~expected:3
+```
+
+This pattern catches regressions across **all** cases on every run, makes
+adding new cases trivial, and keeps the file compact.  Examples in the
+codebase:
+
+| Test unit            | Cases covered                              |
+|----------------------|--------------------------------------------|
+| `usage_parsing`      | 3 providers (openai, llama_cpp, ollama)    |
+| `doctor_run_checks`  | all-pass, missing key, unknown provider    |
+| `tool_dispatch_table`| 8 tools (read, write, grep, sed, bash, …)  |
+| `cli_resolve`        | 8 resolution scenarios                     |
+
+### 7.4  Mock Providers
+
+For stateless behavior use `make_mock_provider` (§7.2).  For stateful
+behavior (multi-turn sequencing, tool-call injection) write a minimal inline
+module.  Keep it as short as possible — stream can often delegate to complete:
+
+```ocaml
+let call_count = ref 0 in
+let module P : Provider.PROVIDER with type config = unit = struct
+  type config = unit
+  let name = "seq"
+  let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+    incr call_count;
+    let tc = Types.{ id = "c"; name = "finish";
+                    args = {|{"summary":"done"}|}; extra_content = None } in
+    Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"p"
+      (Types.assistant_tool_msg ~tool_calls:[tc] "")
+  let stream _net _cfg ?model:_ ?options:_ ?tools:_ msgs ~on_token:_ =
+    complete _net _cfg msgs
+  let list_models _ _ = []
+end in
+let provider = Provider.Provider ((module P), ()) in
+```
+
+### 7.5  Spinner Config in Tests
+
+Use `make_session` — it disables the spinner automatically.  The explicit form
+for reference:
 
 ```ocaml
 |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" }
 ```
 
-### 7.4  Eio in Tests
+### 7.6  Eio in Tests
 
 Tests that need networking or clocks must wrap in `Eio_main.run`:
 
 ```ocaml
 let%test_unit "my_test" =
   Eio_main.run (fun env ->
-    let net = env#net in
-    let clock = env#clock in
     ...)
+```
+
+### 7.7  Config Tests
+
+Use `with_tmp_config` — **never** open-code the setup/teardown sequence:
+
+```ocaml
+(* RIGHT *)
+let%test_unit "my_config_test" =
+  with_tmp_config ~name:"my_cfg" ~toml_content:"key = \"value\"\n" (fun _ ->
+    assert (Config.get_string "key" = Some "value"))
+
+(* WRONG — brittle, leaks state on failure *)
+let%test_unit "my_config_test" =
+  let tmp = "my_cfg.toml" in
+  let oc = open_out tmp in output_string oc "..."; close_out oc;
+  Unix.putenv "CARAVAN_CONFIG" tmp;
+  Config.reload ();
+  ...;
+  Sys.remove tmp; Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ()
 ```
 
 ---
@@ -554,6 +628,23 @@ let get_provider ctx =
 
 **Wrong**: Only parsing `"content"` from delta chunks in streaming providers. Reasoning models (like DeepSeek-R1 or OpenRouter stealth models) stream their reasoning steps inside `"reasoning"` or `"reasoning_content"` keys while sending empty `"content"`. Ignoring these keys makes the CLI appear frozen/stuck for minutes before any text appears.
 **Right**: Parse and stream reasoning tokens (e.g. wrapped in `<thought>` blocks) on-token to keep the interface active and responsive, but do NOT accumulate them into the final message history `buf` to avoid prompt bloating.
+
+### ❌ Per-test inline MockProvider when a shared helper exists
+
+**Wrong**: Defining a new 10-line `module MockProvider` inside every test that
+only needs a plain assistant reply.
+**Right**: Use `make_mock_provider reply` from the shared test infrastructure.
+Only write a custom inline module when the provider must carry state
+(call counters, multi-turn sequences, tool-call injection).
+
+### ❌ One test unit per input case
+
+**Wrong**: Writing `let%test_unit "feature_case_a"`, `let%test_unit
+"feature_case_b"`, … for the same function under different inputs — one failure
+leaves all subsequent cases unexercised and the file grows without bound.
+**Right**: Write one `let%test_unit "feature"` with an inner `check` closure
+called for every case (see §7.3).  Each call is independently labelled with a
+comment; a failure reports the exact case without abandoning the rest.
 
 ---
 

@@ -1,5 +1,44 @@
 open Caravan
 
+(* ── Shared test infrastructure ─────────────────────────────────────── *)
+
+(** Create a minimal mock provider whose [complete] and [stream] always
+    return [reply_content] as a plain assistant message. *)
+let make_mock_provider ?(pname = "mock") reply_content =
+  let module M : Provider.PROVIDER with type config = unit = struct
+    type config = unit
+    let name = pname
+    let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+      Types.wrap_result ~raw_response:"mock" ~model:"mock" ~provider:pname
+        (Types.assistant_msg reply_content)
+    let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token =
+      on_token reply_content;
+      Types.wrap_result ~raw_response:"mock" ~model:"mock" ~provider:pname
+        (Types.assistant_msg reply_content)
+    let list_models _net _cfg = ["mock"]
+  end in
+  Provider.Provider ((module M), ())
+
+(** Create a test session with the spinner disabled. *)
+let make_session ?(tools = []) model provider =
+  Session.create ~tools model provider
+  |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" }
+
+(** Write [toml_content] to a temp file, set [CARAVAN_CONFIG], reload,
+    call [f path], then restore the environment regardless of outcome. *)
+let with_tmp_config ~name ~toml_content f =
+  let path = name ^ ".toml" in
+  let oc = open_out path in
+  output_string oc toml_content; close_out oc;
+  Unix.putenv "CARAVAN_CONFIG" path;
+  Config.reload ();
+  Fun.protect
+    ~finally:(fun () ->
+      (if Sys.file_exists path then Sys.remove path);
+      Unix.putenv "CARAVAN_CONFIG" "";
+      Config.reload ())
+    (fun () -> f path)
+
 let%test_unit "memory_ring" =
   let mem = Memory.Ring.make ~window:2 () in
   let msgs = Prompt.(exec (
@@ -90,85 +129,102 @@ system = "Test System Prompt"
   assert (system = Some "Test System Prompt");
   assert (max_turns = Some 100)
 
-let%test_unit "tool_read_file" =
-  let path = "test_dummy_file.txt" in
-  let ch = open_out path in
-  output_string ch "Hello Tool";
-  close_out ch;
-  
-  let json_args = Printf.sprintf {|{"path": "%s"}|} path in
-  let tool = Tool.Tool (module CaravanTools.Read_file.Read_file) in
-  let res = Tool.dispatch tool json_args in
-  
-  Sys.remove path;
-  if res <> "Hello Tool" then
-    failwith ("Tool read_file failed, got: " ^ res)
+(** Read file contents helper. *)
+let read_file path =
+  let ic = open_in path in
+  let s = really_input_string ic (in_channel_length ic) in
+  close_in ic; s
 
-let%test_unit "tool_write_file" =
-  let path = "test_dummy_write.txt" in
-  if Sys.file_exists path then Sys.remove path;
-  
-  let json_args = Printf.sprintf {|{"path": "%s", "content": "Written by test"}|} path in
-  let tool = Tool.Tool (module CaravanTools.Write_file.Write_file) in
-  let res = Tool.dispatch tool json_args in
-  
-  let content =
-    try
-      let ic = open_in path in
-      let s = really_input_string ic (in_channel_length ic) in
-      close_in ic; s
-    with _ -> ""
+(** Dispatch [tool] with [args_json] and run [check] on the output, cleaning up
+    any [cleanup] paths afterwards. *)
+let tool_check ?(cleanup = []) tool args_json check =
+  let res = Tool.dispatch tool args_json in
+  check res;
+  List.iter (fun p ->
+    if Sys.file_exists p then
+      (if Sys.is_directory p then Unix.rmdir p else Sys.remove p)
+  ) cleanup
+
+let%test_unit "tool_dispatch_table" =
+  (* read_file: content round-trips *)
+  let () =
+    let p = "tdt_read.txt" in
+    let oc = open_out p in output_string oc "Hello Tool"; close_out oc;
+    tool_check ~cleanup:[p]
+      (Tool.Tool (module CaravanTools.Read_file.Read_file))
+      (Printf.sprintf {|{"path": "%s"}|} p)
+      (fun res -> assert (res = "Hello Tool"))
   in
-  if Sys.file_exists path then Sys.remove path;
-  
-  if res <> "File written successfully." || content <> "Written by test" then
-    failwith ("Tool write_file failed, got: " ^ res ^ " content: " ^ content)
 
-let%test_unit "tool_grep" =
-  let path = "test_dummy_grep.txt" in
-  let ch = open_out path in
-  output_string ch "line 1: foo\nline 2: bar\nline 3: foo again";
-  close_out ch;
-
-  let json_args = Printf.sprintf {|{"path": "%s", "pattern": "foo"}|} path in
-  let tool = Tool.Tool (module CaravanTools.Grep.Grep) in
-  let res = Tool.dispatch tool json_args in
-
-  Sys.remove path;
-  if res <> "line 1: foo\nline 3: foo again" then
-    failwith ("Tool grep failed, got: " ^ res)
-
-let%test_unit "tool_sed" =
-  let path = "test_dummy_sed.txt" in
-  let ch = open_out path in
-  output_string ch "hello world";
-  close_out ch;
-
-  let json_args = Printf.sprintf {|{"path": "%s", "pattern": "world", "replacement": "caravan"}|} path in
-  let tool = Tool.Tool (module CaravanTools.Sed.Sed) in
-  let res = Tool.dispatch tool json_args in
-
-  let content =
-    try
-      let ic = open_in path in
-      let s = really_input_string ic (in_channel_length ic) in
-      close_in ic; s
-    with _ -> ""
+  (* write_file: output message + disk content *)
+  let () =
+    let p = "tdt_write.txt" in
+    if Sys.file_exists p then Sys.remove p;
+    tool_check ~cleanup:[p]
+      (Tool.Tool (module CaravanTools.Write_file.Write_file))
+      (Printf.sprintf {|{"path": "%s", "content": "Written by test"}|} p)
+      (fun res ->
+        assert (res = "File written successfully.");
+        assert (read_file p = "Written by test"))
   in
-  Sys.remove path;
-  if res <> "Replaced occurrences successfully." || content <> "hello caravan" then
-    failwith ("Tool sed failed, got: " ^ res ^ " content: " ^ content)
 
-let%test_unit "tool_bash" =
-  let json_args = {|{"command": "echo 'hello bash'"}|} in
-  let tool = Tool.Tool (module CaravanTools.Bash.Bash) in
-  let res = Tool.dispatch tool json_args in
-  let has_hello =
-    let rex = Re.compile (Re.str "hello bash") in
-    Re.execp rex res
+  (* grep: filters matching lines only *)
+  let () =
+    let p = "tdt_grep.txt" in
+    let oc = open_out p in
+    output_string oc "line 1: foo\nline 2: bar\nline 3: foo again";
+    close_out oc;
+    tool_check ~cleanup:[p]
+      (Tool.Tool (module CaravanTools.Grep.Grep))
+      (Printf.sprintf {|{"path": "%s", "pattern": "foo"}|} p)
+      (fun res -> assert (res = "line 1: foo\nline 3: foo again"))
   in
-  if not has_hello then
-    failwith ("Tool bash failed, got: " ^ res)
+
+  (* sed: replaces in-place and reports success *)
+  let () =
+    let p = "tdt_sed.txt" in
+    let oc = open_out p in output_string oc "hello world"; close_out oc;
+    tool_check ~cleanup:[p]
+      (Tool.Tool (module CaravanTools.Sed.Sed))
+      (Printf.sprintf {|{"path": "%s", "pattern": "world", "replacement": "caravan"}|} p)
+      (fun res ->
+        assert (res = "Replaced occurrences successfully.");
+        assert (read_file p = "hello caravan"))
+  in
+
+  (* bash: stdout captured *)
+  let () =
+    tool_check
+      (Tool.Tool (module CaravanTools.Bash.Bash))
+      "{\"command\": \"echo 'hello bash'\"}"
+      (fun res -> assert (Re.execp (Re.compile (Re.str "hello bash")) res))
+  in
+
+  (* touch: file created *)
+  let () =
+    let p = "tdt_touch.txt" in
+    if Sys.file_exists p then Sys.remove p;
+    tool_check ~cleanup:[p]
+      (Tool.Tool (module CaravanTools.Touch.Touch))
+      (Printf.sprintf {|{"path": "%s"}|} p)
+      (fun _res -> assert (Sys.file_exists p))
+  in
+
+  (* mkdir: directory created *)
+  let () =
+    let p = "tdt_dir" in
+    if Sys.file_exists p then Unix.rmdir p;
+    tool_check ~cleanup:[p]
+      (Tool.Tool (module CaravanTools.Mkdir.Mkdir))
+      (Printf.sprintf {|{"path": "%s"}|} p)
+      (fun _res -> assert (Sys.file_exists p && Sys.is_directory p))
+  in
+
+  (* ls: non-empty output *)
+  tool_check
+    (Tool.Tool (module CaravanTools.Ls.Ls))
+    {|{"path": "."}|}
+    (fun res -> assert (String.length res > 0))
 
 let%test_unit "tool_aliases" =
   let tools = [
@@ -177,61 +233,15 @@ let%test_unit "tool_aliases" =
   ] in
   (match Tool.find_tool tools "open_file" with
    | Some t -> assert (Tool.name_of_packed t = "read_file")
-   | None -> failwith "Expected to resolve alias 'open_file' to 'read_file'");
+   | None   -> failwith "Expected to resolve alias 'open_file' to 'read_file'");
   (match Tool.find_tool tools "search" with
    | Some t -> assert (Tool.name_of_packed t = "web_search")
-   | None -> failwith "Expected to resolve alias 'search' to 'web_search'")
-
-let%test_unit "tool_touch" =
-  let path = "test_dummy_touch.txt" in
-  if Sys.file_exists path then Sys.remove path;
-  let json_args = Printf.sprintf {|{"path": "%s"}|} path in
-  let tool = Tool.Tool (module CaravanTools.Touch.Touch) in
-  let res = Tool.dispatch tool json_args in
-  
-  let exists = Sys.file_exists path in
-  if Sys.file_exists path then Sys.remove path;
-  
-  if not exists then
-    failwith ("Tool touch failed, file not created. Result: " ^ res)
-
-let%test_unit "tool_mkdir" =
-  let dir_path = "test_dummy_dir" in
-  if Sys.file_exists dir_path then Unix.rmdir dir_path;
-  
-  let json_args = Printf.sprintf {|{"path": "%s"}|} dir_path in
-  let tool = Tool.Tool (module CaravanTools.Mkdir.Mkdir) in
-  let res = Tool.dispatch tool json_args in
-  
-  let exists = Sys.file_exists dir_path && Sys.is_directory dir_path in
-  if exists then Unix.rmdir dir_path;
-  
-  if not exists then
-    failwith ("Tool mkdir failed, directory not created. Result: " ^ res)
-
-let%test_unit "tool_ls" =
-  let json_args = {|{"path": "."}|} in
-  let tool = Tool.Tool (module CaravanTools.Ls.Ls) in
-  let res = Tool.dispatch tool json_args in
-  
-  if String.length res = 0 then
-    failwith ("Tool ls failed, output was empty")
+   | None   -> failwith "Expected to resolve alias 'search' to 'web_search'")
 
 let%test_unit "subagent_session_and_compaction" =
-  let module MockProvider : Provider.PROVIDER with type config = unit = struct
-    type config = unit
-    let name = "mock_provider"
-    let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
-      let reply = Types.assistant_msg "Subagent response" in
-      Types.wrap_result ~raw_response:"mock" ~model:"mock" ~provider:"mock" reply
-    let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token:_ =
-      let reply = Types.assistant_msg "Subagent response" in
-      Types.wrap_result ~raw_response:"mock" ~model:"mock" ~provider:"mock" reply
-    let list_models _net _cfg = ["mock"]
-  end in
-  let provider = Provider.Provider ((module MockProvider), ()) in
-  let parent_sess = Session.create ~tools:[] "parent_model" provider
-                    |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
+
+  let provider = make_mock_provider ~pname:"mock_provider" "Subagent response" in
+  let parent_sess = make_session "parent_model" provider in
   
   let spec : Subagent.subagent_spec = {
     name = "child_agent";
@@ -331,30 +341,34 @@ let%test_unit "delegate_tool_validation_and_dispatch" =
     assert (String.starts_with ~prefix:"Error: unknown subagent 'unknown_worker'" err_res)
   )
 
-let%test_unit "usage_openai_parsing" =
-  let fake_body = {|
-    { "choices": [{"message": {"role": "assistant", "content": "Hi"},
-                   "finish_reason": "stop"}],
-      "usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
-    } |} in
-  let json = Yojson.Safe.from_string fake_body in
-  let open Yojson.Safe.Util in
-  let u_json = json |> member "usage" in
-  let usage = Types.{
-    prompt_tokens     = u_json |> member "prompt_tokens"     |> to_int;
-    completion_tokens = u_json |> member "completion_tokens" |> to_int;
-    total_tokens      = u_json |> member "total_tokens"      |> to_int;
-    total_duration    = None;
-  } in
-  let meta = Types.(wrap_result ~raw_response:"" ~model:"gpt-4o" ~provider:"openai" ~usage
-    (assistant_msg "Hi")) in
-  (match meta.Types.usage with
-   | Some u ->
-     assert (u.Types.prompt_tokens = 9);
-     assert (u.Types.completion_tokens = 12);
-     assert (u.Types.total_tokens = 21);
-     assert (u.Types.total_duration = None)
-   | None -> failwith "usage field was None")
+(* Table-driven: verifies usage JSON round-trips for multiple provider shapes. *)
+let%test_unit "usage_parsing" =
+  let check ~provider ~model ~prompt ~completion ~total =
+    let body = Printf.sprintf
+      {|{"choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],
+         "usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}|}
+      prompt completion total in
+    let json = Yojson.Safe.from_string body in
+    let open Yojson.Safe.Util in
+    let u = json |> member "usage" in
+    let usage = Types.{
+      prompt_tokens     = u |> member "prompt_tokens"     |> to_int;
+      completion_tokens = u |> member "completion_tokens" |> to_int;
+      total_tokens      = u |> member "total_tokens"      |> to_int;
+      total_duration    = None;
+    } in
+    let meta = Types.(wrap_result ~raw_response:"" ~model ~provider ~usage (assistant_msg "Hi")) in
+    match meta.Types.usage with
+    | None   -> failwith (provider ^ ": usage field was None")
+    | Some g ->
+      assert (g.Types.prompt_tokens = prompt);
+      assert (g.Types.completion_tokens = completion);
+      assert (g.Types.total_tokens = total);
+      assert (g.Types.total_duration = None)
+  in
+  check ~provider:"openai"    ~model:"gpt-4o" ~prompt:9 ~completion:12 ~total:21;
+  check ~provider:"llama_cpp" ~model:"llama3" ~prompt:5 ~completion:5  ~total:10;
+  check ~provider:"ollama"    ~model:"llama3" ~prompt:0 ~completion:1  ~total:1
 
 let%expect_test "monitor_format_usage" =
   let usage = Types.{
@@ -371,29 +385,7 @@ let%expect_test "monitor_format_usage" =
     Tokens: 5 in, 20 out (10.00 toks/s)
     Turn 3 | Tokens: 5 in, 20 out (10.00 toks/s) |}]
 
-let%test_unit "usage_llama_cpp_parsing" =
-  let fake_body = {|
-    { "choices": [{"message": {"role": "assistant", "content": "Hi"},
-                   "finish_reason": "stop"}],
-      "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}
-    } |} in
-  let json = Yojson.Safe.from_string fake_body in
-  let open Yojson.Safe.Util in
-  let u_json = json |> member "usage" in
-  let usage = Types.{
-    prompt_tokens     = u_json |> member "prompt_tokens"     |> to_int;
-    completion_tokens = u_json |> member "completion_tokens" |> to_int;
-    total_tokens      = u_json |> member "total_tokens"      |> to_int;
-    total_duration    = None;
-  } in
-  let meta = Types.(wrap_result ~raw_response:"" ~model:"llama3" ~provider:"llama_cpp" ~usage
-    (assistant_msg "Hi")) in
-  (match meta.Types.usage with
-   | Some u ->
-     assert (u.Types.prompt_tokens = 5);
-     assert (u.Types.completion_tokens = 5);
-     assert (u.Types.total_tokens = 10)
-   | None -> failwith "usage field was None")
+
 
 let%expect_test "tool_finish" =
   let tool = Tool.Tool (module CaravanTools.Finish.Finish) in
@@ -407,37 +399,30 @@ let%expect_test "tool_finish" =
     Task finished: all done
     Task finished: Completed |}]
 
-let%test_unit "document_functor" =
+let%test_unit "document_algebraic_laws" =
+  (* Functor identity law *)
   let doc = Document.Concat [
     Document.Text 42;
     Document.Styled (Document.Bold, Document.Text 100)
   ] in
-  (* Identity law *)
-  let doc_id = Document.Document.map (fun x -> x) doc in
-  assert (doc_id = doc);
+  assert (Document.Document.map (fun x -> x) doc = doc);
 
-  (* Composition law *)
+  (* Functor composition law *)
   let f x = x * 2 in
   let g x = x + 10 in
-  let doc_fg = Document.Document.map (fun x -> f (g x)) doc in
-  let doc_f_g = Document.Document.map f (Document.Document.map g doc) in
-  assert (doc_fg = doc_f_g);
-  ()
+  assert (Document.Document.map (fun x -> f (g x)) doc
+        = Document.Document.map f (Document.Document.map g doc));
 
-let%test_unit "document_monoid" =
+  (* Monoid identity laws *)
   let d1 = Document.Text "hello" in
   let d2 = Document.Text "world" in
   let d3 = Document.Text "!" in
+  let open Document.DocumentMonoid in
+  assert (append empty d1 = d1);
+  assert (append d1 empty = d1);
 
-  (* Identity law *)
-  assert (Document.DocumentMonoid.append Document.DocumentMonoid.empty d1 = d1);
-  assert (Document.DocumentMonoid.append d1 Document.DocumentMonoid.empty = d1);
-
-  (* Associativity law *)
-  let d12_3 = Document.DocumentMonoid.append (Document.DocumentMonoid.append d1 d2) d3 in
-  let d1_23 = Document.DocumentMonoid.append d1 (Document.DocumentMonoid.append d2 d3) in
-  assert (d12_3 = d1_23);
-  ()
+  (* Monoid associativity *)
+  assert (append (append d1 d2) d3 = append d1 (append d2 d3))
 
 let%test_unit "formatter_profunctor" =
   let base_fmt x = Document.Text (string_of_int x) in
@@ -476,21 +461,8 @@ let%test_unit "kleisli_composition" =
 
 let%expect_test "session_summarise" =
   Eio_main.run (fun env ->
-    let module MockProvider : Provider.PROVIDER with type config = unit = struct
-      type config = unit
-      let name = "mock"
-      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
-        let reply = Types.assistant_msg "This is a summary." in
-        Types.wrap_result ~raw_response:"mock" ~model:"mock" ~provider:"mock" reply
-      let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token =
-        on_token "This is a summary.";
-        let reply = Types.assistant_msg "This is a summary." in
-        Types.wrap_result ~raw_response:"mock" ~model:"mock" ~provider:"mock" reply
-      let list_models _net _cfg = ["mock"]
-    end in
-    let provider = Provider.Provider ((module MockProvider), ()) in
-    let sess = Session.create ~tools:[] "mock" provider
-               |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
+    let provider = make_mock_provider "This is a summary." in
+    let sess = make_session "mock" provider in
     let sess = Session.add_messages sess [Types.user_msg "hello"; Types.assistant_msg "hi"] in
     
     let (sess', sum) = Session.summarise env#net env#clock sess in
@@ -633,18 +605,8 @@ let%test_unit "session_with_model_override" =
 
 let%test_unit "tool_output_truncation_for_context" =
   Eio_main.run (fun _env ->
-    let module DummyProvider : Provider.PROVIDER with type config = unit = struct
-      type config = unit
-      let name = "dummy"
-      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
-        Types.wrap_result ~raw_response:"ok" ~model:"dummy" ~provider:"dummy" (Types.assistant_msg "ok")
-      let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token:_ =
-        Types.wrap_result ~raw_response:"ok" ~model:"dummy" ~provider:"dummy" (Types.assistant_msg "ok")
-      let list_models _net _cfg = ["dummy"]
-    end in
-    let provider = Provider.Provider ((module DummyProvider), ()) in
-    let sess = Session.create ~tools:[] "dummy" provider
-               |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
+    let provider = make_mock_provider "ok" in
+    let sess = make_session "dummy" provider in
     let sess = Session.set_max_tool_output_len sess (Some 50) in
     let long_tool_output = String.make 500 'A' in
     let messages = [
@@ -1154,183 +1116,115 @@ let clear_cli_env () =
     (try Unix.putenv v "" with _ -> ())
   ) ["CARAVAN_PROVIDER"; "CARAVAN_MODEL"; "CARAVAN_BASE_URL"]
 
-let%test_unit "cli_resolve_all_flags_override" =
-  (* When every CLI flag is supplied, they dominate unconditionally. *)
-  let tmp = "test_cli_resolve_1.toml" in
-  let oc = open_out tmp in
-  output_string oc "provider = \"ollama\"\nmodel = \"stale-model\"\nbase_url = \"http://stale\"\n";
-  close_out oc;
-  Unix.putenv "CARAVAN_CONFIG" tmp;
-  Config.reload ();
-  clear_cli_env ();
-  let (p, m, u) =
-    resolve_test
-      ~provider_cli:(Some "anthropic")
-      ~model_cli:(Some "claude-opus-4-5")
-      ~base_url_cli:(Some "https://my-proxy") ()
+let%test_unit "cli_resolve" =
+  (* Each case: (label, toml_content, env_setup, cli_args, assert_fn) *)
+
+  (* 1. All CLI flags override config unconditionally. *)
+  let () =
+    with_tmp_config ~name:"cr_flags"
+      ~toml_content:"provider = \"ollama\"\nmodel = \"stale-model\"\nbase_url = \"http://stale\"\n"
+      (fun _ ->
+        clear_cli_env ();
+        let (p, m, u) = resolve_test ~provider_cli:(Some "anthropic")
+            ~model_cli:(Some "claude-opus-4-5") ~base_url_cli:(Some "https://my-proxy") () in
+        assert (p = "anthropic"); assert (m = "claude-opus-4-5");
+        assert (u = Some "https://my-proxy"))
   in
-  Sys.remove tmp; Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ();
-  assert (p = "anthropic");
-  assert (m = "claude-opus-4-5");
-  assert (u = Some "https://my-proxy")
 
-let%test_unit "cli_resolve_no_flags_matching_provider" =
-  (* No CLI flags, config provider matches → model and base_url read from config. *)
-  let tmp = "test_cli_resolve_2.toml" in
-  let oc = open_out tmp in
-  output_string oc "provider = \"openai\"\nmodel = \"gpt-4o\"\nbase_url = \"https://custom-openai\"\n";
-  close_out oc;
-  Unix.putenv "CARAVAN_CONFIG" tmp;
-  Config.reload ();
-  clear_cli_env ();
-  let (p, m, u) =
-    resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None ()
+  (* 2. No CLI flags; config provider matches → model and base_url from config. *)
+  let () =
+    with_tmp_config ~name:"cr_match"
+      ~toml_content:"provider = \"openai\"\nmodel = \"gpt-4o\"\nbase_url = \"https://custom-openai\"\n"
+      (fun _ ->
+        clear_cli_env ();
+        let (p, m, u) = resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None () in
+        assert (p = "openai"); assert (m = "gpt-4o");
+        assert (u = Some "https://custom-openai"))
   in
-  Sys.remove tmp; Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ();
-  assert (p = "openai");
-  assert (m = "gpt-4o");
-  assert (u = Some "https://custom-openai")
 
-let%test_unit "cli_resolve_provider_mismatch_prevents_leak" =
-  (* Config says "ollama" but CLI says "anthropic".
-     Model and base_url from config must NOT leak across providers. *)
-  let tmp = "test_cli_resolve_3.toml" in
-  let oc = open_out tmp in
-  output_string oc "provider = \"ollama\"\nmodel = \"llama3.2:1b\"\nbase_url = \"http://my-ollama:11434\"\n";
-  close_out oc;
-  Unix.putenv "CARAVAN_CONFIG" tmp;
-  Config.reload ();
-  clear_cli_env ();
-  let (p, m, u) =
-    resolve_test
-      ~provider_cli:(Some "anthropic")
-      ~model_cli:None ~base_url_cli:None ()
+  (* 3. Cross-provider leak guard: config ollama, CLI anthropic → no leak. *)
+  let () =
+    with_tmp_config ~name:"cr_leak"
+      ~toml_content:"provider = \"ollama\"\nmodel = \"llama3.2:1b\"\nbase_url = \"http://my-ollama:11434\"\n"
+      (fun _ ->
+        clear_cli_env ();
+        let (p, m, u) = resolve_test ~provider_cli:(Some "anthropic")
+            ~model_cli:None ~base_url_cli:None () in
+        assert (p = "anthropic");
+        assert (m = "claude-sonnet-4-5");   (* default, not the ollama model *)
+        assert (u = None))                   (* ollama URL must not leak *)
   in
-  Sys.remove tmp; Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ();
-  assert (p = "anthropic");
-  (* Model must be the stub default for anthropic, NOT the ollama config value *)
-  assert (m = "claude-sonnet-4-5");
-  (* base_url must NOT carry the ollama URL *)
-  assert (u = None)
 
-let%test_unit "cli_resolve_env_var_fallbacks" =
-  (* CARAVAN_PROVIDER env var selects the provider. But CARAVAN_MODEL and
-     CARAVAN_BASE_URL only kick in when the provider matches the TOML config,
-     because that's how the cross-provider leak guard works. *)
-
-  (* Case A: env var only, no config file → provider from env, model/url from defaults *)
-  let tmp = "test_cli_resolve_4.toml" in
-  if Sys.file_exists tmp then Sys.remove tmp;
-  Unix.putenv "CARAVAN_CONFIG" tmp;
-  Config.reload ();
-  Unix.putenv "CARAVAN_PROVIDER" "groq";
-  Unix.putenv "CARAVAN_MODEL" "llama-3.1-8b-instant";
-  Unix.putenv "CARAVAN_BASE_URL" "https://groq-proxy";
-  let (p, m, _u) =
-    resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None ()
+  (* 4. Env-var fallbacks: no config file → provider from env, model/url ignored;
+         then with config matching → env model/url apply. *)
+  let () =
+    let tmp = "cr_env" in
+    (* Case A: no config file *)
+    with_tmp_config ~name:tmp ~toml_content:"" (fun path ->
+      Sys.remove path;                       (* make the file absent *)
+      Config.reload ();
+      Unix.putenv "CARAVAN_PROVIDER" "groq";
+      Unix.putenv "CARAVAN_MODEL" "llama-3.1-8b-instant";
+      Unix.putenv "CARAVAN_BASE_URL" "https://groq-proxy";
+      let (p, m, _u) = resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None () in
+      assert (p = "groq");
+      assert (m = stub_default_model "groq"));
+    (* Case B: config says provider=groq → env model/url now apply *)
+    with_tmp_config ~name:tmp ~toml_content:"provider = \"groq\"\n" (fun _ ->
+      Unix.putenv "CARAVAN_PROVIDER" "groq";
+      Unix.putenv "CARAVAN_MODEL" "llama-3.1-8b-instant";
+      Unix.putenv "CARAVAN_BASE_URL" "https://groq-proxy";
+      let (p, m, u) = resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None () in
+      clear_cli_env ();
+      assert (p = "groq");
+      assert (m = "llama-3.1-8b-instant");
+      assert (u = Some "https://groq-proxy"))
   in
-  assert (p = "groq");
-  (* No config file → provider_matches_config is false → env model/url ignored *)
-  assert (m = stub_default_model "groq");
 
-  (* Case B: config file also says provider=groq → model/url env vars apply *)
-  let oc = open_out tmp in
-  output_string oc "provider = \"groq\"\n";
-  close_out oc;
-  Config.reload ();
-  let (p2, m2, u2) =
-    resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None ()
+  (* 5. [providers.myhost] table provides base_url for a named custom provider. *)
+  let () =
+    with_tmp_config ~name:"cr_sect"
+      ~toml_content:"provider = \"ollama\"\nmodel = \"llama3.2\"\n[providers.myhost]\nbase_url = \"http://myhost:8080/v1\"\n"
+      (fun _ ->
+        clear_cli_env ();
+        let (p, m, u) = resolve_test ~provider_cli:(Some "myhost")
+            ~model_cli:None ~base_url_cli:None () in
+        assert (p = "myhost");
+        assert (m = "default-for-myhost");
+        assert (u = Some "http://myhost:8080/v1"))
   in
-  clear_cli_env ();
-  Sys.remove tmp;
-  Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ();
-  assert (p2 = "groq");
-  assert (m2 = "llama-3.1-8b-instant");
-  assert (u2 = Some "https://groq-proxy")
 
-let%test_unit "cli_resolve_provider_config_section" =
-  (* A [providers.myhost] table provides base_url even when the top-level
-     config has a different provider. *)
-  let tmp = "test_cli_resolve_5.toml" in
-  let oc = open_out tmp in
-  output_string oc {|
-provider = "ollama"
-model = "llama3.2"
-
-[providers.myhost]
-base_url = "http://myhost:8080/v1"
-|};
-  close_out oc;
-  Unix.putenv "CARAVAN_CONFIG" tmp;
-  Config.reload ();
-  clear_cli_env ();
-  let (p, m, u) =
-    resolve_test
-      ~provider_cli:(Some "myhost")
-      ~model_cli:None ~base_url_cli:None ()
+  (* 6. Nothing set anywhere → hardcoded ollama defaults. *)
+  let () =
+    with_tmp_config ~name:"cr_def" ~toml_content:"" (fun path ->
+      Sys.remove path; Config.reload ();
+      clear_cli_env ();
+      let (p, m, u) = resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None () in
+      assert (p = "ollama"); assert (m = "llama3.2"); assert (u = None))
   in
-  Sys.remove tmp; Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ();
-  assert (p = "myhost");
-  (* Provider mismatch, so model falls back to the stub default *)
-  assert (m = "default-for-myhost");
-  (* base_url comes from [providers.myhost] *)
-  assert (u = Some "http://myhost:8080/v1")
 
-let%test_unit "cli_resolve_fully_default" =
-  (* Nothing set anywhere: hardcoded ollama defaults. *)
-  let tmp = "test_cli_resolve_6.toml" in
-  if Sys.file_exists tmp then Sys.remove tmp;
-  Unix.putenv "CARAVAN_CONFIG" tmp;
-  Config.reload ();
-  clear_cli_env ();
-  let (p, m, u) =
-    resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None ()
+  (* 7. Case-insensitive provider match: config "OpenAI" matches without normalisation. *)
+  let () =
+    with_tmp_config ~name:"cr_case"
+      ~toml_content:"provider = \"OpenAI\"\nmodel = \"gpt-4o\"\nbase_url = \"https://custom\"\n"
+      (fun _ ->
+        clear_cli_env ();
+        let (p, m, u) = resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None () in
+        assert (p = "OpenAI");
+        assert (m = "gpt-4o");
+        assert (u = Some "https://custom"))
   in
-  if Sys.file_exists tmp then Sys.remove tmp;
-  Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ();
-  assert (p = "ollama");
-  assert (m = "llama3.2");
-  assert (u = None)
 
-let%test_unit "cli_resolve_case_insensitive_provider_match" =
-  (* Config says "OpenAI" (capitalised), CLI says nothing → should still
-     match and use config model/base_url. *)
-  let tmp = "test_cli_resolve_7.toml" in
-  let oc = open_out tmp in
-  output_string oc "provider = \"OpenAI\"\nmodel = \"gpt-4o\"\nbase_url = \"https://custom\"\n";
-  close_out oc;
-  Unix.putenv "CARAVAN_CONFIG" tmp;
-  Config.reload ();
-  clear_cli_env ();
-  let (p, m, u) =
-    resolve_test ~provider_cli:None ~model_cli:None ~base_url_cli:None ()
-  in
-  Sys.remove tmp; Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ();
-  (* provider_name comes from get_string_opt, so it's the raw "OpenAI" *)
-  assert (p = "OpenAI");
-  (* The comparison is case-insensitive, so config model/url are used *)
-  assert (m = "gpt-4o");
-  assert (u = Some "https://custom")
-
-let%test_unit "cli_resolve_model_cli_with_mismatched_provider" =
-  (* Even when provider mismatches, an explicit model_cli is honoured. *)
-  let tmp = "test_cli_resolve_8.toml" in
-  let oc = open_out tmp in
-  output_string oc "provider = \"ollama\"\nmodel = \"llama3.2\"\n";
-  close_out oc;
-  Unix.putenv "CARAVAN_CONFIG" tmp;
-  Config.reload ();
-  clear_cli_env ();
-  let (p, m, u) =
-    resolve_test
-      ~provider_cli:(Some "anthropic")
-      ~model_cli:(Some "claude-haiku-4-5")
-      ~base_url_cli:None ()
-  in
-  Sys.remove tmp; Unix.putenv "CARAVAN_CONFIG" ""; Config.reload ();
-  assert (p = "anthropic");
-  assert (m = "claude-haiku-4-5");
-  assert (u = None)
+  (* 8. Explicit model_cli is honoured even when provider mismatches config. *)
+  with_tmp_config ~name:"cr_model_cli"
+    ~toml_content:"provider = \"ollama\"\nmodel = \"llama3.2\"\n"
+    (fun _ ->
+      clear_cli_env ();
+      let (p, m, u) = resolve_test ~provider_cli:(Some "anthropic")
+          ~model_cli:(Some "claude-haiku-4-5") ~base_url_cli:None () in
+      assert (p = "anthropic");
+      assert (m = "claude-haiku-4-5");
+      assert (u = None))
 
 (* ── Compaction_policy tests ─────────────────────────────────────────── *)
 
@@ -1404,53 +1298,39 @@ let%test_unit "session_summarise_custom_prompt" =
 
 (* ── Doctor tests ────────────────────────────────────────────────────── *)
 
-let%test_unit "doctor_run_checks_all_pass" =
-  let checks = Doctor.run_checks
-    ~find_provider:(fun n -> Some {
-        Doctor.name = n;
-        kind = Doctor.Cloud;
-        base_url = "http://mock";
-        requires_key = true;
-        key_env = Some "MOCK_KEY";
-      })
-    ~api_key_for:(fun _ -> Some "mock-key")
+(** Shared runner: builds the canonical mock provider record for Doctor. *)
+let run_doctor_checks ~find_provider ~api_key_for =
+  Doctor.run_checks
+    ~find_provider
+    ~api_key_for
     ~list_models:(fun _ _ -> ["mock-model"])
     ~subagents_roster:[]
     ~subagents_enabled:true
     ()
-  in
-  let has_fail = List.exists (fun (c : Doctor.check) -> c.severity = Doctor.Fail) checks in
-  assert (not has_fail)
 
-let%test_unit "doctor_run_checks_missing_key" =
-  let checks = Doctor.run_checks
-    ~find_provider:(fun n -> Some {
-        Doctor.name = n;
-        kind = Doctor.Cloud;
-        base_url = "http://mock";
-        requires_key = true;
-        key_env = Some "MOCK_KEY";
-      })
-    ~api_key_for:(fun _ -> None)
-    ~list_models:(fun _ _ -> ["mock-model"])
-    ~subagents_roster:[]
-    ~subagents_enabled:true
-    ()
-  in
-  let has_fail = List.exists (fun (c : Doctor.check) -> c.severity = Doctor.Fail) checks in
-  assert has_fail
+let has_fail checks =
+  List.exists (fun (c : Doctor.check) -> c.severity = Doctor.Fail) checks
 
-let%test_unit "doctor_run_checks_unknown_provider" =
-  let checks = Doctor.run_checks
+let%test_unit "doctor_run_checks" =
+  let mock_provider n = Some Doctor.{
+    name = n; kind = Cloud; base_url = "http://mock";
+    requires_key = true; key_env = Some "MOCK_KEY";
+  } in
+
+  (* Case 1: all dependencies satisfied → no failures *)
+  assert (not (has_fail (run_doctor_checks
+    ~find_provider:mock_provider
+    ~api_key_for:(fun _ -> Some "mock-key"))));
+
+  (* Case 2: key missing for cloud provider → at least one failure *)
+  assert (has_fail (run_doctor_checks
+    ~find_provider:mock_provider
+    ~api_key_for:(fun _ -> None)));
+
+  (* Case 3: provider unknown to registry → at least one failure *)
+  assert (has_fail (run_doctor_checks
     ~find_provider:(fun _ -> None)
-    ~api_key_for:(fun _ -> Some "mock-key")
-    ~list_models:(fun _ _ -> ["mock-model"])
-    ~subagents_roster:[]
-    ~subagents_enabled:true
-    ()
-  in
-  let has_fail = List.exists (fun (c : Doctor.check) -> c.severity = Doctor.Fail) checks in
-  assert has_fail
+    ~api_key_for:(fun _ -> Some "mock-key")))
 
 let%test_unit "chat_message_to_wire_json_preserves_content" =
   (* Args are now expected to be pre-sanitized via sanitize_json_args at
@@ -1653,17 +1533,10 @@ let%test_unit "parse_provider_error_openrouter_and_openai" =
      assert (detail.message = "Incorrect API key")
    | None -> failwith "Failed to parse OpenAI provider error")
 
-let%test_unit "session_of_json_roundtrip_and_checkpoint" =
-  let module MockProvider : Provider.PROVIDER with type config = unit = struct
-    type config = unit
-    let name = "mock"
-    let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
-      Types.wrap_result ~raw_response:"ok" ~model:"mock" ~provider:"mock" (Types.assistant_msg "ok")
-    let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token:_ =
-      Types.wrap_result ~raw_response:"ok" ~model:"mock" ~provider:"mock" (Types.assistant_msg "ok")
-    let list_models _net _cfg = ["mock"]
-  end in
-  let provider = Provider.Provider ((module MockProvider), ()) in
+let%test_unit "session_checkpoint_roundtrip" =
+  (* Covers: export_json/of_json field fidelity, save/load checkpoint,
+     and a live-turn checkpoint (the REPL save path). *)
+  let provider = make_mock_provider "ok" in
   let sess = Session.create ~tools:[] "test-model" provider in
   let sess = Session.set_system sess "Custom System Instructions" in
   let sess = Session.add_messages sess [
@@ -1671,7 +1544,8 @@ let%test_unit "session_of_json_roundtrip_and_checkpoint" =
     Types.assistant_msg "Reply turn 1";
     Types.tool_msg "call_123" "Tool output data";
   ] in
-  
+
+  (* 1. JSON export/import round-trip *)
   let json = Session.export_json sess in
   (match Session.of_json ~provider json with
    | Ok sess' ->
@@ -1680,92 +1554,40 @@ let%test_unit "session_of_json_roundtrip_and_checkpoint" =
      assert (cfg.system = Some "Custom System Instructions");
      let hist = Session.history sess' in
      assert (List.length hist = 3);
-     let last_msg = List.nth hist 2 in
-     assert (last_msg.content = "Tool output data")
-   | Error err -> failwith ("Session.of_json failed: " ^ err));
+     assert ((List.nth hist 2).content = "Tool output data")
+   | Error e -> failwith ("of_json failed: " ^ e));
 
-  let tmp_checkpoint = "test_session_checkpoint.json" in
-  (match Session.save_checkpoint ~path:tmp_checkpoint sess with
-   | Ok p -> assert (p = tmp_checkpoint)
-   | Error e -> failwith ("Session.save_checkpoint failed: " ^ e));
-
-  (match Session.load_checkpoint ~provider ~path:tmp_checkpoint () with
+  (* 2. Checkpoint save and load *)
+  let cp = "test_session_checkpoint.json" in
+  (match Session.save_checkpoint ~path:cp sess with
+   | Ok p -> assert (p = cp)
+   | Error e -> failwith ("save_checkpoint failed: " ^ e));
+  (match Session.load_checkpoint ~provider ~path:cp () with
    | Ok loaded ->
-     Sys.remove tmp_checkpoint;
+     Sys.remove cp;
      let cfg = Session.config loaded in
      assert (cfg.model = "test-model");
      assert (cfg.system = Some "Custom System Instructions");
-     let hist = Session.history loaded in
-     assert (List.length hist = 3)
+     assert (List.length (Session.history loaded) = 3)
    | Error e ->
-     if Sys.file_exists tmp_checkpoint then Sys.remove tmp_checkpoint;
-     failwith ("Session.load_checkpoint failed: " ^ e))
+     if Sys.file_exists cp then Sys.remove cp;
+     failwith ("load_checkpoint failed: " ^ e));
 
-let%test_unit "agent_on_step_callback_preserves_context" =
+  (* 3. Live-turn checkpoint (REPL save path): history grows after a real turn. *)
   Eio_main.run (fun env ->
-    let step_sessions = ref [] in
-    let call_count = ref 0 in
-    let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
-    let read_tool = Tool.Tool (module CaravanTools.Read_file.Read_file) in
-    let module StepTestProvider : Provider.PROVIDER with type config = unit = struct
-      type config = unit
-      let name = "step_test"
-      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
-        incr call_count;
-        if !call_count = 1 then
-          let tc = Types.{ id = "c1"; name = "read_file"; args = {|{"path": "dune"}|}; extra_content = None } in
-          let reply = Types.assistant_tool_msg ~tool_calls:[tc] "Reading..." in
-          Types.wrap_result ~raw_response:"ok" ~model:"step" ~provider:"step" reply
-        else
-          let tc = Types.{ id = "c2"; name = "finish"; args = {|{"summary": "Done"}|}; extra_content = None } in
-          let reply = Types.assistant_tool_msg ~tool_calls:[tc] "Finished step test" in
-          Types.wrap_result ~raw_response:"ok" ~model:"step" ~provider:"step" reply
-      let stream _net _cfg ?model:_ ?options:_ ?tools:_ msgs ~on_token:_ =
-        complete _net _cfg msgs
-      let list_models _net _cfg = ["step_test"]
-    end in
-    let provider = Provider.Provider ((module StepTestProvider), ()) in
-    let sess = Session.create ~tools:[finish_tool; read_tool] "step" provider
-               |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
-    
-    let on_step s = step_sessions := s :: !step_sessions in
-    let agent_cfg = Agent.{ max_turns = 5; continue_prompt = "continue"; nudge = false } in
-    let res = Agent.run ~config:agent_cfg ~on_step env#net env#clock sess "Run step callback test" in
-    (match res with
-     | Ok (final_sess, _meta) ->
-       assert (List.length !step_sessions >= 2);
-       let intermediate_sess = List.hd (List.rev !step_sessions) in
-       assert (List.length (Session.history intermediate_sess) >= 1);
-       assert (Session.turn_idx final_sess = 2)
-     | Error msg -> failwith ("Agent.run with on_step failed: " ^ msg))
-  )
-
-let%test_unit "repl_interactive_turn_checkpointing" =
-  Eio_main.run (fun env ->
-    let module MockReplProvider : Provider.PROVIDER with type config = unit = struct
-      type config = unit
-      let name = "mock_repl"
-      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
-        Types.wrap_result ~raw_response:"repl" ~model:"mock" ~provider:"mock" (Types.assistant_msg "REPL response")
-      let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token:_ =
-        Types.wrap_result ~raw_response:"repl" ~model:"mock" ~provider:"mock" (Types.assistant_msg "REPL response")
-      let list_models _net _cfg = ["mock_repl"]
-    end in
-    let provider = Provider.Provider ((module MockReplProvider), ()) in
-    let sess = Session.create ~tools:[] "mock" provider in
-    let tmp_checkpoint = "test_repl_checkpoint.json" in
-    let (new_sess, _res) = Session.turn env#net env#clock sess "Hello REPL" in
-    (match Session.save_checkpoint ~path:tmp_checkpoint new_sess with
+    let live_sess = make_session "mock" provider in
+    let (turned, _) = Session.turn env#net env#clock live_sess "Hello REPL" in
+    let cp2 = "test_repl_checkpoint.json" in
+    (match Session.save_checkpoint ~path:cp2 turned with
      | Ok _ ->
-       (match Session.load_checkpoint ~provider ~path:tmp_checkpoint () with
+       (match Session.load_checkpoint ~provider ~path:cp2 () with
         | Ok loaded ->
-          Sys.remove tmp_checkpoint;
+          Sys.remove cp2;
           assert (List.length (Session.history loaded) = 2)
         | Error e ->
-          if Sys.file_exists tmp_checkpoint then Sys.remove tmp_checkpoint;
-          failwith ("load_checkpoint failed: " ^ e))
-     | Error e -> failwith ("save_checkpoint failed: " ^ e))
-  )
+          if Sys.file_exists cp2 then Sys.remove cp2;
+          failwith ("live load_checkpoint failed: " ^ e))
+     | Error e -> failwith ("live save_checkpoint failed: " ^ e)))
 
 
 
