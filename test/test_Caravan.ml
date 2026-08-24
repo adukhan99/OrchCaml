@@ -1740,6 +1740,34 @@ let%test_unit "agent_on_step_callback_preserves_context" =
      | Error msg -> failwith ("Agent.run with on_step failed: " ^ msg))
   )
 
+let%test_unit "repl_interactive_turn_checkpointing" =
+  Eio_main.run (fun env ->
+    let module MockReplProvider : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "mock_repl"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        Types.wrap_result ~raw_response:"repl" ~model:"mock" ~provider:"mock" (Types.assistant_msg "REPL response")
+      let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token:_ =
+        Types.wrap_result ~raw_response:"repl" ~model:"mock" ~provider:"mock" (Types.assistant_msg "REPL response")
+      let list_models _net _cfg = ["mock_repl"]
+    end in
+    let provider = Provider.Provider ((module MockReplProvider), ()) in
+    let sess = Session.create ~tools:[] "mock" provider in
+    let tmp_checkpoint = "test_repl_checkpoint.json" in
+    let (new_sess, _res) = Session.turn env#net env#clock sess "Hello REPL" in
+    (match Session.save_checkpoint ~path:tmp_checkpoint new_sess with
+     | Ok _ ->
+       (match Session.load_checkpoint ~provider ~path:tmp_checkpoint () with
+        | Ok loaded ->
+          Sys.remove tmp_checkpoint;
+          assert (List.length (Session.history loaded) = 2)
+        | Error e ->
+          if Sys.file_exists tmp_checkpoint then Sys.remove tmp_checkpoint;
+          failwith ("load_checkpoint failed: " ^ e))
+     | Error e -> failwith ("save_checkpoint failed: " ^ e))
+  )
+
+
 
 
 

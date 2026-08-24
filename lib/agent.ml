@@ -67,7 +67,7 @@ let run_generic ?config ?on_turn ?on_step run_fn sess task =
     if config.max_turns > 0 && Session.turn_idx sess >= config.max_turns then
       Error "Maximum turns reached without completion."
     else begin
-      let (sess', result) = run_fn ?max_turns ?on_turn sess in
+      let (sess', result) = run_fn ?max_turns ?on_turn ?on_step sess in
       notify_step sess';
       if is_finished result then
         Ok (sess', result)
@@ -86,11 +86,11 @@ let run_generic ?config ?on_turn ?on_step run_fn sess task =
 
 let run ?config ?on_turn ?on_step net clock sess task =
   run_generic ?config ?on_turn ?on_step
-    (fun ?max_turns ?on_turn s -> Session.run_conversations ?max_turns ?on_turn net clock s)
+    (fun ?max_turns ?on_turn ?on_step s -> Session.run_conversations ?max_turns ?on_turn ?on_step net clock s)
     sess task
 
 let run_stream ?config ?on_turn ?on_step net clock sess task ~on_token =
   run_generic ?config ?on_turn ?on_step
-    (fun ?max_turns ?on_turn s -> Session.run_conversations_stream ?max_turns ?on_turn net clock s ~on_token)
+    (fun ?max_turns ?on_turn ?on_step s -> Session.run_conversations_stream ?max_turns ?on_turn ?on_step net clock s ~on_token)
     sess task
 

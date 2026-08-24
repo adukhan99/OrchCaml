@@ -772,6 +772,7 @@ let repl net clock st =
               Session.turn net clock st.session line)
         in
         st.session <- new_sess;
+        ignore (Session.save_checkpoint new_sess);
         (match result.usage with
          | Some u ->
            st.total_tokens_in  <- st.total_tokens_in + u.prompt_tokens;
@@ -788,6 +789,7 @@ let repl net clock st =
         end;
         if not is_tty && stream_enabled then print_newline ()
       with exn ->
+        ignore (Session.save_checkpoint st.session);
         if is_tty then print_newline ();
         Trace.error "repl" "%s" (Caravan_error.humanize exn);
         println_ansi (red (Printf.sprintf "\n  ✗ %s" (Caravan_error.humanize exn))));

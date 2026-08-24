@@ -46,8 +46,8 @@ val with_model : t -> string -> t
 val history : t -> chat_message list
 val history_for_llm : t -> chat_message list
 
-val run_conversations : ?max_turns:int -> ?on_turn:(int -> int -> unit) -> _ Eio.Net.t -> _ Eio.Time.clock -> t -> t * chat_message result_with_meta
-val run_conversations_stream : ?max_turns:int -> ?on_turn:(int -> int -> unit) -> _ Eio.Net.t -> _ Eio.Time.clock -> t -> on_token:(string -> unit) -> t * chat_message result_with_meta
+val run_conversations : ?max_turns:int -> ?on_turn:(int -> int -> unit) -> ?on_step:(t -> unit) -> _ Eio.Net.t -> _ Eio.Time.clock -> t -> t * chat_message result_with_meta
+val run_conversations_stream : ?max_turns:int -> ?on_turn:(int -> int -> unit) -> ?on_step:(t -> unit) -> _ Eio.Net.t -> _ Eio.Time.clock -> t -> on_token:(string -> unit) -> t * chat_message result_with_meta
 
 val turn : _ Eio.Net.t -> _ Eio.Time.clock -> t -> string -> t * chat_message result_with_meta
 val turn_stream : _ Eio.Net.t -> _ Eio.Time.clock -> t -> string -> on_token:(string -> unit) -> t * chat_message result_with_meta

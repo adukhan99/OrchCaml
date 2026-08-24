@@ -212,13 +212,18 @@ type step_outcome =
   | Continue of t
   | Done     of t * string * done_reason
 
-let run_turn_step ?max_turns ?on_turn net clock sess (reply : chat_message) =
+let run_turn_step ?max_turns ?on_turn ?on_step net clock sess (reply : chat_message) =
   let Memory.Mem ((module M), mem) = sess.memory in
   let final_memory = Memory.Mem ((module M), M.add mem reply) in
   let new_sess = { sess with memory = final_memory; turn_idx = sess.turn_idx + 1 } in
   (match on_turn with
    | Some f -> f new_sess.turn_idx (Option.value ~default:0 max_turns)
    | None -> ());
+  let notify_step s =
+    match on_step with
+    | Some f -> (try f s with _ -> ())
+    | None -> ()
+  in
   match reply.tool_calls with
   | Some tcs when tcs <> [] ->
     let tool_responses = execute_tool_calls net clock new_sess tcs in
@@ -243,6 +248,7 @@ let run_turn_step ?max_turns ?on_turn net clock sess (reply : chat_message) =
       else
         sess_after_tools
     in
+    notify_step sess_after_sum;
 
     let has_finish = List.exists (fun tc -> tc.name = "finish") tcs in
     if has_finish then
@@ -266,6 +272,7 @@ let run_turn_step ?max_turns ?on_turn net clock sess (reply : chat_message) =
        | _ ->
          Continue sess_after_sum)
   | _ ->
+    notify_step new_sess;
     Done (new_sess, reply.content, Via_plain_reply)
 
 let emit_assistant_reply (reply : chat_message) =
@@ -276,16 +283,16 @@ let emit_assistant_reply (reply : chat_message) =
   in
   Trace.emit (Trace.Assistant_reply { content = reply.content; tool_call_names })
 
-let rec run_conversations ?max_turns ?on_turn net clock sess =
+let rec run_conversations ?max_turns ?on_turn ?on_step net clock sess =
   let verb = sess.spinner_cfg.get_verb "thinking" in
   let enabled = sess.spinner_cfg.enabled in
   let result = Ui.with_spinner clock verb enabled (fun () ->
     Provider.complete_packed net ~model:sess.cfg.model ~options:sess.cfg.options ~tools:sess.tools sess.provider (history_for_llm sess)
   ) in
   emit_assistant_reply result.value;
-  let outcome = run_turn_step ?max_turns ?on_turn net clock sess result.value in
+  let outcome = run_turn_step ?max_turns ?on_turn ?on_step net clock sess result.value in
   match outcome with
-  | Continue sess' -> run_conversations ?max_turns ?on_turn net clock sess'
+  | Continue sess' -> run_conversations ?max_turns ?on_turn ?on_step net clock sess'
   | Done (sess', content, reason) ->
       (sess', { result with value = { result.value with content };
                             finish_reason = Some (done_reason_string reason);
@@ -297,7 +304,7 @@ let turn net clock sess user_input =
   let sess' = { sess with memory = Memory.Mem ((module M), M.add mem user) } in
   run_conversations net clock sess'
 
-let rec run_conversations_stream ?max_turns ?on_turn net clock sess ~on_token =
+let rec run_conversations_stream ?max_turns ?on_turn ?on_step net clock sess ~on_token =
   let verb = sess.spinner_cfg.get_verb "thinking" in
   let enabled = sess.spinner_cfg.enabled in
   let result_with_meta =
@@ -324,9 +331,9 @@ let rec run_conversations_stream ?max_turns ?on_turn net clock sess ~on_token =
     )
   in
   emit_assistant_reply result_with_meta.value;
-  let outcome = run_turn_step ?max_turns ?on_turn net clock sess result_with_meta.value in
+  let outcome = run_turn_step ?max_turns ?on_turn ?on_step net clock sess result_with_meta.value in
   match outcome with
-  | Continue sess' -> run_conversations_stream ?max_turns ?on_turn net clock sess' ~on_token
+  | Continue sess' -> run_conversations_stream ?max_turns ?on_turn ?on_step net clock sess' ~on_token
   | Done (sess', content, reason) ->
       (sess', { result_with_meta with value = { result_with_meta.value with content };
                                       finish_reason = Some (done_reason_string reason);
