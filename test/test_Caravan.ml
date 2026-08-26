@@ -1666,7 +1666,7 @@ let%test_unit "provider_retry_classification" =
   assert (Provider.Retry.max_attempts Provider.Retry.Off = 1);
   assert (Provider.Retry.max_attempts Provider.Retry.Low = 2);
   assert (Provider.Retry.max_attempts Provider.Retry.Medium = 4);
-  assert (Provider.Retry.max_attempts Provider.Retry.High = 4)
+  assert (Provider.Retry.max_attempts Provider.Retry.High = max_int)
 
 let%test_unit "provider_retry_backoff" =
   let check ~(label : string) ~base ~attempt ~expected =
