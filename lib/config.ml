@@ -138,12 +138,31 @@ let get_int key =
       try Some (Otoml.find ast Otoml.get_integer ["orchestrator"; key])
       with _ -> None
 
+(** Read a top-level or [orchestrator] TOML float. Accepts integers too. *)
+let get_float key =
+  match get_ast () with
+  | None -> None
+  | Some ast ->
+    try Some (Otoml.find ast Otoml.get_float [key])
+    with _ ->
+      try Some (float_of_int (Otoml.find ast Otoml.get_integer [key]))
+      with _ ->
+        try Some (float_of_int (Otoml.find ast Otoml.get_integer ["orchestrator"; key]))
+        with _ -> None
+
 let get_int_opt env_var toml_key =
   match env_var with
   | Some e -> (match Sys.getenv_opt e with
                | Some v when v <> "" -> (try Some (int_of_string v) with _ -> get_int toml_key)
                | _ -> get_int toml_key)
   | None -> get_int toml_key
+
+let get_float_opt env_var toml_key =
+  match env_var with
+  | Some e -> (match Sys.getenv_opt e with
+               | Some v when v <> "" -> (try Some (float_of_string v) with _ -> get_float toml_key)
+               | _ -> get_float toml_key)
+  | None -> get_float toml_key
 
 let get_string key =
   match get_ast () with
@@ -605,6 +624,20 @@ let get_max_turns () =
 let get_nudge_enabled () =
   get_bool_opt (Some "CARAVAN_NUDGE") "nudge" |> Option.value ~default:true
 
+(** How aggressively provider calls retry transient failures:
+    "off" | "low" | "medium" | "high" (default "medium"). Parsed into a
+    [Provider.Retry.mode] at the call site; unknown values fall back to
+    the default there. *)
+let get_provider_retry_mode () =
+  get_string_opt (Some "CARAVAN_PROVIDER_RETRY") "provider_retry"
+  |> Option.value ~default:"medium"
+
+(** Base delay (seconds) for exponential provider-retry backoff: attempt
+    N sleeps base * 2^(N-1), capped at 30s. Default 0.5. *)
+let get_provider_retry_base_delay () =
+  get_float_opt (Some "CARAVAN_PROVIDER_RETRY_BASE_DELAY") "provider_retry_base_delay"
+  |> Option.value ~default:0.5
+
 (** Look up an API key: [env_var] first, then [api_keys.<name>] in TOML,
     then a legacy top-level key if given. *)
 let get_api_key ~env_var ~name ?legacy_key () =
@@ -692,6 +725,8 @@ let editable_keys : (string * string * string) list = [
   ("max_turns",   "Agent turn budget",                  "integer");
   ("nudge",       "Budget nudges in agent loops",       "true | false");
   ("permissions", "Mutating-tool policy",               "auto | ask | readonly");
+  ("provider_retry", "Provider error retry aggression", "off | low | medium | high");
+  ("provider_retry_base_delay", "Base backoff seconds between provider retries", "float");
   ("transcript",  "JSONL session logs",                 "true | false");
   ("strict_mode", "bash tool discipline",               "0 | 1 | 2");
   ("enable_subagents", "Offer the delegate tool when [[subagents]] exist", "true | false");

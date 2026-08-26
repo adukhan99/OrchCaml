@@ -1621,8 +1621,184 @@ let%test_unit "session_checkpoint_roundtrip" =
           failwith ("live load_checkpoint failed: " ^ e))
      | Error e -> failwith ("live save_checkpoint failed: " ^ e)))
 
+(* ── Provider.Retry ──────────────────────────────────────────────────── *)
 
+let%test_unit "provider_retry_mode_parsing" =
+  let check ~(label : string) ~input ~expected =
+    assert (Provider.Retry.of_string input = expected)
+  in
+  (* label; input; expected mode *)
+  check ~label:"off"     ~input:"off"    ~expected:(Some Provider.Retry.Off);
+  check ~label:"alias"   ~input:"none"   ~expected:(Some Provider.Retry.Off);
+  check ~label:"low"     ~input:"low"    ~expected:(Some Provider.Retry.Low);
+  check ~label:"medium"  ~input:"medium" ~expected:(Some Provider.Retry.Medium);
+  check ~label:"med"     ~input:"med"    ~expected:(Some Provider.Retry.Medium);
+  check ~label:"high"    ~input:"high"   ~expected:(Some Provider.Retry.High);
+  check ~label:"bogus"   ~input:"bogus"  ~expected:None;
+  check ~label:"empty"   ~input:""       ~expected:None
 
+let%test_unit "provider_retry_classification" =
+  let mk_failure status =
+    Caravan_error.Provider_failure
+      { provider = "p"; status; body = ""; detail = None }
+  in
+  let check ~(label : string) ~mode ~status ~expected =
+    assert (Provider.Retry.classify ~mode (mk_failure status) = expected)
+  in
+  (* label; mode; status; retriable *)
+  check ~label:"off_500"   ~mode:Provider.Retry.Off    ~status:500 ~expected:false;
+  check ~label:"off_429"   ~mode:Provider.Retry.Off    ~status:429 ~expected:false;
+  check ~label:"low_500"   ~mode:Provider.Retry.Low    ~status:500 ~expected:true;
+  check ~label:"low_502"   ~mode:Provider.Retry.Low    ~status:502 ~expected:true;
+  check ~label:"low_429"   ~mode:Provider.Retry.Low    ~status:429 ~expected:false;
+  check ~label:"low_400"   ~mode:Provider.Retry.Low    ~status:400 ~expected:false;
+  check ~label:"med_500"   ~mode:Provider.Retry.Medium ~status:500 ~expected:true;
+  check ~label:"med_503"   ~mode:Provider.Retry.Medium ~status:503 ~expected:true;
+  check ~label:"med_429"   ~mode:Provider.Retry.Medium ~status:429 ~expected:true;
+  check ~label:"med_400"   ~mode:Provider.Retry.Medium ~status:400 ~expected:false;
+  check ~label:"med_401"   ~mode:Provider.Retry.Medium ~status:401 ~expected:false;
+  check ~label:"med_404"   ~mode:Provider.Retry.Medium ~status:404 ~expected:false;
+  check ~label:"high_400"  ~mode:Provider.Retry.High   ~status:400 ~expected:true;
+  check ~label:"high_401"  ~mode:Provider.Retry.High   ~status:401 ~expected:true;
+  check ~label:"high_429"  ~mode:Provider.Retry.High   ~status:429 ~expected:true;
+  check ~label:"high_500"  ~mode:Provider.Retry.High   ~status:500 ~expected:true;
+  (* max_attempts per mode *)
+  assert (Provider.Retry.max_attempts Provider.Retry.Off = 1);
+  assert (Provider.Retry.max_attempts Provider.Retry.Low = 2);
+  assert (Provider.Retry.max_attempts Provider.Retry.Medium = 4);
+  assert (Provider.Retry.max_attempts Provider.Retry.High = 4)
 
+let%test_unit "provider_retry_backoff" =
+  let check ~(label : string) ~base ~attempt ~expected =
+    assert (Provider.Retry.delay_seconds ~base_delay:base attempt = expected)
+  in
+  (* label; base delay s; attempt; delay s (exponential, capped at 30) *)
+  check ~label:"first"  ~base:0.5 ~attempt:1 ~expected:0.5;
+  check ~label:"second" ~base:0.5 ~attempt:2 ~expected:1.0;
+  check ~label:"third"  ~base:0.5 ~attempt:3 ~expected:2.0;
+  check ~label:"fourth" ~base:1.0 ~attempt:4 ~expected:8.0;
+  check ~label:"capped" ~base:10.0 ~attempt:6 ~expected:30.0
 
+let%test_unit "provider_retry_config" =
+  with_tmp_config ~name:"provider_retry_cfg"
+    ~toml_content:"provider_retry = \"low\"\nprovider_retry_base_delay = 2.5\n"
+    (fun _ ->
+      assert (Config.get_provider_retry_mode () = "low");
+      assert (Config.get_provider_retry_base_delay () = 2.5);
+      Unix.putenv "CARAVAN_PROVIDER_RETRY" "high";
+      assert (Config.get_provider_retry_mode () = "high");
+      Unix.putenv "CARAVAN_PROVIDER_RETRY" "")
+
+(* Behavioral: one table over the injected-failure provider — recovery,
+   deterministic no-retry, rate-limit classes, mode boundaries, and the
+   unbounded [High] budget. *)
+let%test_unit "provider_retry_behavior" =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let attempts = ref 0 and fail_until = ref 0 and fail_status = ref 503 in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "flaky"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        incr attempts;
+        if !attempts <= !fail_until then
+          Caravan_error.raise_provider_failure ~provider:"flaky" ~status:!fail_status
+            ~body:"{\"error\":{\"message\":\"injected\"}}"
+        else
+          Types.wrap_result ~raw_response:"ok" ~model:"m" ~provider:"flaky"
+            (Types.assistant_msg "recovered")
+      let stream _net _cfg ?model:_ ?options:_ ?tools:_ msgs ~on_token:_ =
+        complete _net _cfg msgs
+      let list_models _ _ = []
+    end in
+    let provider = Provider.Provider ((module P), ()) in
+    let retries_seen = ref [] in
+    let sink ev =
+      match ev with
+      | Trace.Provider_retry { attempt; _ } -> retries_seen := attempt :: !retries_seen
+      | _ -> ()
+    in
+    let check ~(label : string) ~(failures : int) ~(status : int)
+        ~(mode : Provider.Retry.mode) ~(expect_attempts : int) ~(recovers : bool) =
+      attempts := 0; fail_until := failures; fail_status := status;
+      retries_seen := [];
+      let outcome =
+        try Ok (Trace.with_sink sink (fun () ->
+                Provider.complete_packed ~retry_mode:mode ~retry_base_delay:0.0
+                  ~retry_clock:clock net provider []))
+        with Caravan_error.Provider_failure { status; _ } ->
+          assert (status = !fail_status); Error ()
+      in
+      assert (!attempts = expect_attempts);
+      (match outcome with
+       | Ok r ->
+         assert recovers;
+         assert (r.value.content = "recovered");
+         assert (List.length !retries_seen = expect_attempts - 1)
+       | Error () -> assert (not recovers))
+    in
+    (* label; failures before success; injected status; mode;
+       expected total upstream attempts; task eventually recovers *)
+    check ~label:"503_recovers_medium"   ~failures:2   ~status:503
+      ~mode:Provider.Retry.Medium ~expect_attempts:3 ~recovers:true;
+    check ~label:"400_deterministic_medium" ~failures:99 ~status:400
+      ~mode:Provider.Retry.Medium ~expect_attempts:1 ~recovers:false;
+    check ~label:"429_rate_limit_medium" ~failures:1   ~status:429
+      ~mode:Provider.Retry.Medium ~expect_attempts:2 ~recovers:true;
+    check ~label:"429_outside_low"       ~failures:99  ~status:429
+      ~mode:Provider.Retry.Low    ~expect_attempts:1 ~recovers:false;
+    check ~label:"500_off_single_shot"   ~failures:99  ~status:500
+      ~mode:Provider.Retry.Off    ~expect_attempts:1 ~recovers:false;
+    check ~label:"500_low_one_retry"     ~failures:99  ~status:500
+      ~mode:Provider.Retry.Low    ~expect_attempts:2 ~recovers:false;
+    (* high has no attempt ceiling: keeps going past the Medium budget *)
+    check ~label:"400_high_unbounded"    ~failures:6   ~status:400
+      ~mode:Provider.Retry.High   ~expect_attempts:7 ~recovers:true)
+
+(* Network-level failures are classified structurally from Eio's typed
+   [Io] exceptions — no string scraping. *)
+let%test_unit "provider_retry_eio_io_classification" =
+  Eio_main.run (fun env ->
+    let refused =
+      Eio.Switch.run (fun sw ->
+        try
+          ignore (Eio.Net.connect (Eio.Stdenv.net env) ~sw
+                    (`Tcp (Eio.Net.Ipaddr.V4.loopback, 1)));
+          None
+        with exn -> Some exn)
+      |> Option.get
+    in
+    assert (not (Provider.Retry.classify ~mode:Provider.Retry.Off refused));
+    assert (Provider.Retry.classify ~mode:Provider.Retry.Medium refused))
+
+(* The token guard: once any token reached the caller's UI, a retriable
+   failure must propagate instead of duplicating streamed output. *)
+let%test_unit "provider_retry_token_guard_on_stream" =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let module PS : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "flaky_stream"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"flaky_stream"
+          (Types.assistant_msg "")
+      let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token =
+        on_token "partial";
+        Caravan_error.raise_provider_failure ~provider:"flaky_stream" ~status:500
+          ~body:"{}"
+      let list_models _ _ = []
+    end in
+    let pstream = Provider.Provider ((module PS), ()) in
+    let got = ref "" in
+    let raised =
+      try
+        ignore (Provider.stream_packed ~retry_mode:Provider.Retry.High
+                  ~retry_base_delay:0.0 net pstream []
+                  ~on_token:(fun t -> got := !got ^ t));
+        false
+      with Caravan_error.Provider_failure _ -> true
+    in
+    assert raised;
+    assert (!got = "partial"))
 

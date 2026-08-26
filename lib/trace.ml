@@ -27,6 +27,9 @@ type event =
   | Subagent_end     of { name : string; summary : string }
   | Plugin_transition of { name : string; uid : int; state : string }
       (** a plugin fiber changed lifecycle state (see [Plugin]) *)
+  | Provider_retry of { provider : string; attempt : int; max_attempts : int }
+      (** a provider call failed transiently and is being retried
+          ([attempt] = retry number just decided, 1-based) *)
   | Run_error        of { origin : string; message : string }
       (** a provider/tool/run failure surfaced to the user — recorded so
           failed sessions are auditable, not only successful ones *)
@@ -89,6 +92,10 @@ let event_to_json ev : Yojson.Safe.t =
     base "subagent_end" [("name", `String name); ("summary", `String summary)]
   | Plugin_transition { name; uid; state } ->
     base "plugin_transition" [("name", `String name); ("uid", `Int uid); ("state", `String state)]
+  | Provider_retry { provider; attempt; max_attempts } ->
+    base "provider_retry"
+      [("provider", `String provider); ("attempt", `Int attempt);
+       ("max_attempts", `Int max_attempts)]
   | Run_error { origin; message } ->
     base "error" [("origin", `String origin); ("message", `String message)]
 

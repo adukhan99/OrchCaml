@@ -66,6 +66,10 @@ let render opts ev =
       let sum_preview = if opts.verbose then String.trim summary else Ui.truncate_visible (String.trim summary) 60 in
       println (Printf.sprintf "  %s %s %s"
                  (Ui.dim "  ⎿ [subagent:") (Ui.dim name) (Ui.dim (Printf.sprintf "] complete: %s" sum_preview)))
+  | Provider_retry { provider; attempt; max_attempts } ->
+    if not opts.quiet then
+      println (Ui.yellow (Printf.sprintf "  ↻ %s transient failure (attempt %d/%d), retrying…"
+                 provider attempt max_attempts))
   | Plugin_transition { name; uid = _; state } ->
     (* Lifecycle chatter is verbose-only; the transcript records it always. *)
     if opts.verbose && not opts.quiet then

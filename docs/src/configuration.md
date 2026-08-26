@@ -33,6 +33,8 @@ stream      = true       # stream tokens as they arrive
 max_turns   = 15         # agent turn budget
 nudge       = true       # budget-awareness nudges in agent loops
 permissions = "auto"     # auto | ask | readonly
+provider_retry = "medium"  # provider error retry aggression: off | low | medium | high
+# provider_retry_base_delay = 0.5  # base backoff seconds (exponential, cap 30s)
 transcript  = true       # JSONL session logs in ~/.caravan/logs/
 strict_mode = 1          # bash tool: 0 permissive, 1 single-command, 2 hidden
 enable_subagents = true  # offer delegate when [[subagents]] exist
@@ -40,6 +42,26 @@ enable_subagents = true  # offer delegate when [[subagents]] exist
 
 `caravan config keys` (or `/config keys`) lists every editable key with
 accepted values.
+
+### Provider retries
+
+When a provider call fails transiently (HTTP 5xx, 429 rate limits,
+dropped connections), Caravan can retry it automatically instead of
+interrupting the turn. `provider_retry` controls the aggression:
+
+| Mode | Retries | Retries on |
+|------|---------|-----------|
+| `off` | 0 | never |
+| `low` | 1 | 5xx + connection failures |
+| `medium` (default) | 3 | 5xx + 429 + connection failures |
+| `high` | unlimited | every HTTP status, including deterministic 4xx |
+
+Backoff is exponential (`provider_retry_base_delay`, default 0.5s:
+0.5s → 1s → 2s … capped at 30s). Streaming responses are only retried
+before the first token reaches your terminal, so output is never
+duplicated. Every retry is announced in the transcript as a
+`provider_retry` event. Env overrides: `CARAVAN_PROVIDER_RETRY`,
+`CARAVAN_PROVIDER_RETRY_BASE_DELAY`.
 
 ## API keys
 

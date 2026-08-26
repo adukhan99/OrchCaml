@@ -134,6 +134,13 @@ let history_for_llm sess =
      | { role = System; _ } :: _ -> compact_hist
      | rest -> sm :: rest)
 
+(** Retry aggression for provider calls, from the [provider_retry]
+    setting; unknown values fall back to the library default. *)
+let retry_mode () =
+  match Provider.Retry.of_string (Config.get_provider_retry_mode ()) with
+  | Some m -> m
+  | None -> Provider.Retry.default_mode
+
 let execute_tool_calls _net clock sess tcs =
   Eio.Fiber.List.map (fun tc ->
     match Tool.find_tool sess.tools tc.name with
@@ -181,7 +188,8 @@ let summarise ?prompt_fn net clock sess =
     let enabled = sess.spinner_cfg.enabled in
     Trace.emit Trace.Summarize_start;
     let result = Ui.with_spinner clock verb enabled (fun () ->
-      Provider.complete_packed net ~model:sess.cfg.model ~options:sess.cfg.options ~tools:[] sess.provider [user_msg prompt]
+      Provider.complete_packed ~retry_mode:(retry_mode ()) ~retry_clock:clock
+        net ~model:sess.cfg.model ~options:sess.cfg.options ~tools:[] sess.provider [user_msg prompt]
     ) in
     let summary_content = String.trim result.value.content in
     Trace.emit (Trace.Summarize_end { summary = summary_content });
@@ -287,7 +295,8 @@ let rec run_conversations ?max_turns ?on_turn ?on_step net clock sess =
   let verb = sess.spinner_cfg.get_verb "thinking" in
   let enabled = sess.spinner_cfg.enabled in
   let result = Ui.with_spinner clock verb enabled (fun () ->
-    Provider.complete_packed net ~model:sess.cfg.model ~options:sess.cfg.options ~tools:sess.tools sess.provider (history_for_llm sess)
+    Provider.complete_packed ~retry_mode:(retry_mode ()) ~retry_clock:clock
+      net ~model:sess.cfg.model ~options:sess.cfg.options ~tools:sess.tools sess.provider (history_for_llm sess)
   ) in
   emit_assistant_reply result.value;
   let outcome = run_turn_step ?max_turns ?on_turn ?on_step net clock sess result.value in
@@ -327,7 +336,10 @@ let rec run_conversations_stream ?max_turns ?on_turn ?on_step net clock sess ~on
       in
       Fun.protect
         ~finally:(fun () -> if not (Eio.Promise.is_resolved promise) then Eio.Promise.resolve resolver ())
-        (fun () -> Provider.stream_packed net ~model:sess.cfg.model ~options:sess.cfg.options ~tools:sess.tools ~on_token:wrapped_on_token sess.provider (history_for_llm sess))
+        (fun () ->
+         Provider.stream_packed ~retry_mode:(retry_mode ()) ~retry_clock:clock
+           net ~model:sess.cfg.model ~options:sess.cfg.options ~tools:sess.tools
+           ~on_token:wrapped_on_token sess.provider (history_for_llm sess))
     )
   in
   emit_assistant_reply result_with_meta.value;
