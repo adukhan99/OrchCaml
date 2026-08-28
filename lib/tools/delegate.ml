@@ -192,29 +192,33 @@ let make
   List.iter (fun (spec : Caravan.Subagent.subagent_spec) ->
     Hashtbl.replace registry spec.name spec
   ) subagent_specs;
+  let available_subagents () =
+    Hashtbl.fold (fun k _ a -> k :: a) registry []
+    |> List.sort String.compare
+    |> String.concat ", "
+  in
+  (* Resolve a spec's parent provider/model and open a fresh session for it. *)
+  let session_for (spec : Caravan.Subagent.subagent_spec) =
+    let spec = effective_spec ~live_tools spec in
+    let parent_provider =
+      match spec.provider with
+      | Some p -> p
+      | None   -> failwith "delegate: subagent spec has no provider set"
+    in
+    let model =
+      match spec.model with
+      | Some m -> m
+      | None   -> spec.name
+    in
+    (spec, Caravan.Session.create model parent_provider)
+  in
   (* Construct a fresh packed_tool whose [execute] closes over [net] and [clock] *)
   let dispatch_single (subagent : string) (task : string) : (string, string) result =
     match Hashtbl.find_opt registry subagent with
     | None ->
-      let available =
-        Hashtbl.fold (fun k _ a -> k :: a) registry []
-        |> List.sort String.compare
-        |> String.concat ", "
-      in
-      Error (Printf.sprintf "Error: unknown subagent '%s'. Available: %s" subagent available)
-    | Some (spec : Caravan.Subagent.subagent_spec) ->
-      let spec = effective_spec ~live_tools spec in
-      let parent_provider =
-        match spec.provider with
-        | Some p -> p
-        | None   -> failwith "delegate: subagent spec has no provider set"
-      in
-      let model =
-        match spec.model with
-        | Some m -> m
-        | None   -> spec.name
-      in
-      let parent_sess = Caravan.Session.create model parent_provider in
+      Error (Printf.sprintf "Error: unknown subagent '%s'. Available: %s" subagent (available_subagents ()))
+    | Some spec ->
+      let (spec, parent_sess) = session_for spec in
       (match Caravan.Subagent.delegate net clock parent_sess spec task with
        | Ok (_sess, result) -> Ok result.value.content
        | Error msg          -> Error (Printf.sprintf "Subagent '%s' error: %s" subagent msg))
@@ -239,31 +243,15 @@ let make
         List.filter_map (function Error s -> Some s | Ok _ -> None) specs_and_tasks
       in
       if unknown <> [] then
-        let available =
-          Hashtbl.fold (fun k _ a -> k :: a) registry []
-          |> List.sort String.compare
-          |> String.concat ", "
-        in
         Printf.sprintf "Error: unknown subagent(s): %s. Available: %s"
-          (String.concat ", " unknown) available
+          (String.concat ", " unknown) (available_subagents ())
       else
         let valid_items =
           List.filter_map (function Ok pair -> Some pair | Error _ -> None) specs_and_tasks
         in
         let tasks_with_sessions =
-          List.map (fun ((spec : Caravan.Subagent.subagent_spec), task) ->
-            let spec = effective_spec ~live_tools spec in
-            let parent_provider =
-              match spec.provider with
-              | Some p -> p
-              | None   -> failwith "delegate: subagent spec has no provider set"
-            in
-            let model =
-              match spec.model with
-              | Some m -> m
-              | None   -> spec.name
-            in
-            let parent_sess = Caravan.Session.create model parent_provider in
+          List.map (fun (spec, task) ->
+            let (spec, parent_sess) = session_for spec in
             (spec, task, parent_sess)
           ) valid_items
         in

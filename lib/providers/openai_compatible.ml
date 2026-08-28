@@ -190,6 +190,16 @@ let stream net cfg ?model ?options ?tools msgs ~on_token =
      but are still perfectly valid streaming responses. *)
   let stream_succeeded = ref false in
   let wrapped_on_token token = on_token token in
+  let finalize_tool_calls tool_acc =
+    if Hashtbl.length tool_acc = 0 then None
+    else begin
+      let pairs = Hashtbl.fold (fun idx v acc -> (idx, v) :: acc) tool_acc [] in
+      let sorted = List.sort (fun (a,_) (b,_) -> compare a b) pairs in
+      Some (List.map (fun (_, (id, name, abuf, tc_ec)) ->
+        { id; name; args = Caravan.Types.sanitize_json_args (Buffer.contents abuf); extra_content = tc_ec }
+      ) sorted)
+    end
+  in
   let try_stream () =
     let buf      = Buffer.create 4096 in
     let tool_acc : (int, string * string * Buffer.t * Yojson.Safe.t option) Hashtbl.t = Hashtbl.create 4 in
@@ -225,16 +235,7 @@ let stream net cfg ?model ?options ?tools msgs ~on_token =
           if data = "[DONE]" then begin
             close_reasoning ();
             let full = Buffer.contents buf in
-            let tool_calls =
-              if Hashtbl.length tool_acc = 0 then None
-              else begin
-                let pairs = Hashtbl.fold (fun idx v acc -> (idx, v) :: acc) tool_acc [] in
-                let sorted = List.sort (fun (a,_) (b,_) -> compare a b) pairs in
-                 Some (List.map (fun (_, (id, name, abuf, tc_ec)) ->
-                   { id; name; args = Caravan.Types.sanitize_json_args (Buffer.contents abuf); extra_content = tc_ec }
-                 ) sorted)
-              end
-            in
+            let tool_calls = finalize_tool_calls tool_acc in
             let reply = make_message ?tool_calls ?extra_content:(!extra_content_ref) Assistant full in
             result_ref := Some (wrap_result ~raw_response:full ~model:effective_model
               ~provider:cfg.provider_name ?usage:(!usage_ref) reply);
@@ -322,16 +323,7 @@ let stream net cfg ?model ?options ?tools msgs ~on_token =
     | Some r -> r
     | None ->
       let full = Buffer.contents buf in
-      let tool_calls =
-        if Hashtbl.length tool_acc = 0 then None
-        else begin
-          let pairs = Hashtbl.fold (fun idx v acc -> (idx, v) :: acc) tool_acc [] in
-          let sorted = List.sort (fun (a,_) (b,_) -> compare a b) pairs in
-          Some (List.map (fun (_, (id, name, abuf, tc_ec)) ->
-            { id; name; args = Caravan.Types.sanitize_json_args (Buffer.contents abuf); extra_content = tc_ec }
-          ) sorted)
-        end
-      in
+      let tool_calls = finalize_tool_calls tool_acc in
       (* Guard against a stalled/truncated stream: if the server closed the
          connection before sending [DONE] and we have neither content nor tool
          calls, raise rather than returning an empty message.  An empty reply

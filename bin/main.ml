@@ -265,19 +265,7 @@ let print_providers_table active =
 
 (* ── Slash command handling ───────────────────────────────────────────── *)
 
-let handle_slash_command net clock st line =
-  let parts = String.split_on_char ' ' (String.trim line) |> List.filter (fun s -> s <> "") in
-  match parts with
-  | [] -> ()
-
-  | ["/quit"] | ["/exit"] | ["/q"] ->
-    println_ansi (dim "\nGoodbye.");
-    exit 0
-
-  | ["/help"] | ["/?"] ->
-    print_help_grouped help_groups
-
-  | "/agent" :: rest ->
+let cmd_agent net clock st rest =
     let task = String.concat " " rest |> String.trim in
     if task = "" then usage "/agent" "<task description>"
     else begin
@@ -321,7 +309,7 @@ let handle_slash_command net clock st line =
         println_ansi (red (Printf.sprintf "  ✗ %s" (Caravan_error.humanize exn))))
     end
 
-  | "/lisp" :: rest ->
+let cmd_lisp rest =
     let src = String.concat " " rest |> String.trim in
     if src = "" then usage "/lisp" "<program>   e.g. /lisp (sum (range 1 101))"
     else
@@ -329,7 +317,7 @@ let handle_slash_command net clock st line =
        | Ok out -> println_ansi (green ("  " ^ out))
        | Error e -> println_ansi (red ("  ✗ " ^ e)))
 
-  | "/nudge" :: rest ->
+let cmd_nudge st rest =
     let text = String.concat " " rest |> String.trim in
     if text = "" then usage "/nudge" "<steering note>"
     else begin
@@ -337,14 +325,14 @@ let handle_slash_command net clock st line =
       confirm "nudge queued — it will be injected before the next model call"
     end
 
-  | "/model" :: rest ->
+let cmd_model st rest =
     (match rest with
      | [new_model] ->
        switch_model st new_model;
        confirm "Model → %s" new_model
      | _ -> usage "/model" "<model-name>")
 
-  | "/provider" :: rest ->
+let cmd_provider st rest =
     (match rest with
      | name :: rest ->
        (match Registry.find name with
@@ -364,7 +352,7 @@ let handle_slash_command net clock st line =
           confirm "Provider → %s (model %s)" e.name model)
      | [] -> usage "/provider" "<name> [url]")
 
-  | "/permissions" :: rest ->
+let cmd_permissions rest =
     (match rest with
      | [mode] when List.mem mode ["auto"; "ask"; "readonly"] ->
        permission_mode := mode;
@@ -373,13 +361,13 @@ let handle_slash_command net clock st line =
        println_ansi (Printf.sprintf "  Permission mode: %s" (bold !permission_mode))
      | _ -> usage "/permissions" "auto | ask | readonly")
 
-  | "/system" :: rest ->
+let cmd_system st rest =
     let text = String.concat " " rest |> String.trim in
     st.session <- Session.set_system st.session text;
     if text = "" then confirm "System prompt cleared"
     else confirm "System prompt set (%d chars)" (String.length text)
 
-  | "/memory" :: rest ->
+let cmd_memory st rest =
     (match rest with
      | [n_str] ->
        (match int_of_string_opt n_str with
@@ -389,7 +377,7 @@ let handle_slash_command net clock st line =
         | None -> usage "/memory" "<n>")
      | _ -> usage "/memory" "<n>")
 
-  | ["/summarise"] | ["/summarize"] ->
+let cmd_summarise net clock st =
     let hist = Session.history st.session in
     if hist = [] then
       println_ansi (yellow "  ⚠ Conversation history is empty; nothing to summarize.")
@@ -404,11 +392,11 @@ let handle_slash_command net clock st line =
          println_ansi (red (Printf.sprintf "  ✗ summarize: %s" (Caravan_error.humanize exn))))
     end
 
-  | ["/clear"] ->
+let cmd_clear st =
     st.session <- Session.clear st.session;
     confirm "History cleared"
 
-  | ["/history"] ->
+let cmd_history st =
     let hist = Session.history st.session in
     if hist = [] then println_ansi (dim "  (empty history)")
     else
@@ -419,7 +407,7 @@ let handle_slash_command net clock st line =
         println_ansi (Printf.sprintf "%s: %s" (bold (colour role_str)) (dim msg.content))
       ) hist
 
-  | "/export" :: rest ->
+let cmd_export st rest =
     (match rest with
      | [file] ->
        (try
@@ -431,7 +419,7 @@ let handle_slash_command net clock st line =
      | [] -> print_endline (Yojson.Safe.pretty_to_string (Session.export_json st.session))
      | _ -> usage "/export" "[file]")
 
-  | "/resume" :: rest ->
+let cmd_resume st rest =
     let path = match rest with [] -> None | [file] -> Some file | _ -> None in
     (match Session.load_checkpoint ~provider:st.provider ~tools:(Session.tools st.session) ?path () with
      | Ok sess ->
@@ -448,7 +436,7 @@ let handle_slash_command net clock st line =
        confirm "Resumed session checkpoint (%d messages, turn %d)" turns (Session.turn_idx sess')
      | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
 
-  | ["/models"] ->
+let cmd_models net st =
     (try
       let models = Provider.list_models_packed net st.provider in
       println_ansi (rule ~title:(Printf.sprintf "Models on %s" st.provider_name) ());
@@ -473,10 +461,7 @@ let handle_slash_command net clock st line =
     with exn ->
       println_ansi (red ("  " ^ Caravan_error.humanize exn)))
 
-  | ["/providers"] ->
-    print_providers_table st.provider_name
-
-  | ["/subagents"] ->
+let cmd_subagents st =
     let roster = Subagents.describe () in
     if roster = [] then begin
       println_ansi (dim "  No subagents configured.");
@@ -518,7 +503,7 @@ let handle_slash_command net clock st line =
         println_ansi (yellow "  Configured but not loaded in this session — check warnings above/at startup.")
     end
 
-  | ["/tools"] ->
+let cmd_tools st =
     let tools = Session.tools st.session in
     if tools = [] then println_ansi (yellow "  No tools registered.")
     else begin
@@ -533,7 +518,7 @@ let handle_slash_command net clock st line =
       println_ansi (dim "\n  ✎ = can modify state (governed by /permissions)")
     end
 
-  | "/plugins" :: rest ->
+let cmd_plugins net clock st rest =
     let h = Lazy.force host in
     (match rest with
      | [] ->
@@ -574,7 +559,7 @@ let handle_slash_command net clock st line =
         | Error e -> println_ansi (red ("  ✗ " ^ e)))
      | _ -> usage "/plugins" "[enable|disable <id>]")
 
-  | "/mcp" :: rest ->
+let cmd_mcp net clock st rest =
     let h = Lazy.force host in
     (match rest with
      | [] | ["list"] ->
@@ -650,7 +635,7 @@ let handle_slash_command net clock st line =
         | Error e -> println_ansi (red ("  ✗ " ^ e)))
      | _ -> usage "/mcp" "[list | get <name> | add <name> -- <cmd> [args...] | remove <name>]")
 
-  | "/config" :: "set" :: key :: rest when rest <> [] ->
+let cmd_config_set st key rest =
     let value = String.concat " " rest in
     (match Config.set_value key value with
      | Ok path ->
@@ -665,7 +650,7 @@ let handle_slash_command net clock st line =
         | _ -> ())
      | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
 
-  | ["/config"; "get"; key] ->
+let cmd_config_get key =
     (match Config.get_string key with
      | Some v -> println_ansi (kv_line key (white v))
      | None ->
@@ -676,7 +661,7 @@ let handle_slash_command net clock st line =
          | Some b -> println_ansi (kv_line key (white (string_of_bool b)))
          | None -> println_ansi (yellow (Printf.sprintf "  '%s' is not set" key)))
 
-  | ["/config"; "keys"] ->
+let cmd_config_keys () =
     println_ansi (rule ~title:"Editable keys" ());
     List.iter (fun (k, desc, accepts) ->
       println_ansi (Printf.sprintf "  %s %s %s"
@@ -686,7 +671,7 @@ let handle_slash_command net clock st line =
     ) Config.editable_keys;
     println_ansi (dim "\n  /config set <key> <value>   ·   /key <provider> to store an API key")
 
-  | "/key" :: rest ->
+let cmd_key rest =
     (match rest with
      | [name] ->
        (match Registry.find name with
@@ -702,7 +687,7 @@ let handle_slash_command net clock st line =
              | Error err -> println_ansi (red (Printf.sprintf "  ✗ %s" err))))
      | _ -> usage "/key" "<provider>   (stores the key under [api_keys], input hidden)")
 
-  | ["/config"] ->
+let cmd_config_show st =
     let cfg = Session.config st.session in
     let opts = cfg.options in
     println_ansi (rule ~title:"Configuration" ());
@@ -732,13 +717,7 @@ let handle_slash_command net clock st line =
     if opts.stop <> [] then
       println_ansi (kv_line ~key_width:12 "  Stop" (white (String.concat ", " opts.stop)))
 
-  | "/temp"       :: rest -> update_float_opt st "/temp" "Temperature" (fun v o -> { o with temperature = Some v }) 0.0 2.0 rest
-  | "/top_p"      :: rest -> update_float_opt st "/top_p" "Top P" (fun v o -> { o with top_p = Some v }) 0.0 1.0 rest
-  | "/top_k"      :: rest -> update_int_opt st "/top_k" "Top K" (fun v o -> { o with top_k = Some v }) rest
-  | "/max_tokens" :: rest -> update_int_opt st "/max_tokens" "Max Tokens" (fun v o -> { o with max_tokens = Some v }) rest
-  | "/seed"       :: rest -> update_int_opt st "/seed" "Seed" (fun v o -> { o with seed = Some v }) rest
-
-  | "/stop" :: rest ->
+let cmd_stop st rest =
     if rest = [] then begin
       st.session <- Session.set_options st.session (fun o -> { o with stop = [] });
       confirm "Stop sequences cleared"
@@ -746,6 +725,76 @@ let handle_slash_command net clock st line =
       st.session <- Session.set_options st.session (fun o -> { o with stop = rest });
       confirm "Stop sequences → %s" (String.concat ", " rest)
     end
+
+
+let handle_slash_command net clock st line =
+  let parts = String.split_on_char ' ' (String.trim line) |> List.filter (fun s -> s <> "") in
+  match parts with
+  | [] -> ()
+
+  | ["/quit"] | ["/exit"] | ["/q"] ->
+    println_ansi (dim "\nGoodbye.");
+    exit 0
+
+  | ["/help"] | ["/?"] ->
+    print_help_grouped help_groups
+
+  | "/agent" :: rest -> cmd_agent net clock st rest
+
+  | "/lisp" :: rest -> cmd_lisp rest
+
+  | "/nudge" :: rest -> cmd_nudge st rest
+
+  | "/model" :: rest -> cmd_model st rest
+
+  | "/provider" :: rest -> cmd_provider st rest
+
+  | "/permissions" :: rest -> cmd_permissions rest
+
+  | "/system" :: rest -> cmd_system st rest
+
+  | "/memory" :: rest -> cmd_memory st rest
+
+  | ["/summarise"] | ["/summarize"] -> cmd_summarise net clock st
+
+  | ["/clear"] -> cmd_clear st
+
+  | ["/history"] -> cmd_history st
+
+  | "/export" :: rest -> cmd_export st rest
+
+  | "/resume" :: rest -> cmd_resume st rest
+
+  | ["/models"] -> cmd_models net st
+
+  | ["/providers"] ->
+    print_providers_table st.provider_name
+
+  | ["/subagents"] -> cmd_subagents st
+
+  | ["/tools"] -> cmd_tools st
+
+  | "/plugins" :: rest -> cmd_plugins net clock st rest
+
+  | "/mcp" :: rest -> cmd_mcp net clock st rest
+
+  | "/config" :: "set" :: key :: rest when rest <> [] -> cmd_config_set st key rest
+
+  | ["/config"; "get"; key] -> cmd_config_get key
+
+  | ["/config"; "keys"] -> cmd_config_keys ()
+
+  | "/key" :: rest -> cmd_key rest
+
+  | ["/config"] -> cmd_config_show st
+
+  | "/temp"       :: rest -> update_float_opt st "/temp" "Temperature" (fun v o -> { o with temperature = Some v }) 0.0 2.0 rest
+  | "/top_p"      :: rest -> update_float_opt st "/top_p" "Top P" (fun v o -> { o with top_p = Some v }) 0.0 1.0 rest
+  | "/top_k"      :: rest -> update_int_opt st "/top_k" "Top K" (fun v o -> { o with top_k = Some v }) rest
+  | "/max_tokens" :: rest -> update_int_opt st "/max_tokens" "Max Tokens" (fun v o -> { o with max_tokens = Some v }) rest
+  | "/seed"       :: rest -> update_int_opt st "/seed" "Seed" (fun v o -> { o with seed = Some v }) rest
+
+  | "/stop" :: rest -> cmd_stop st rest
 
   (* Pre-run commands, reachable from inside the REPL too — one command
      surface instead of two. They run as subprocesses so their own event

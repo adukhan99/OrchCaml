@@ -775,38 +775,36 @@ let add_subagent (fields : (string * string) list) : (string, string) result =
           ("provider", Otoml.string provider);
           ("model",    Otoml.string model);
         ] in
-        (match lookup "system_prompt" with
-         | Some sp when sp <> "" -> pairs := !pairs @ [("system_prompt", Otoml.string sp)]
-         | _ -> ());
-        (match lookup "tools" with
-         | Some ts when ts <> "" ->
-           let tool_list =
-             String.split_on_char ',' ts
-             |> List.map String.trim
-             |> List.filter (fun s -> s <> "")
-             |> List.map Otoml.string
-           in
-           if tool_list <> [] then
-             pairs := !pairs @ [("tools", Otoml.TomlArray tool_list)]
-         | _ -> ());
-        (match lookup "role" with
-         | Some r when r <> "" -> pairs := !pairs @ [("role", Otoml.string r)]
-         | _ -> ());
-        (match lookup "realm" with
-         | Some r when r <> "" -> pairs := !pairs @ [("realm", Otoml.string r)]
-         | _ -> ());
-        (match lookup "max_tokens" with
-         | Some mt when mt <> "" ->
-           (match int_of_string_opt mt with
-            | Some n -> pairs := !pairs @ [("max_tokens", Otoml.integer n)]
-            | None -> ())
-         | _ -> ());
-        (match lookup "temperature" with
-         | Some t when t <> "" ->
-           (match float_of_string_opt t with
-            | Some f -> pairs := !pairs @ [("temperature", Otoml.float f)]
-            | None -> ())
-         | _ -> ());
+        (* Each optional field is looked up, gated on non-empty, then
+           converted to a TOML value; a conversion failure (e.g. an
+           unparsable number) silently drops the field rather than erroring. *)
+        let str_field s = if s = "" then None else Some (Otoml.string s) in
+        let int_field s = if s = "" then None else Option.map Otoml.integer (int_of_string_opt s) in
+        let float_field s = if s = "" then None else Option.map Otoml.float (float_of_string_opt s) in
+        let tools_field s =
+          if s = "" then None
+          else
+            let tool_list =
+              String.split_on_char ',' s
+              |> List.map String.trim
+              |> List.filter (fun s -> s <> "")
+              |> List.map Otoml.string
+            in
+            if tool_list = [] then None else Some (Otoml.TomlArray tool_list)
+        in
+        let add_field key convert =
+          match lookup key with
+          | Some v -> (match convert v with
+              | Some t -> pairs := !pairs @ [(key, t)]
+              | None -> ())
+          | None -> ()
+        in
+        add_field "system_prompt" str_field;
+        add_field "tools" tools_field;
+        add_field "role" str_field;
+        add_field "realm" str_field;
+        add_field "max_tokens" int_field;
+        add_field "temperature" float_field;
         let entry = Otoml.TomlTable !pairs in
         (* Append to the existing [[subagents]] array or create one *)
         let existing =
