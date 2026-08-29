@@ -2406,3 +2406,23 @@ let%test_unit "summarise_routes_to_cheap_model_and_keeps_tail" =
           m.Types.content = "did 5") hist);
         assert (List.exists (fun (m : Types.chat_message) ->
           m.Types.content = "step 5") hist)))
+
+(* ── M1: tool profiles ────────────────────────────────────────────────── *)
+
+let%test_unit "tool_profile_selection" =
+  let native = Capability.lookup "claude-sonnet-5" in
+  let flaky  = Capability.lookup "llama3.2:1b" in
+  (* auto derives from capability *)
+  assert (not (Capability.use_core_profile ~profile:"auto" native));
+  assert (Capability.use_core_profile ~profile:"auto" flaky);
+  (* unknown models are conservative -> core *)
+  assert (Capability.use_core_profile ~profile:"auto" Capability.conservative);
+  (* explicit settings win in both directions *)
+  assert (Capability.use_core_profile ~profile:"core" native);
+  assert (not (Capability.use_core_profile ~profile:"full" flaky));
+  (* native tool calling but tiny context still argues for core *)
+  let small_native = Capability.{ native with context_window = 8192 } in
+  assert (Capability.use_core_profile ~profile:"auto" small_native);
+  (* the completion protocol is always part of the core surface *)
+  assert (List.mem "finish" Capability.core_tool_names);
+  assert (Config.get_tool_profile () = "auto")

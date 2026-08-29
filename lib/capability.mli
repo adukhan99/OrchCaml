@@ -42,6 +42,16 @@ val tool_fidelity_to_string : tool_fidelity -> string
 val cache_kind_of_string : string -> cache_kind option
 val cache_kind_to_string : cache_kind -> string
 
+(** The reduced tool surface for low-capability models; always
+    includes [finish], the completion protocol. *)
+val core_tool_names : string list
+
+(** [use_core_profile ~profile cap] — whether to expose only
+    {!core_tool_names}.  [profile] is the [tool_profile] config value:
+    ["core"]/["full"] force it, anything else derives from capability
+    (non-native tool calling, or a context window under 16k). *)
+val use_core_profile : profile:string -> t -> bool
+
 (** Cheap chars/4 token estimate — a compaction trigger, not a billing
     figure.  Slightly over-estimates code and JSON, the safe direction. *)
 val estimate_tokens : string -> int

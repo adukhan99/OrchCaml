@@ -109,6 +109,21 @@ let make_session ~net ~clock ~provider_name ~model ~base_url ~system =
   Plugin_host.set_provider (Lazy.force host) provider;
   let tools = Subagents.session_tools ~net ~clock ~host:(Lazy.force host) (all_tools ()) in
   let capability = Capability.lookup model in
+  (* Tool profile (M1): low-capability models get the core surface —
+     every schema is a per-turn context tax, and small models choose
+     badly among many options. tool_profile = "full" restores all. *)
+  let tools =
+    if Capability.use_core_profile ~profile:(Config.get_tool_profile ()) capability
+    then begin
+      let kept = List.filter
+          (fun t -> List.mem (Tool.name_of_packed t) Capability.core_tool_names)
+          tools in
+      Trace.log "info"
+        "Tool profile 'core' active for %s (%d of %d tools exposed; set tool_profile = \"full\" to override)"
+        model (List.length kept) (List.length tools);
+      kept
+    end else tools
+  in
   let sess =
     Session.create ~tools model provider
     |> (fun s -> Session.set_context_window s (Some capability.Capability.context_window))

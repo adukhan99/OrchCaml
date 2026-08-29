@@ -661,6 +661,14 @@ let get_tool_call_mode () =
   |> Option.value ~default:"auto"
   |> String.lowercase_ascii
 
+(** Which tools are exposed to the model: "auto" (capability-driven —
+    low-capability models get the core set), "core" (force the reduced
+    set), "full" (everything). Default "auto". *)
+let get_tool_profile () =
+  get_string_opt (Some "CARAVAN_TOOL_PROFILE") "tool_profile"
+  |> Option.value ~default:"auto"
+  |> String.lowercase_ascii
+
 (** Model used for history summarisation calls, when set — routing
     compaction to a cheap model keeps it off the working model's rate
     limit and budget.  Unset (default) means use the session's model. *)
@@ -778,6 +786,7 @@ let editable_keys : (string * string * string) list = [
   ("tool_call_mode", "Tool-call recognition",           "auto | native | text");
   ("require_finish", "Agent runs must call finish to complete", "true | false");
   ("summarize_model", "Model for compaction summaries",     "model name (default: session model)");
+  ("tool_profile", "Tool surface exposed to the model",     "auto | core | full");
   ("permissions", "Mutating-tool policy",               "auto | ask | readonly");
   ("provider_retry", "Provider error retry aggression", "off | low | medium | high");
   ("provider_retry_base_delay", "Base backoff seconds between provider retries", "float");

@@ -211,6 +211,26 @@ let lookup model =
        else acc)
     base (Config.get_capability_overrides ())
 
+(* ── Tool profiles ────────────────────────────────────────────────────── *)
+
+(** The reduced tool surface for low-capability models.  All 14+ static
+    tools serialised into every request are a large fixed per-turn tax
+    on an 8k-context model, and small models choose badly when offered
+    many options.  [finish] must stay — it is the completion protocol. *)
+let core_tool_names =
+  ["bash"; "read_file"; "write_file"; "ls"; "grep"; "finish"]
+
+(** Whether the session should expose only {!core_tool_names}.
+    [profile] is the [tool_profile] config value: ["core"] and ["full"]
+    force the answer; anything else ("auto") derives it from the
+    model's capability — non-native tool calling or a small context
+    window both argue for the reduced surface. *)
+let use_core_profile ~profile cap =
+  match profile with
+  | "core" -> true
+  | "full" -> false
+  | _ -> cap.tool_calling <> Native || cap.context_window < 16_384
+
 (* ── Token estimation ─────────────────────────────────────────────────── *)
 
 (* A chars/4 heuristic.  Deliberately dependency-free: the point is a
