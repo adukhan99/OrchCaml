@@ -108,12 +108,15 @@ let make_session ~net ~clock ~provider_name ~model ~base_url ~system =
   let provider = resolve_provider_or_exit ~provider_name ~model ~base_url in
   Plugin_host.set_provider (Lazy.force host) provider;
   let tools = Subagents.session_tools ~net ~clock ~host:(Lazy.force host) (all_tools ()) in
-  let sess = Session.create ~tools model provider in
+  let capability = Capability.lookup model in
+  let sess =
+    Session.create ~tools model provider
+    |> (fun s -> Session.set_context_window s (Some capability.Capability.context_window))
+  in
   let replace =
     Config.get_bool_opt (Some "CARAVAN_SYSTEM_REPLACE") "system_replace"
     |> Option.value ~default:false
   in
-  let capability = Capability.lookup model in
   match System_prompt.compose ~capability ?user_system:system ~replace () with
   | Some s -> Session.set_system sess s
   | None -> sess

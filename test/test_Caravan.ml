@@ -1267,22 +1267,35 @@ let%test_unit "cli_resolve" =
 (* ── Compaction_policy tests ─────────────────────────────────────────── *)
 
 let%test_unit "compaction_policy_edge_cases" =
-  let check ~auto ~mem_size ~len ~tools =
+  let check ?ctx ?(tokens = 0) ~auto ~mem_size ~len ~tools () =
     Compaction_policy.should_compact
+      ?context_window:ctx
       ~auto_summarize:auto ~memory_size:mem_size ~history_length:len
-      ~tool_call_names:tools
+      ~history_tokens:tokens ~tool_call_names:tools ()
   in
   (* overflow triggers compaction *)
-  assert (check ~auto:true ~mem_size:10 ~len:15 ~tools:[] = true);
+  assert (check ~auto:true ~mem_size:10 ~len:15 ~tools:[] () = true);
   (* size 0 means unlimited *)
-  assert (check ~auto:true ~mem_size:0 ~len:1000 ~tools:[] = false);
+  assert (check ~auto:true ~mem_size:0 ~len:1000 ~tools:[] () = false);
   (* disabled means no auto compaction *)
-  assert (check ~auto:false ~mem_size:5 ~len:10 ~tools:[] = false);
+  assert (check ~auto:false ~mem_size:5 ~len:10 ~tools:[] () = false);
   (* no overflow, no compaction *)
-  assert (check ~auto:true ~mem_size:10 ~len:9 ~tools:[] = false);
+  assert (check ~auto:true ~mem_size:10 ~len:9 ~tools:[] () = false);
   (* explicit tool triggers compaction even if auto=false or memory_size=0 *)
-  assert (check ~auto:false ~mem_size:0 ~len:0 ~tools:["summarize"] = true);
-  assert (check ~auto:true ~mem_size:10 ~len:5 ~tools:["compress_history"] = true)
+  assert (check ~auto:false ~mem_size:0 ~len:0 ~tools:["summarize"] () = true);
+  assert (check ~auto:true ~mem_size:10 ~len:5 ~tools:["compress_history"] () = true);
+  (* — token-aware trigger (H2) — *)
+  (* over 75% of the window: compact even with few messages *)
+  assert (check ~ctx:8192 ~tokens:7000 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = true);
+  (* same token count in a large window: no compaction *)
+  assert (check ~ctx:128000 ~tokens:7000 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = false);
+  (* exactly at the boundary is not over it *)
+  assert (check ~ctx:1000 ~tokens:750 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = false);
+  assert (check ~ctx:1000 ~tokens:751 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = true);
+  (* token trigger respects auto_summarize *)
+  assert (check ~ctx:1000 ~tokens:900 ~auto:false ~mem_size:40 ~len:6 ~tools:[] () = false);
+  (* unknown window: token count alone never triggers *)
+  assert (check ~tokens:1_000_000 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = false)
 
 (* ── Agent_output tests ──────────────────────────────────────────────── *)
 

@@ -8,6 +8,10 @@ type config = {
   memory_size         : int;
   max_tool_output_len : int option;
   auto_summarize      : bool;
+  (** Model context window in tokens (from the capability table); when
+      set, compaction fires on estimated fraction-of-window consumption
+      rather than only on message count. *)
+  context_window      : int option; [@yojson.option]
 } [@@deriving yojson]
 
 
@@ -28,6 +32,10 @@ val set_system : t -> string -> t
 val set_memory_size : t -> int -> t
 val set_max_tool_output_len : t -> int option -> t
 val set_auto_summarize : t -> bool -> t
+
+(** Set (or clear) the model context window used for token-aware
+    compaction; front-ends feed this from [Capability.lookup]. *)
+val set_context_window : t -> int option -> t
 val set_options : t -> (gen_options -> gen_options) -> t
 val with_spinner_config : spinner_config -> t -> t
 val clear : t -> t

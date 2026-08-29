@@ -10,6 +10,11 @@ type config = {
   memory_size         : int;
   max_tool_output_len : int option;
   auto_summarize      : bool;
+  (** Model context window in tokens (from the capability table); when
+      set, compaction fires on estimated fraction-of-window consumption
+      rather than only on message count.  [@yojson.option] keeps
+      checkpoints from older Caravans loadable. *)
+  context_window      : int option; [@yojson.option]
 } [@@deriving yojson]
 
 let default_config model = {
@@ -19,6 +24,7 @@ let default_config model = {
   memory_size         = 40;
   max_tool_output_len = Some 1000;
   auto_summarize      = true;
+  context_window      = None;
 }
 
 type spinner_config = {
@@ -72,6 +78,9 @@ let set_max_tool_output_len sess max_len =
 
 let set_auto_summarize sess auto =
   { sess with cfg = { sess.cfg with auto_summarize = auto } }
+
+let set_context_window sess window =
+  { sess with cfg = { sess.cfg with context_window = window } }
 
 let set_options sess f =
   let cfg = { sess.cfg with options = f sess.cfg.options } in
@@ -318,10 +327,13 @@ let run_turn_step ?max_turns ?on_turn ?on_step net clock sess (reply : chat_mess
     let tool_call_names = List.map (fun tc -> tc.name) tcs in
     let Memory.Mem ((module M2), mem2) = memory_with_tools in
     let compact = Compaction_policy.should_compact
+      ?context_window:sess.cfg.context_window
       ~auto_summarize:sess.cfg.auto_summarize
       ~memory_size:sess.cfg.memory_size
       ~history_length:(M2.length mem2)
+      ~history_tokens:(Capability.estimate_history_tokens (M2.get mem2))
       ~tool_call_names
+      ()
     in
     let sess_after_sum =
       if compact then
