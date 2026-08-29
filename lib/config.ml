@@ -745,7 +745,8 @@ let editable_keys : (string * string * string) list = [
   ("provider",    "Backend to talk to",                 "see `caravan providers`");
   ("model",       "Model name",                         "provider-specific");
   ("base_url",    "Endpoint override",                  "URL");
-  ("system",      "Default system prompt",              "text");
+  ("system",      "Extra system prompt (appended to the shipped default)", "text");
+  ("system_replace", "system replaces the shipped default instead of appending", "true | false");
   ("stream",      "Stream tokens as they arrive",       "true | false");
   ("max_turns",   "Agent turn budget",                  "integer");
   ("nudge",       "Budget nudges in agent loops",       "true | false");

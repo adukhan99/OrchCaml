@@ -96,13 +96,27 @@ let resolve_cli_spec ~provider_cli ~model_cli ~base_url_cli =
     ~provider_cli ~model_cli ~base_url_cli ()
 
 (** Build a session inside [Eio_main.run]: static + MCP tools, plus the
-    config-declared delegate tool when subagents are enabled. *)
+    config-declared delegate tool when subagents are enabled.
+
+    The system prompt is layered (System_prompt.compose): the shipped
+    base + capability-conditioned format guidance + environment
+    preamble, with the user's [system] setting appended on top.
+    [system_replace = true] hands the user full control instead.  The
+    preamble is assembled here — once per session — so the request
+    prefix stays byte-stable for prompt caching. *)
 let make_session ~net ~clock ~provider_name ~model ~base_url ~system =
   let provider = resolve_provider_or_exit ~provider_name ~model ~base_url in
   Plugin_host.set_provider (Lazy.force host) provider;
   let tools = Subagents.session_tools ~net ~clock ~host:(Lazy.force host) (all_tools ()) in
   let sess = Session.create ~tools model provider in
-  match system with Some s -> Session.set_system sess s | None -> sess
+  let replace =
+    Config.get_bool_opt (Some "CARAVAN_SYSTEM_REPLACE") "system_replace"
+    |> Option.value ~default:false
+  in
+  let capability = Capability.lookup model in
+  match System_prompt.compose ~capability ?user_system:system ~replace () with
+  | Some s -> Session.set_system sess s
+  | None -> sess
 
 (* ── REPL state ───────────────────────────────────────────────────────── *)
 

@@ -1905,3 +1905,46 @@ let%test_unit "compaction_does_not_reset_turn_budget" =
     (* Each turn costs one work call plus at most one summarise call; the
        budget must bound total spend even under constant compaction. *)
     assert (!calls <= 2 * max_t + 1))
+
+(* ── C1: default system prompt + environment preamble ─────────────────── *)
+
+let%test_unit "system_prompt_compose_layers" =
+  (* Default composition carries the harness contract and environment. *)
+  (match System_prompt.compose () with
+   | None -> failwith "compose () must produce a prompt"
+   | Some p ->
+     let has needle =
+       let re = Re.compile (Re.str needle) in
+       Re.execp re p
+     in
+     assert (has "finish");
+     assert (has "Working directory:");
+     assert (has "Date:");
+     (* conservative capability => the text tool-call format layer is in *)
+     assert (has "\"tool\""));
+  (* Native-tool models skip the format layer. *)
+  let native = Capability.lookup "claude-sonnet-5" in
+  assert (System_prompt.tool_format_layer native = None);
+  (match System_prompt.compose ~capability:native () with
+   | Some p ->
+     let re = Re.compile (Re.str "EXACTLY one JSON object") in
+     assert (not (Re.execp re p))
+   | None -> failwith "compose ~capability must produce a prompt");
+  (* User text appends as the last layer... *)
+  (match System_prompt.compose ~user_system:"Always answer in French." () with
+   | Some p ->
+     let re = Re.compile (Re.str "Always answer in French.") in
+     assert (Re.execp re p);
+     assert (String.length p > String.length "Always answer in French.")
+   | None -> failwith "append compose must produce a prompt");
+  (* ...and replace mode hands over full control. *)
+  assert (System_prompt.compose ~user_system:"just me" ~replace:true ()
+          = Some "just me");
+  assert (System_prompt.compose ~replace:true () = None)
+
+let%test_unit "system_prompt_preamble_stable" =
+  (* Byte-stability within a session is the caching precondition; the
+     preamble must at minimum be deterministic for an unchanged env. *)
+  let a = System_prompt.environment_preamble () in
+  let b = System_prompt.environment_preamble () in
+  assert (a = b)
