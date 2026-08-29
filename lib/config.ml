@@ -661,6 +661,12 @@ let get_tool_call_mode () =
   |> Option.value ~default:"auto"
   |> String.lowercase_ascii
 
+(** Model used for history summarisation calls, when set — routing
+    compaction to a cheap model keeps it off the working model's rate
+    limit and budget.  Unset (default) means use the session's model. *)
+let get_summarize_model () =
+  get_string_opt (Some "CARAVAN_SUMMARIZE_MODEL") "summarize_model"
+
 (** Whether agent runs require an explicit [finish] tool call to count
     as complete (default: true). When false, a plain text reply ends
     the run — the pre-refactor behaviour. *)
@@ -771,6 +777,7 @@ let editable_keys : (string * string * string) list = [
   ("nudge",       "Budget nudges in agent loops",       "true | false");
   ("tool_call_mode", "Tool-call recognition",           "auto | native | text");
   ("require_finish", "Agent runs must call finish to complete", "true | false");
+  ("summarize_model", "Model for compaction summaries",     "model name (default: session model)");
   ("permissions", "Mutating-tool policy",               "auto | ask | readonly");
   ("provider_retry", "Provider error retry aggression", "off | low | medium | high");
   ("provider_retry_base_delay", "Base backoff seconds between provider retries", "float");

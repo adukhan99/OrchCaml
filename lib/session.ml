@@ -229,22 +229,60 @@ let default_prompt_fn msgs =
   "Conversation History:\n" ^
   format_history
 
+(** How many trailing messages summarisation keeps verbatim.  An agent
+    mid-task loses the least when its immediate working context
+    survives compaction untouched. *)
+let summary_tail_keep = 4
+
+(** Split [msgs] into (to_summarize, kept_tail), keeping the newest
+    {!summary_tail_keep} verbatim with a pair-aware boundary: leading
+    tool results whose assistant call falls on the summarised side move
+    with it, so the kept tail never starts with an orphan. *)
+let split_for_summary msgs =
+  let n = List.length msgs in
+  if n <= summary_tail_keep + 2 then (msgs, [])
+  else begin
+    let cut = n - summary_tail_keep in
+    let head = List.filteri (fun i _ -> i < cut) msgs in
+    let tail = List.filteri (fun i _ -> i >= cut) msgs in
+    let rec shift head tail =
+      match tail with
+      | ({ role = Tool _; _ } as m) :: rest -> shift (head @ [m]) rest
+      | _ -> (head, tail)
+    in
+    shift head tail
+  end
+
 let summarise ?prompt_fn net clock sess =
   let hist = history sess in
   if hist = [] then
     (sess, "Conversation history is empty; nothing to summarize.")
   else
+    let non_system = List.filter (fun m -> m.role <> System) hist in
+    let (to_summarize, kept_tail) = split_for_summary non_system in
+    (* The original task statement survives verbatim: total discard was
+       catastrophic mid-task (the agent forgot what it was doing and
+       what it had read, then spent tokens re-reading). *)
+    let task_stmt = List.find_opt (fun m -> m.role = User) to_summarize in
     let prompt =
       match prompt_fn with
-      | Some f -> f hist
-      | None -> default_prompt_fn hist
+      | Some f -> f to_summarize
+      | None -> default_prompt_fn to_summarize
     in
     let verb = sess.spinner_cfg.get_verb "summarizing" in
     let enabled = sess.spinner_cfg.enabled in
     Trace.emit Trace.Summarize_start;
+    (* A cheap model summarises as well as a weak one and does not
+       compete with the working model's rate limit; [summarize_model]
+       routes the call when configured. *)
+    let summary_model =
+      match Config.get_summarize_model () with
+      | Some m when String.trim m <> "" -> m
+      | _ -> sess.cfg.model
+    in
     let result = Ui.with_spinner clock verb enabled (fun () ->
       Provider.complete_packed ~retry_mode:(retry_mode ()) ~retry_clock:clock
-        net ~model:sess.cfg.model ~options:sess.cfg.options ~tools:[] sess.provider [user_msg prompt]
+        net ~model:summary_model ~options:sess.cfg.options ~tools:[] sess.provider [user_msg prompt]
     ) in
     let summary_content = String.trim result.value.content in
     Trace.emit (Trace.Summarize_end { summary = summary_content });
@@ -252,6 +290,13 @@ let summarise ?prompt_fn net clock sess =
       let open Memory.Summary in
       let mem = create ~max_messages:sess.cfg.memory_size () in
       let mem_sum = compress ~complete:(fun _ -> summary_content) mem in
+      let kept =
+        (match task_stmt with
+         | Some t -> [{ t with content = "[Original task]: " ^ t.content }]
+         | None -> [])
+        @ kept_tail
+      in
+      let mem_sum = List.fold_left add mem_sum kept in
       Memory.Mem ((module Memory.SummaryMemory), mem_sum)
     in
     (* [turn_idx] counts turns consumed against the agent budget and is
@@ -262,6 +307,65 @@ let summarise ?prompt_fn net clock sess =
        Only [clear] — a genuine new conversation — resets the counter. *)
     let new_sess = { sess with memory = new_mem_t } in
     (new_sess, summary_content)
+
+(* ── Structural compaction (the free tier of compaction) ─────────────── *)
+
+let hard_truncate_len = 200
+
+(** Compaction-time truncation of aged tool outputs — harsher than the
+    steady-state cap, because at this point the alternative is a model
+    call.  The +64 slack keeps it idempotent (an already-hard-truncated
+    message is never reshaped again). *)
+let hard_truncate_tool_output msg =
+  match msg.role with
+  | Tool _ when String.length msg.content > hard_truncate_len + 64 ->
+    { msg with content =
+        String.sub msg.content 0 hard_truncate_len
+        ^ "\n[... truncated during compaction ...]" }
+  | _ -> msg
+
+(** Whether the session is (still) over its compaction budget, judged
+    by the same policy that triggers compaction (minus the explicit
+    tool trigger). *)
+let over_budget sess =
+  let Memory.Mem ((module M), mem) = sess.memory in
+  Compaction_policy.should_compact
+    ?context_window:sess.cfg.context_window
+    ~auto_summarize:sess.cfg.auto_summarize
+    ~memory_size:sess.cfg.memory_size
+    ~history_length:(M.length mem)
+    ~history_tokens:(Capability.estimate_history_tokens (M.get mem))
+    ~tool_call_names:[]
+    ()
+
+(** Tier one of compaction: hard-truncate aged tool outputs (the bulk
+    of an agent history, and the least reusable part).  Free — no model
+    call, no rate-limit pressure, nothing an agent still needs is
+    touched (the newest messages keep full outputs). *)
+let structural_compact sess =
+  let Memory.Mem ((module M), mem) = sess.memory in
+  let mem' = M.map_recent mem ~keep:full_output_window hard_truncate_tool_output in
+  { sess with memory = Memory.Mem ((module M), mem') }
+
+(** Compact the session: structural eviction first, and only when that
+    is insufficient — or the model explicitly asked via a summarize
+    tool — the model-call summarisation tier.  On a metered free tier
+    the summarisation call competes with the actual work for the same
+    rate limit, so it is the last resort, not the first. *)
+let compact ?(explicit = false) net clock sess =
+  if explicit then
+    let (s, _) = summarise net clock sess in
+    s
+  else begin
+    let structural = structural_compact sess in
+    if not (over_budget structural) then begin
+      Trace.log "info"
+        "Compacted structurally (aged tool outputs truncated) — no summarisation call needed";
+      structural
+    end else
+      let (s, _) = summarise net clock structural in
+      s
+  end
 
 (** Why a conversation run ended. Threaded into the returned
     [result_with_meta.finish_reason] so callers (notably [Agent]) can tell
@@ -326,7 +430,7 @@ let run_turn_step ?max_turns ?on_turn ?on_step net clock sess (reply : chat_mess
     (* Trigger summarization if explicit tool was executed or if history size threshold reached *)
     let tool_call_names = List.map (fun tc -> tc.name) tcs in
     let Memory.Mem ((module M2), mem2) = memory_with_tools in
-    let compact = Compaction_policy.should_compact
+    let needs_compaction = Compaction_policy.should_compact
       ?context_window:sess.cfg.context_window
       ~auto_summarize:sess.cfg.auto_summarize
       ~memory_size:sess.cfg.memory_size
@@ -335,10 +439,13 @@ let run_turn_step ?max_turns ?on_turn ?on_step net clock sess (reply : chat_mess
       ~tool_call_names
       ()
     in
+    let explicit_compaction = List.exists
+      (fun n -> n = "summarize" || n = "compress_history" || n = "summarise")
+      tool_call_names
+    in
     let sess_after_sum =
-      if compact then
-        let (s, _) = summarise net clock sess_after_tools in
-        s
+      if needs_compaction then
+        compact ~explicit:explicit_compaction net clock sess_after_tools
       else
         sess_after_tools
     in

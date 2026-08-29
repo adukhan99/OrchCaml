@@ -512,7 +512,7 @@ let%expect_test "session_summarise" =
   );
   [%expect {|
     This is a summary.
-    History length: 1
+    History length: 2
     Role: System
     Content: [Conversation summary]: This is a summary.
     |}]
@@ -2293,3 +2293,116 @@ let%test_unit "retry_delay_prefers_server_hint" =
   (* no hint: plain exponential backoff *)
   assert (d (mk None) = 0.5);
   assert (Provider.Retry.delay_for ~base_delay:0.5 ~attempt:3 (mk None) = 2.0)
+
+(* ── H1: compaction is tiered and affordable ──────────────────────────── *)
+
+(* A tool whose output is deliberately bulky, to make old tool results
+   dominate the token estimate the way they do in real agent runs. *)
+module Bulky = struct
+  let name = "bulky"
+  let aliases = []
+  let description = "test tool with a large output"
+  type input = unit
+  type output = string
+  let json_schema () = `Assoc [("type", `String "object"); ("properties", `Assoc [])]
+  let parse_args _ = Ok ()
+  let format_output s = s
+  let is_mutating = false
+  let describe_action _ = "bulky"
+  type _ Effect.t += Exec : input -> output Effect.t
+  let execute () = String.make 5000 'Z'
+end
+
+let%test_unit "structural_compaction_avoids_model_call" =
+  Eio_main.run (fun env ->
+    let calls = ref 0 in
+    let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+    let bulky_tool = Tool.Tool (module Bulky) in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "worker"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        incr calls;
+        let tc = Types.{ id = "f1"; name = "finish";
+                         args = {|{"summary":"ok"}|}; extra_content = None } in
+        Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"worker"
+          (Types.assistant_tool_msg ~tool_calls:[tc] "")
+      let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+        complete net cfg ?model ?options ?tools msgs
+      let list_models _ _ = []
+    end in
+    let provider = Provider.Provider ((module P), ()) in
+    (* Seed an agent-shaped history whose bulk is AGED tool output —
+       the case the structural tier exists for.  ~3 x 5000-char results
+       overflow an 800-token window even after the steady-state 1000-
+       byte cap; hard truncation to ~200 bytes brings them under. *)
+    let old_turn i =
+      let id = Printf.sprintf "b%d" i in
+      let tc = Types.{ id; name = "bulky"; args = "{}"; extra_content = None } in
+      [Types.assistant_tool_msg ~tool_calls:[tc] "";
+       Types.tool_msg id (String.make 5000 'Z')]
+    in
+    let sess =
+      make_session ~tools:[bulky_tool; finish_tool] "m" provider
+      |> (fun s -> Session.set_context_window s (Some 800))
+      |> (fun s -> Session.add_messages s
+            (Types.user_msg "do bulky work" :: List.concat_map old_turn [1; 2; 3]))
+    in
+    let (final, result) = Session.run_conversations ~max_turns:5 env#net env#clock sess in
+    assert (result.Types.finish_reason = Some "finish_tool");
+    (* One work call, zero summarisation calls: the structural tier
+       absorbed the overflow without spending a request. *)
+    assert (!calls = 1);
+    (* The aged bulky outputs were hard-truncated in place... *)
+    let hist = Session.history final in
+    let bulky_msg = List.find (fun (m : Types.chat_message) ->
+      m.Types.role = Types.Tool "b1") hist in
+    assert (String.length bulky_msg.Types.content < 300);
+    (* ...and the task statement is still there verbatim (no summary
+       memory swap happened). *)
+    assert (List.exists (fun (m : Types.chat_message) ->
+      m.Types.content = "do bulky work") hist))
+
+let%test_unit "summarise_routes_to_cheap_model_and_keeps_tail" =
+  with_tmp_config ~name:"test_summarize_model"
+    ~toml_content:"summarize_model = \"tiny-summarizer\"\n"
+    (fun _ ->
+      Eio_main.run (fun env ->
+        let summary_model = ref None in
+        let module P : Provider.PROVIDER with type config = unit = struct
+          type config = unit
+          let name = "recorder"
+          let complete _net _cfg ?model ?options:_ ?tools:_ _msgs =
+            summary_model := model;
+            Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"recorder"
+              (Types.assistant_msg "the summary")
+          let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+            complete net cfg ?model ?options ?tools msgs
+          let list_models _ _ = []
+        end in
+        let provider = Provider.Provider ((module P), ()) in
+        let msgs =
+          Types.user_msg "the original task"
+          :: List.concat_map (fun i ->
+              [Types.user_msg (Printf.sprintf "step %d" i);
+               Types.assistant_msg (Printf.sprintf "did %d" i)])
+            [1; 2; 3; 4; 5]
+        in
+        let sess = make_session "expensive-model" provider in
+        let sess = Session.add_messages sess msgs in
+        let (sess', summary) = Session.summarise env#net env#clock sess in
+        assert (summary = "the summary");
+        (* the call went to the configured cheap model *)
+        assert (!summary_model = Some "tiny-summarizer");
+        let hist = Session.history sess' in
+        (* summary present... *)
+        assert (List.exists (fun (m : Types.chat_message) ->
+          Re.execp (Re.compile (Re.str "the summary")) m.Types.content) hist);
+        (* ...original task preserved verbatim... *)
+        assert (List.exists (fun (m : Types.chat_message) ->
+          Re.execp (Re.compile (Re.str "the original task")) m.Types.content) hist);
+        (* ...and the most recent exchanges survive untouched. *)
+        assert (List.exists (fun (m : Types.chat_message) ->
+          m.Types.content = "did 5") hist);
+        assert (List.exists (fun (m : Types.chat_message) ->
+          m.Types.content = "step 5") hist)))
