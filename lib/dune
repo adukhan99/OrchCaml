@@ -40,6 +40,7 @@
   Monitor
   Provider
   Tool
+  Tool_call_fallback
   Session
   Prompt
   Template

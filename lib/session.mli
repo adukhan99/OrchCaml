@@ -46,6 +46,18 @@ val with_model : t -> string -> t
 val history : t -> chat_message list
 val history_for_llm : t -> chat_message list
 
+(** Why a conversation run ended. Threaded into the returned
+    [result_with_meta.finish_reason] (via {!done_reason_string}) so
+    callers — notably [Agent] — can tell a genuine [finish] tool call
+    apart from a turn-budget stop or a bare text reply without
+    scanning history. *)
+type done_reason =
+  | Via_finish_tool
+  | Via_max_turns
+  | Via_plain_reply
+
+val done_reason_string : done_reason -> string
+
 val run_conversations : ?max_turns:int -> ?on_turn:(int -> int -> unit) -> ?on_step:(t -> unit) -> _ Eio.Net.t -> _ Eio.Time.clock -> t -> t * chat_message result_with_meta
 val run_conversations_stream : ?max_turns:int -> ?on_turn:(int -> int -> unit) -> ?on_step:(t -> unit) -> _ Eio.Net.t -> _ Eio.Time.clock -> t -> on_token:(string -> unit) -> t * chat_message result_with_meta
 

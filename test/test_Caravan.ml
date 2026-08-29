@@ -723,7 +723,7 @@ let%test_unit "agent_turn_increment_and_max_turns" =
                |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
     
     let on_turn current max = turn_calls := (current, max) :: !turn_calls in
-    let agent_cfg = Agent.{ max_turns = 5; continue_prompt = "continue"; nudge = false } in
+    let agent_cfg = Agent.{ max_turns = 5; continue_prompt = "continue"; nudge = false; require_finish = true; max_plain_replies = 3 } in
     let res = Agent.run ~config:agent_cfg ~on_turn env#net env#clock sess "Execute multi-turn task" in
     (match res with
      | Ok (final_sess, _meta) ->
@@ -736,7 +736,7 @@ let%test_unit "agent_turn_increment_and_max_turns" =
     turn_calls := [];
     let sess2 = Session.create ~tools:[finish_tool; read_tool] "multi" provider
                 |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
-    let agent_cfg_low = Agent.{ max_turns = 2; continue_prompt = "continue"; nudge = false } in
+    let agent_cfg_low = Agent.{ max_turns = 2; continue_prompt = "continue"; nudge = false; require_finish = true; max_plain_replies = 3 } in
     let res_low = Agent.run ~config:agent_cfg_low ~on_turn env#net env#clock sess2 "Task max turns test" in
     (match res_low with
      | Error "Maximum turns reached without completion." -> ()
@@ -747,7 +747,7 @@ let%test_unit "agent_turn_increment_and_max_turns" =
     turn_calls := [];
     let sess3 = Session.create ~tools:[finish_tool; read_tool] "multi" provider
                 |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
-    let agent_cfg_inf = Agent.{ max_turns = 0; continue_prompt = "continue"; nudge = false } in
+    let agent_cfg_inf = Agent.{ max_turns = 0; continue_prompt = "continue"; nudge = false; require_finish = true; max_plain_replies = 3 } in
     let res_inf = Agent.run ~config:agent_cfg_inf ~on_turn env#net env#clock sess3 "Task infinite max turns test" in
     (match res_inf with
      | Ok (final_sess, _meta) ->
@@ -850,7 +850,7 @@ let%test_unit "registry_lookup_and_errors" =
   ) entries
 
 let%test_unit "agent_nudge_injection" =
-  let cfg = Agent.{ max_turns = 10; continue_prompt = "continue"; nudge = true } in
+  let cfg = Agent.{ max_turns = 10; continue_prompt = "continue"; nudge = true; require_finish = true; max_plain_replies = 3 } in
   (* Halfway through the budget the nudge fires... *)
   let p_half = Agent.continue_prompt_for cfg ~task:"solve it" ~used:5 in
   assert (Re.execp (Re.compile (Re.str "Caravan nudge")) p_half);
@@ -1948,3 +1948,138 @@ let%test_unit "system_prompt_preamble_stable" =
   let a = System_prompt.environment_preamble () in
   let b = System_prompt.environment_preamble () in
   assert (a = b)
+
+(* ── C2: text tool-call fallback ──────────────────────────────────────── *)
+
+let%test_unit "tool_call_fallback_extract_table_driven" =
+  let tools = [Tool.Tool (module CaravanTools.Finish.Finish);
+               Tool.Tool (module CaravanTools.Bash.Bash)] in
+  let ok ~content ~name ~fmt =
+    match Tool_call_fallback.extract ~tools content with
+    | Some ([tc], format) ->
+      assert (tc.Types.name = name);
+      assert (format = fmt)
+    | Some _ -> failwith ("unexpected multi-call for: " ^ content)
+    | None -> failwith ("expected extraction for: " ^ content)
+  in
+  let rejected content =
+    assert (Tool_call_fallback.extract ~tools content = None)
+  in
+  (* bare JSON object *)
+  ok ~content:{|{"tool": "bash", "arguments": {"command": "ls"}}|}
+     ~name:"bash" ~fmt:"json";
+  (* alternate key spellings *)
+  ok ~content:{|{"name": "finish", "args": {"summary": "done"}}|}
+     ~name:"finish" ~fmt:"json";
+  (* fenced *)
+  ok ~content:"```json\n{\"tool\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n```"
+     ~name:"bash" ~fmt:"fenced_json";
+  (* XML wrappers *)
+  ok ~content:{|<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>|}
+     ~name:"bash" ~fmt:"xml";
+  (* OpenAI-style function object *)
+  ok ~content:{|{"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}|}
+     ~name:"bash" ~fmt:"json";
+  (* aliases resolve *)
+  ok ~content:{|{"tool": "sh", "arguments": {"command": "ls"}}|}
+     ~name:"sh" ~fmt:"json";
+  (* multi-call batch *)
+  (match Tool_call_fallback.extract ~tools
+           {|{"tool_calls": [{"function": {"name": "bash", "arguments": "{}"}}, {"function": {"name": "finish", "arguments": "{}"}}]}|}
+   with
+   | Some (tcs, _) -> assert (List.length tcs = 2)
+   | None -> failwith "batch extraction failed");
+  (* — rejections: the false-positive guards — *)
+  (* prose around the invocation *)
+  rejected {|I would run {"tool": "bash", "arguments": {}} if asked.|};
+  (* prose around a fence *)
+  rejected "Here is my plan:\n```json\n{\"tool\": \"bash\", \"arguments\": {}}\n```";
+  (* unregistered tool *)
+  rejected {|{"tool": "rm_rf_everything", "arguments": {}}|};
+  (* ordinary JSON that names no tool *)
+  rejected {|{"result": "ok", "count": 3}|};
+  (* ordinary prose and empty content *)
+  rejected "The bash tool lists files when given ls.";
+  rejected "";
+  (* one bad entry rejects the whole batch *)
+  rejected {|{"tool_calls": [{"function": {"name": "bash", "arguments": "{}"}}, {"function": {"name": "nope", "arguments": "{}"}}]}|}
+
+(* End to end: a model that emits its finish call as fenced text must
+   complete the run — before C2 the harness returned the JSON as prose
+   and reported success with zero tools executed. *)
+let%test_unit "session_executes_text_tool_call" =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+    let provider = make_mock_provider
+        "```json\n{\"tool\": \"finish\", \"arguments\": {\"summary\": \"recovered from text\"}}\n```" in
+    let sess = make_session ~tools:[finish_tool] "m" provider in
+    let (_, result) = Session.turn net clock sess "do the thing" in
+    assert (result.Types.finish_reason = Some "finish_tool");
+    let re = Re.compile (Re.str "recovered from text") in
+    assert (Re.execp re result.Types.value.Types.content))
+
+(* tool_call_mode = "native" disables the fallback. *)
+let%test_unit "tool_call_mode_native_disables_fallback" =
+  with_tmp_config ~name:"test_native_mode" ~toml_content:"tool_call_mode = \"native\"\n"
+    (fun _ ->
+      Eio_main.run (fun env ->
+        let net = Eio.Stdenv.net env in
+        let clock = Eio.Stdenv.clock env in
+        let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+        let text = {|{"tool": "finish", "arguments": {"summary": "nope"}}|} in
+        let provider = make_mock_provider text in
+        let sess = make_session ~tools:[finish_tool] "m" provider in
+        let (_, result) = Session.turn net clock sess "hi" in
+        assert (result.Types.finish_reason = Some "plain_reply");
+        assert (result.Types.value.Types.content = text)))
+
+(* ── H5: plain-reply-means-finished is wrong in agent mode ────────────── *)
+
+let%test_unit "agent_finish_discipline" =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+    let cfg on = Agent.{ max_turns = 20; continue_prompt = "continue";
+                         nudge = false; require_finish = on;
+                         max_plain_replies = 3 } in
+    (* A model that only ever chats must fail fast with a diagnostic. *)
+    let chatty = make_mock_provider "Sure, I'll read that file for you!" in
+    let sess = make_session ~tools:[finish_tool] "m" chatty in
+    (match Agent.run ~config:(cfg true) net clock sess "read the file" with
+     | Ok _ -> failwith "chatty model must not count as finished"
+     | Error msg ->
+       assert (Re.execp (Re.compile (Re.str "without calling")) msg));
+    (* With the discipline off, the old behaviour is preserved. *)
+    let sess = make_session ~tools:[finish_tool] "m" chatty in
+    (match Agent.run ~config:(cfg false) net clock sess "read the file" with
+     | Ok (_, result) ->
+       assert (result.Types.finish_reason = Some "plain_reply")
+     | Error e -> failwith ("require_finish=false should accept plain: " ^ e));
+    (* A model that chats first and finishes after the reminder succeeds. *)
+    let calls = ref 0 in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "late_finisher"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        incr calls;
+        if !calls < 3 then
+          Types.wrap_result ~raw_response:"" ~model:"m" ~provider:name
+            (Types.assistant_msg "Working on it!")
+        else
+          let tc = Types.{ id = "f"; name = "finish";
+                           args = {|{"summary": "done late"}|}; extra_content = None } in
+          Types.wrap_result ~raw_response:"" ~model:"m" ~provider:name
+            (Types.assistant_tool_msg ~tool_calls:[tc] "")
+      let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+        complete net cfg ?model ?options ?tools msgs
+      let list_models _ _ = []
+    end in
+    let late = Provider.Provider ((module P), ()) in
+    let sess = make_session ~tools:[finish_tool] "m" late in
+    (match Agent.run ~config:(cfg true) net clock sess "task" with
+     | Ok (_, result) ->
+       assert (result.Types.finish_reason = Some "finish_tool")
+     | Error e -> failwith ("late finisher should succeed: " ^ e)))

@@ -649,6 +649,25 @@ let get_max_turns () =
 let get_nudge_enabled () =
   get_bool_opt (Some "CARAVAN_NUDGE") "nudge" |> Option.value ~default:true
 
+(** How tool calls are recognised in model replies:
+    - "auto"   (default) — native tool_calls, plus the text fallback
+      parser when a reply's whole content is a well-formed invocation;
+    - "native" — trust only the API tool_calls field;
+    - "text"   — same recognition as "auto"; the explicit setting exists
+      so text-protocol use is a documented first-class mode, and so
+      front-ends can add text-mode prompt scaffolding on top. *)
+let get_tool_call_mode () =
+  get_string_opt (Some "CARAVAN_TOOL_CALL_MODE") "tool_call_mode"
+  |> Option.value ~default:"auto"
+  |> String.lowercase_ascii
+
+(** Whether agent runs require an explicit [finish] tool call to count
+    as complete (default: true). When false, a plain text reply ends
+    the run — the pre-refactor behaviour. *)
+let get_require_finish () =
+  get_bool_opt (Some "CARAVAN_REQUIRE_FINISH") "require_finish"
+  |> Option.value ~default:true
+
 (** How aggressively provider calls retry transient failures:
     "off" | "low" | "medium" | "high" (default "medium"). Parsed into a
     [Provider.Retry.mode] at the call site; unknown values fall back to
@@ -750,6 +769,8 @@ let editable_keys : (string * string * string) list = [
   ("stream",      "Stream tokens as they arrive",       "true | false");
   ("max_turns",   "Agent turn budget",                  "integer");
   ("nudge",       "Budget nudges in agent loops",       "true | false");
+  ("tool_call_mode", "Tool-call recognition",           "auto | native | text");
+  ("require_finish", "Agent runs must call finish to complete", "true | false");
   ("permissions", "Mutating-tool policy",               "auto | ask | readonly");
   ("provider_retry", "Provider error retry aggression", "off | low | medium | high");
   ("provider_retry_base_delay", "Base backoff seconds between provider retries", "float");

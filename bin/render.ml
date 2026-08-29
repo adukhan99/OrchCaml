@@ -26,6 +26,9 @@ let render opts ev =
     if not opts.quiet then println (Ui.format_tool_result ~verbose:opts.verbose ~output ~duration ())
   | Tool_not_found { name } ->
     println (Ui.red (Printf.sprintf "  ✗ tool '%s' not found" name))
+  | Tool_call_fallback { name; format } ->
+    if not opts.quiet then
+      println (Ui.dim (Printf.sprintf "  ↯ recovered '%s' tool call from text (%s)" name format))
   | Permission_denied { name } ->
     println (Ui.yellow (Printf.sprintf "  ⛔ permission denied: %s" name))
   | Task_finished { summary } ->

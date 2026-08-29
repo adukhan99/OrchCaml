@@ -226,7 +226,29 @@ type step_outcome =
   | Continue of t
   | Done     of t * string * done_reason
 
+(** Recover a tool call the model emitted as text (audit C2).  Applied
+    only when the native [tool_calls] field is empty, the session has
+    tools, and [tool_call_mode] is not "native".  The extractor itself
+    enforces the whole-content and registered-tool guards; the reply is
+    rewritten to carry the synthesised calls (content moves to the
+    tool_calls, mirroring what a native-calling model would have sent). *)
+let apply_tool_call_fallback sess (reply : chat_message) =
+  match reply.tool_calls with
+  | Some tcs when tcs <> [] -> reply
+  | _ ->
+    if sess.tools = [] || Config.get_tool_call_mode () = "native" then reply
+    else
+      match Tool_call_fallback.extract ~tools:sess.tools reply.content with
+      | None -> reply
+      | Some (tcs, format) ->
+        List.iter
+          (fun (tc : tool_call) ->
+             Trace.emit (Trace.Tool_call_fallback { name = tc.name; format }))
+          tcs;
+        { reply with tool_calls = Some tcs; content = "" }
+
 let run_turn_step ?max_turns ?on_turn ?on_step net clock sess (reply : chat_message) =
+  let reply = apply_tool_call_fallback sess reply in
   let Memory.Mem ((module M), mem) = sess.memory in
   let final_memory = Memory.Mem ((module M), M.add mem reply) in
   let new_sess = { sess with memory = final_memory; turn_idx = sess.turn_idx + 1 } in
