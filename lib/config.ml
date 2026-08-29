@@ -641,9 +641,12 @@ let get_permission_mode () =
   |> Option.value ~default:"auto"
   |> String.lowercase_ascii
 
-(** Agent turn budget (CLI flag > env > TOML > default 10). *)
+(** Agent turn budget (CLI flag > env > TOML > default 24).  Raised
+    from 10 once C4 made the ceiling actually enforceable: weak models
+    need more steps to reach the same place, and the budget nudges keep
+    long runs pointed at the task. *)
 let get_max_turns () =
-  get_int_opt (Some "CARAVAN_MAX_TURNS") "max_turns" |> Option.value ~default:10
+  get_int_opt (Some "CARAVAN_MAX_TURNS") "max_turns" |> Option.value ~default:24
 
 (** Whether the agent loop injects budget-awareness nudges (default: true). *)
 let get_nudge_enabled () =

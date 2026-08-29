@@ -11,7 +11,7 @@ module Registry = CaravanProviders.Registry
 
 let strict_mode () =
   Config.get_int_opt (Some "CARAVAN_STRICT_MODE") "strict_mode"
-  |> Option.value ~default:1
+  |> Option.value ~default:0
 
 let base_tools () =
   let base = CaravanTools.All_tools.all_tools in
@@ -168,7 +168,7 @@ let help_groups = [
   { title = "Model and Provider";
     commands = [
       ("/model <name>", "Switch AI model",
-       Some "Example: /model claude-sonnet-4-5");
+       Some "Example: /model claude-sonnet-5");
       ("/provider <p> [url]", "Switch AI provider",
        Some "Example: /provider anthropic");
       ("/models", "Browse available models", None);
@@ -1465,7 +1465,7 @@ let config_cmd =
   let doc = "Show or edit the configuration file (show | path | get | set)." in
   let man = [
     `S Manpage.s_examples;
-    `P "caravan config set model claude-sonnet-4-5"; `Noblank;
+    `P "caravan config set model claude-sonnet-5"; `Noblank;
     `P "caravan config set permissions ask"; `Noblank;
     `P "caravan config get provider";
   ] in
@@ -1628,7 +1628,7 @@ let () =
     `P "caravan init                          # guided setup"; `Noblank;
     `P "caravan                               # chat REPL"; `Noblank;
     `P "caravan agent \"fix the failing test\"  # one-shot autonomy"; `Noblank;
-    `P "caravan -p anthropic -m claude-sonnet-4-5"; `Noblank;
+    `P "caravan -p anthropic -m claude-sonnet-5"; `Noblank;
     `P "caravan providers --ladder            # model suggestions by size";
   ] in
   let info = Cmd.info "caravan" ~doc ~man ~version:Version.v in

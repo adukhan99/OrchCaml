@@ -25,20 +25,45 @@ caravan config set permissions ask     # CLI
 
 ```toml
 provider    = "anthropic"          # see `caravan providers`
-model       = "claude-sonnet-4-5"  # omit → provider default
+model       = "claude-sonnet-5"    # omit → provider default
 # base_url  = "http://my-gateway:8000/v1"
-system      = "You are a concise research assistant."
+system      = "You are a concise research assistant."   # appended to the shipped default
+# system_replace = true  # make `system` replace the shipped default entirely
 
 stream      = true       # stream tokens as they arrive
-max_turns   = 15         # agent turn budget
+max_turns   = 15         # agent turn budget (default 24)
 nudge       = true       # budget-awareness nudges in agent loops
 permissions = "auto"     # auto | ask | readonly
 provider_retry = "medium"  # provider error retry aggression: off | low | medium | high
 # provider_retry_base_delay = 0.5  # base backoff seconds (exponential, cap 30s)
 transcript  = true       # JSONL session logs in ~/.caravan/logs/
-strict_mode = 1          # bash tool: 0 permissive, 1 single-command, 2 hidden
+strict_mode = 0          # bash tool: 0 permissive, 1 single-command, 2 hidden
 enable_subagents = true  # offer delegate when [[subagents]] exist
+
+tool_call_mode = "auto"  # tool-call recognition: auto | native | text
+require_finish = true    # agent runs complete only via the finish tool
+tool_profile   = "auto"  # tool surface: auto (capability-driven) | core | full
+# summarize_model = "…"  # cheap model for compaction summaries
 ```
+
+### Model capabilities
+
+Unknown models get conservative defaults (8k context window, tool
+calling treated as unreliable). Override per model-name pattern
+(case-insensitive substring match); every field is optional:
+
+```toml
+[capabilities."my-local-model"]
+context_window = 32768
+tool_calling = "native"        # native | flaky | text
+streaming_tool_calls = true
+cache = "automatic"            # none | automatic | explicit
+requests_per_minute = 20
+```
+
+The capability table drives the compaction threshold, the text
+tool-call fallback, the tool profile, and the system-prompt layers —
+see [Getting Started for Free](free-tier.md).
 
 `caravan config keys` (or `/config keys`) lists every editable key with
 accepted values.
@@ -56,7 +81,10 @@ interrupting the turn. `provider_retry` controls the aggression:
 | `medium` (default) | 3 | 5xx + 429 + connection failures |
 | `high` | unlimited | every HTTP status, including deterministic 4xx |
 
-Backoff is exponential (`provider_retry_base_delay`, default 0.5s:
+When the server supplies `Retry-After` (or an `x-ratelimit-reset-*`
+header), that wait is honoured instead — clamped to 120s — which is
+what makes 429-heavy free tiers survivable.
+Otherwise backoff is exponential (`provider_retry_base_delay`, default 0.5s:
 0.5s → 1s → 2s … capped at 30s). Streaming responses are only retried
 before the first token reaches your terminal, so output is never
 duplicated. Every retry is announced in the transcript as a

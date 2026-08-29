@@ -829,7 +829,7 @@ let%test_unit "registry_lookup_and_errors" =
   let open CaravanProviders.Registry in
   (match find "anthropic" with
    | Some e ->
-     assert (e.default_model = "claude-sonnet-4-5");
+     assert (e.default_model = "claude-sonnet-5");
      assert (e.key_env = Some "ANTHROPIC_API_KEY")
    | None -> failwith "anthropic missing from registry");
   (* Aliases resolve. *)

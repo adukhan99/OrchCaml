@@ -28,7 +28,7 @@ Every command accepts `-p/--provider`, `-m/--model`, `--base-url`,
 
 ### `caravan agent`
 
-- `--max-turns N` — turn budget (default: config `max_turns`, else 10)
+- `--max-turns N` — turn budget (default: config `max_turns`, else 24)
 - `--quiet` — final result only
 - `--json` — one JSON object on stdout:
   `{ok, result, turns, usage, transcript}`
