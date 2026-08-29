@@ -7,7 +7,7 @@
     hundred dependency-free lines.
 
     Features:
-    - arrow keys / Home / End / Delete / Backspace, Ctrl-A/E/K/U/W/L
+    - arrow keys / Home / End / Delete / Backspace, Ctrl/Alt-Left/Right, Alt-B/F, Ctrl-A/E/K/U/W/L
     - Up/Down history, persisted to ~/.caravan/history (0600)
     - a fish-style palette: typing '/' filters commands live below the
       input; Tab completes (cycling on ambiguity); Esc hides it
@@ -63,6 +63,7 @@ type key =
   | Char of string      (* a UTF-8 character *)
   | Enter | Backspace | Delete | Tab | Esc
   | Up | Down | Left | Right | Home | End
+  | Word_left | Word_right
   | Ctrl of char        (* Ctrl-A … Ctrl-Z by letter *)
   | Eof
 
@@ -87,12 +88,14 @@ let read_key () =
           | Some ch when ch >= '@' && ch <= '~' && ch <> '[' ->
             let seq = Buffer.contents buf in
             (match ch, seq with
-             | 'A', _ -> Up
-             | 'B', _ -> Down
-             | 'C', _ -> Right
-             | 'D', _ -> Left
-             | 'H', _ -> Home
-             | 'F', _ -> End
+             | 'A', _  -> Up
+             | 'B', _  -> Down
+             | 'C', "" -> Right
+             | 'C', _  -> Word_right
+             | 'D', "" -> Left
+             | 'D', _  -> Word_left
+             | 'H', _  -> Home
+             | 'F', _  -> End
              | '~', ("1" | "7") -> Home
              | '~', ("4" | "8") -> End
              | '~', "3" -> Delete
@@ -100,6 +103,16 @@ let read_key () =
           | Some ch -> Buffer.add_char buf ch; collect ()
         in
         collect ()
+      | Some ('b' | 'B') -> Word_left
+      | Some ('f' | 'F') -> Word_right
+      | Some '\027' ->
+        (match read_byte () with
+         | Some ('[' | 'O') ->
+           (match read_byte () with
+            | Some 'D' -> Word_left
+            | Some 'C' -> Word_right
+            | _ -> Esc)
+         | _ -> Esc)
       | Some _ -> Esc
     end
     else if code < 32 then
@@ -187,6 +200,37 @@ let chars_of_string s =
       go (i + step) (String.sub s i step :: acc)
   in
   go 0 []
+
+let is_word_char s =
+  if String.length s <> 1 then true
+  else
+    match s.[0] with
+    | 'a'..'z' | 'A'..'Z' | '0'..'9' | '_' -> true
+    | _ -> false
+
+let word_left st =
+  let arr = Array.of_list st.chars in
+  let len = Array.length arr in
+  let i = ref (min st.cursor len) in
+  while !i > 0 && not (is_word_char arr.(!i - 1)) do
+    decr i
+  done;
+  while !i > 0 && is_word_char arr.(!i - 1) do
+    decr i
+  done;
+  !i
+
+let word_right st =
+  let arr = Array.of_list st.chars in
+  let len = Array.length arr in
+  let i = ref (max 0 st.cursor) in
+  while !i < len && not (is_word_char arr.(!i)) do
+    incr i
+  done;
+  while !i < len && is_word_char arr.(!i) do
+    incr i
+  done;
+  !i
 
 let matching_commands commands (line : string) =
   if String.length line = 0 || line.[0] <> '/' then []
@@ -316,6 +360,8 @@ let read_line ~prompt ~(commands : command_info list) () : string option =
          | Delete -> delete_at st.cursor; st.tab_idx <- 0
          | Left -> if st.cursor > 0 then st.cursor <- st.cursor - 1
          | Right -> if st.cursor < List.length st.chars then st.cursor <- st.cursor + 1
+         | Word_left -> st.cursor <- word_left st; st.tab_idx <- 0
+         | Word_right -> st.cursor <- word_right st; st.tab_idx <- 0
          | Home | Ctrl 'A' -> st.cursor <- 0
          | End  | Ctrl 'E' -> st.cursor <- List.length st.chars
          | Ctrl 'C' ->
