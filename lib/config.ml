@@ -318,6 +318,31 @@ let assoc_int_opt fields key =
   | Some (Otoml.TomlInteger n) -> Some n
   | _ -> None
 
+(** Read a TOML boolean field from an association list, returning None on miss. *)
+let assoc_bool_opt fields key =
+  match List.assoc_opt key fields with
+  | Some (Otoml.TomlBoolean b) -> Some b
+  | _ -> None
+
+(** Read the [capabilities] table: each sub-table keyed by a model-name
+    pattern, e.g. [capabilities."my-model"] with capability fields.
+    Returns [(pattern, fields)] in file order; see [Capability.lookup]. *)
+let get_capability_overrides () =
+  match get_ast () with
+  | None -> []
+  | Some ast ->
+    try
+      match Otoml.find ast (fun x -> x) ["capabilities"] with
+      | Otoml.TomlTable entries | Otoml.TomlInlineTable entries ->
+        List.filter_map (fun (pattern, v) ->
+          match v with
+          | Otoml.TomlTable fields | Otoml.TomlInlineTable fields ->
+            Some (pattern, fields)
+          | _ -> None
+        ) entries
+      | _ -> []
+    with _ -> []
+
 (** Get a single MCP server config by name. *)
 let get_mcp_server name =
   List.find_opt (fun (s : mcp_server_config) -> s.name = name) (get_mcp_servers ())

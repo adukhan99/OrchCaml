@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# caravan-demo — run and re-skin the Caravan terminal demos.
+#
+# Untracked scratch tooling; it never touches git and only ever writes
+# inside Caravan's _build/.  Every knob is passed to the demos as an
+# environment variable, so `CARAVAN_DEMO_PALETTE=nous ./oasis.exe` on its
+# own does exactly what this script does.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Two layouts, one script:
+#   standalone  — this directory is its own dune project (dune-project here)
+#   in-tree     — this is demos/ inside a bigger dune project (Caravan)
+if [ -f "$HERE/dune-project" ]; then
+  ROOT="$HERE"; BIN="$ROOT/_build/default"; TARGET="."
+elif [ -f "$HERE/../dune-project" ]; then
+  ROOT="$(cd "$HERE/.." && pwd)"; BIN="$ROOT/_build/default/$(basename "$HERE")"; TARGET="$(basename "$HERE")/"
+else
+  printf 'no dune-project found next to %s or above it\n' "$HERE" >&2; exit 1
+fi
+
+DEMOS=(cuneiform silkroad pyramids galtian oasis)
+BLURB=(
+  "Sumerian clay tablet — a stylus impresses the session record, wedge by wedge"
+  "The long road — parallax dunes, a camel train, and a goods ticker (loops)"
+  "Dawn over the context stack — the sun rises and lights three pyramids"
+  "Duotone plasma — halftoned field, CARAVAN cut out of it, RGB-split tearing (loops)"
+  "Camp at the oasis — Hermes-style banner, info panel, and a live trace stream"
+)
+DEFPAL=(lapis ember hermes nous hermes)
+PALETTES=(hermes lapis ember oasis nous phosphor bone)
+
+esc=$'\033'
+bold="${esc}[1m"; dim="${esc}[2m"; rst="${esc}[0m"
+gold="${esc}[38;2;255;191;0m"; cyan="${esc}[38;2;0;229;255m"
+red="${esc}[38;2;229;83;75m"; grey="${esc}[38;2;110;100;85m"
+
+PALETTE=""          # empty = each demo keeps its own default
+SPEED="${CARAVAN_DEMO_SPEED:-1}"
+HOLD=""
+ASCII=0
+TRUECOLOR=""
+
+die() { printf '%s✗ %s%s\n' "$red" "$*" "$rst" >&2; exit 1; }
+
+usage() {
+  cat <<USAGE
+
+  ${bold}caravan-demo${rst} — five terminal demos for Caravan
+
+  ${bold}usage${rst}
+    caravan-demo                    interactive menu
+    caravan-demo <name|1-5> [opts]  run one
+    caravan-demo --all [opts]       run all five in order
+    caravan-demo --tour [opts]      run all five, each in a different palette
+
+  ${bold}options${rst}
+    -p, --palette NAME   ${PALETTES[*]}
+    -s, --speed X        animation rate multiplier (default 1, try 2 or 0.5)
+    -H, --hold SECS      seconds to linger on the final frame (default: wait for a key)
+        --ascii          swap exotic glyphs for safe stand-ins
+        --no-truecolor   force the 256-colour fallback
+    -l, --list           list the demos
+    -c, --palettes       print every palette as colour bars
+    -h, --help           this
+
+  ${bold}notes${rst}
+    q or Esc quits any demo.  The final frame is left in your scrollback.
+    Best at 100x32 or larger; everything reflows down to about 60x20.
+
+USAGE
+}
+
+list_demos() {
+  printf '\n'
+  for i in "${!DEMOS[@]}"; do
+    printf '  %s%d%s  %s%-10s%s %s(default palette: %s)%s\n' \
+      "$gold" "$((i+1))" "$rst" "$bold" "${DEMOS[$i]}" "$rst" "$dim" "${DEFPAL[$i]}" "$rst"
+    printf '      %s%s%s\n' "$grey" "${BLURB[$i]}" "$rst"
+  done
+  printf '\n'
+}
+
+build() {
+  # opam is optional — any dune + ocaml on PATH is enough, the demos link
+  # against unix and nothing else.
+  command -v dune >/dev/null 2>&1 || \
+    { command -v opam >/dev/null 2>&1 && eval "$(opam env 2>/dev/null)" || true; }
+  command -v dune >/dev/null 2>&1 || die "dune not found on PATH (try: eval \$(opam env))"
+  ( cd "$ROOT" && dune build "$TARGET" 2>&1 | head -30 ) || die "build failed"
+  [ -x "$BIN/oasis.exe" ] || die "binaries missing after build (looked in $BIN)"
+}
+
+run_one() {
+  local name="$1" pal="$2"
+  [ -x "$BIN/$name.exe" ] || die "no such demo: $name"
+  local env=(env)
+  [ -n "$pal" ] && env+=("CARAVAN_DEMO_PALETTE=$pal")
+  [ -n "$SPEED" ] && env+=("CARAVAN_DEMO_SPEED=$SPEED")
+  [ -n "$HOLD" ] && env+=("CARAVAN_DEMO_HOLD=$HOLD")
+  [ "$ASCII" = "1" ] && env+=("CARAVAN_DEMO_ASCII=1")
+  [ -n "$TRUECOLOR" ] && env+=("CARAVAN_DEMO_TRUECOLOR=$TRUECOLOR")
+  "${env[@]}" "$BIN/$name.exe"
+}
+
+# Resolve a demo argument (name, prefix, or 1-5) to an index.
+resolve() {
+  local a="$1"
+  if [[ "$a" =~ ^[1-9]$ ]] && [ "$a" -le "${#DEMOS[@]}" ]; then echo $((a-1)); return 0; fi
+  for i in "${!DEMOS[@]}"; do [ "${DEMOS[$i]}" = "$a" ] && { echo "$i"; return 0; }; done
+  for i in "${!DEMOS[@]}"; do [[ "${DEMOS[$i]}" == "$a"* ]] && { echo "$i"; return 0; }; done
+  return 1
+}
+
+pal_for() { # index -> palette to use
+  if [ -n "$PALETTE" ]; then echo "$PALETTE"; else echo "${DEFPAL[$1]}"; fi
+}
+
+run_all() {
+  local tour="$1" i pal
+  [ -z "$HOLD" ] && HOLD=4
+  for i in "${!DEMOS[@]}"; do
+    if [ "$tour" = "1" ] && [ -z "$PALETTE" ]; then
+      pal="${PALETTES[$(( i % ${#PALETTES[@]} ))]}"
+    else
+      pal="$(pal_for "$i")"
+    fi
+    printf '\n%s── %d/%d  %s  %s[%s]%s\n' "$gold" "$((i+1))" "${#DEMOS[@]}" "${DEMOS[$i]}" "$dim" "$pal" "$rst"
+    run_one "${DEMOS[$i]}" "$pal"
+  done
+}
+
+menu() {
+  local cur=0 msg=""
+  while true; do
+    clear
+    printf '\n  %s%s☾ caravan-demo%s   %sfive terminal demos%s\n' "$bold" "$gold" "$rst" "$dim" "$rst"
+    printf '  %s──────────────────────────────────────────────────────────────%s\n' "$grey" "$rst"
+    list_demos
+    printf '  %spalette%s  %s%s%s   %sspeed%s %s   %sglyphs%s %s\n' \
+      "$dim" "$rst" "$cyan" "${PALETTE:-per-demo default}" "$rst" \
+      "$dim" "$rst" "$SPEED" "$dim" "$rst" "$([ "$ASCII" = 1 ] && echo ascii-safe || echo unicode)"
+    printf '\n  %s1-5%s run   %sa%s all   %st%s tour (a palette each)   %sp%s next palette   %sP%s previous\n' \
+      "$gold" "$rst" "$gold" "$rst" "$gold" "$rst" "$gold" "$rst" "$gold" "$rst"
+    printf '  %sc%s palette bars   %s0%s clear palette   %s+/-%s speed   %sx%s ascii   %sq%s quit\n' \
+      "$gold" "$rst" "$gold" "$rst" "$gold" "$rst" "$gold" "$rst" "$gold" "$rst"
+    [ -n "$msg" ] && printf '\n  %s%s%s\n' "$cyan" "$msg" "$rst"
+    msg=""
+    printf '\n  > '
+    IFS= read -rsn1 k || break
+    case "$k" in
+      [1-5]) i="$((k-1))"; run_one "${DEMOS[$i]}" "$(pal_for "$i")" ;;
+      a|A) run_all 0; HOLD="" ;;
+      t|T) run_all 1; HOLD="" ;;
+      p) if [ -z "$PALETTE" ]; then PALETTE="${PALETTES[0]}"; else
+           for i in "${!PALETTES[@]}"; do [ "${PALETTES[$i]}" = "$PALETTE" ] && cur=$i; done
+           PALETTE="${PALETTES[$(( (cur+1) % ${#PALETTES[@]} ))]}"; fi ;;
+      P) if [ -z "$PALETTE" ]; then PALETTE="${PALETTES[-1]}"; else
+           for i in "${!PALETTES[@]}"; do [ "${PALETTES[$i]}" = "$PALETTE" ] && cur=$i; done
+           PALETTE="${PALETTES[$(( (cur-1+${#PALETTES[@]}) % ${#PALETTES[@]} ))]}"; fi ;;
+      0) PALETTE=""; msg="palette cleared — each demo uses its own default" ;;
+      c|C) clear; CARAVAN_DEMO_PALETTE="$PALETTE" "$BIN/swatch.exe"; printf '  press any key '; IFS= read -rsn1 _ ;;
+      +|=) SPEED="$(awk -v s="$SPEED" 'BEGIN{printf "%.2g", (s*1.5>8?8:s*1.5)}')" ;;
+      -|_) SPEED="$(awk -v s="$SPEED" 'BEGIN{printf "%.2g", (s/1.5<0.2?0.2:s/1.5)}')" ;;
+      x|X) ASCII=$(( 1 - ASCII )) ;;
+      q|Q|$'\033') clear; printf '\n'; break ;;
+      *) msg="unknown key" ;;
+    esac
+  done
+}
+
+# ── argument parsing ─────────────────────────────────────────────────────
+WHAT=""
+MODE="one"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--list) list_demos; exit 0 ;;
+    -c|--palettes) build; CARAVAN_DEMO_PALETTE="$PALETTE" "$BIN/swatch.exe"; exit 0 ;;
+    --all) MODE="all" ;;
+    --tour) MODE="tour" ;;
+    -p|--palette) PALETTE="${2:-}"; shift
+      [[ " ${PALETTES[*]} " == *" $PALETTE "* ]] || die "unknown palette '$PALETTE' (have: ${PALETTES[*]})" ;;
+    -s|--speed) SPEED="${2:-1}"; shift ;;
+    -H|--hold) HOLD="${2:-4}"; shift ;;
+    --ascii) ASCII=1 ;;
+    --no-truecolor) TRUECOLOR=0 ;;
+    -*) die "unknown option $1 (try --help)" ;;
+    *) WHAT="$1" ;;
+  esac
+  shift
+done
+
+build
+case "$MODE" in
+  all)  run_all 0 ;;
+  tour) run_all 1 ;;
+  one)
+    if [ -z "$WHAT" ]; then menu
+    else
+      idx="$(resolve "$WHAT")" || die "no such demo '$WHAT' (try --list)"
+      run_one "${DEMOS[$idx]}" "$(pal_for "$idx")"
+    fi ;;
+esac

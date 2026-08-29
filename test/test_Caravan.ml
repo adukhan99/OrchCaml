@@ -1802,3 +1802,66 @@ let%test_unit "provider_retry_token_guard_on_stream" =
     assert raised;
     assert (!got = "partial"))
 
+
+(* ── Capability table (Tier 0 of the low-cost-model refactor) ─────────── *)
+
+let%test_unit "capability_lookup_table_driven" =
+  let check ~model ~ctx ~fidelity =
+    let cap = Capability.lookup model in
+    assert (cap.Capability.context_window = ctx);
+    assert (cap.Capability.tool_calling = fidelity)
+  in
+  (* frontier cloud *)
+  check ~model:"claude-sonnet-5"   ~ctx:1_000_000 ~fidelity:Capability.Native;
+  check ~model:"claude-haiku-4-5"  ~ctx:200_000   ~fidelity:Capability.Native;
+  check ~model:"gpt-4o-mini"       ~ctx:128_000   ~fidelity:Capability.Native;
+  check ~model:"deepseek-chat"     ~ctx:128_000   ~fidelity:Capability.Native;
+  (* small local — the population the fallback parser exists for *)
+  check ~model:"llama3.2:1b"       ~ctx:8_192     ~fidelity:Capability.Flaky;
+  check ~model:"qwen3:4b"          ~ctx:32_768    ~fidelity:Capability.Flaky;
+  (* unknown models get the conservative default *)
+  check ~model:"totally-unknown-model-7b"
+    ~ctx:Capability.conservative.Capability.context_window
+    ~fidelity:Capability.conservative.Capability.tool_calling;
+  (* specific patterns beat family catch-alls *)
+  let hk = Capability.lookup "claude-haiku-4-5" in
+  let cl = Capability.lookup "claude-opus-5" in
+  assert (hk.Capability.context_window < cl.Capability.context_window);
+  (* deepseek advertises automatic prefix caching *)
+  assert ((Capability.lookup "deepseek-chat").Capability.cache = Capability.Cache_automatic)
+
+let%test_unit "capability_config_override" =
+  with_tmp_config ~name:"test_capability_override"
+    ~toml_content:{|
+[capabilities."my-lab-model"]
+context_window = 65536
+tool_calling = "text"
+cache = "automatic"
+requests_per_minute = 20
+|}
+    (fun _ ->
+      let cap = Capability.lookup "My-Lab-Model-v2" in
+      assert (cap.Capability.context_window = 65536);
+      assert (cap.Capability.tool_calling = Capability.Text_only);
+      assert (cap.Capability.cache = Capability.Cache_automatic);
+      assert (cap.Capability.requests_per_minute = Some 20);
+      (* untouched fields keep their base value *)
+      assert (cap.Capability.streaming_tool_calls
+              = Capability.conservative.Capability.streaming_tool_calls);
+      (* overrides patch on top of a built-in base too *)
+      let unrelated = Capability.lookup "claude-sonnet-5" in
+      assert (unrelated.Capability.context_window = 1_000_000))
+
+let%test_unit "capability_token_estimate" =
+  let check ~s ~expected = assert (Capability.estimate_tokens s = expected) in
+  check ~s:"" ~expected:0;
+  check ~s:"abcd" ~expected:1;
+  check ~s:"abcde" ~expected:2;
+  check ~s:(String.make 4000 'x') ~expected:1000;
+  (* message estimate covers tool-call args, not just content *)
+  let tc = Types.{ id = "c1"; name = "bash";
+                   args = {|{"command":"ls -la"}|}; extra_content = None } in
+  let with_tc = Types.assistant_tool_msg ~tool_calls:[tc] "" in
+  let plain   = Types.assistant_msg "" in
+  assert (Capability.estimate_message_tokens with_tc
+          > Capability.estimate_message_tokens plain)

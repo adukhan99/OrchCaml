@@ -1,0 +1,20 @@
+; Untracked eye-candy demos.  Deliberately self-contained: they link only
+; against unix, never against the Caravan library, so nothing here can
+; break the real build or the opam package.
+; Warnings stay visible but are never fatal: this directory ships as a
+; standalone zip, and a compiler a version or two off should not turn a new
+; warning into a failed build on someone else's machine.
+(env
+ (_
+  (flags
+   (:standard -warn-error -a))))
+
+(library
+ (name dtui)
+ (modules tui)
+ (libraries unix))
+
+(executables
+ (names cuneiform silkroad pyramids galtian oasis swatch)
+ (modules cuneiform silkroad pyramids galtian oasis swatch)
+ (libraries dtui unix))
