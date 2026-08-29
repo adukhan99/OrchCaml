@@ -104,7 +104,19 @@ let parse_usage json =
       | `Float ns -> Some (ns /. 1e9)
       | _         -> None
     in
-    Some { prompt_tokens; completion_tokens; total_tokens; total_duration }
+    (* Cache-hit accounting: OpenAI-shaped APIs report
+       prompt_tokens_details.cached_tokens; DeepSeek uses
+       prompt_cache_hit_tokens.  Recording it makes the byte-stable
+       prefix work verifiable instead of hopeful. *)
+    let cached_tokens =
+      match u |> member "prompt_tokens_details" |> member "cached_tokens" with
+      | `Int n -> Some n
+      | _ ->
+        (match u |> member "prompt_cache_hit_tokens" with
+         | `Int n -> Some n
+         | _ -> None)
+    in
+    Some { prompt_tokens; completion_tokens; total_tokens; total_duration; cached_tokens }
   | _ -> None
 
 let parse_complete_response body_str provider_name model =

@@ -105,13 +105,41 @@ let history sess =
   let Memory.Mem ((module M), mem) = sess.memory in
   M.get mem
 
+let truncation_suffix = "omitted to preserve context ...]"
+
+(** Truncate an aged tool output.  Idempotent — an already-truncated
+    message is returned unchanged, byte for byte, because this runs on
+    every turn and any byte drift in an old message invalidates the
+    provider's prompt-cache prefix from that point on. *)
 let truncate_tool_output max_len msg =
   match msg.role with
-  | Tool _ when String.length msg.content > max_len ->
+  | Tool _ when String.length msg.content > max_len
+             && not (String.ends_with ~suffix:truncation_suffix msg.content) ->
     let prefix = String.sub msg.content 0 max_len in
     let omitted = String.length msg.content - max_len in
     { msg with content = Printf.sprintf "%s\n[... %d bytes omitted to preserve context ...]" prefix omitted }
   | _ -> msg
+
+(** How many trailing messages keep their full tool output.  The model
+    reads a result in full while it is fresh; once it ages past this
+    window it is truncated permanently in memory (see [stabilize]). *)
+let full_output_window = 2
+
+(** Truncate tool outputs that have aged out of the recent window —
+    {b in memory}, once, so each message's serialised form is immutable
+    for the rest of its life.  The previous design re-derived truncation
+    per request with a moving boundary, which changed old messages'
+    bytes between turns and made the request prefix uncacheable by
+    construction (prompt caching is strict prefix matching).  Run before
+    every provider call; idempotence of [truncate_tool_output] makes the
+    repeated application byte-stable. *)
+let stabilize sess =
+  match sess.cfg.max_tool_output_len with
+  | None -> sess
+  | Some max_len ->
+    let Memory.Mem ((module M), mem) = sess.memory in
+    let mem' = M.map_recent mem ~keep:full_output_window (truncate_tool_output max_len) in
+    { sess with memory = Memory.Mem ((module M), mem') }
 
 (** Defensive wire-shape validation: drop [tool] messages whose
     [tool_call_id] is not introduced by a preceding assistant message.
@@ -137,25 +165,19 @@ let drop_orphan_tool_results msgs =
   in
   List.rev rev
 
+(* Truncation deliberately does NOT happen here any more: rendering a
+   message differently depending on its distance from the end changed
+   its bytes between turns and defeated prompt caching (audit H3).
+   [stabilize] now truncates in memory, exactly once per message. *)
 let history_for_llm sess =
   let Memory.Mem ((module M), mem) = sess.memory in
   let hist = drop_orphan_tool_results (M.get mem) in
-  let compact_hist =
-    match sess.cfg.max_tool_output_len with
-    | None -> hist
-    | Some max_len ->
-      let hist_len = List.length hist in
-      List.mapi (fun idx msg ->
-        if idx < hist_len - 2 then truncate_tool_output max_len msg
-        else msg
-      ) hist
-  in
   match sess.cfg.system with
-  | None     -> compact_hist
+  | None     -> hist
   | Some sys ->
     let sm = system_msg sys in
-    (match compact_hist with
-     | { role = System; _ } :: _ -> compact_hist
+    (match hist with
+     | { role = System; _ } :: _ -> hist
      | rest -> sm :: rest)
 
 (** Retry aggression for provider calls, from the [provider_retry]
@@ -344,6 +366,7 @@ let emit_assistant_reply (reply : chat_message) =
   Trace.emit (Trace.Assistant_reply { content = reply.content; tool_call_names })
 
 let rec run_conversations ?max_turns ?on_turn ?on_step net clock sess =
+  let sess = stabilize sess in
   let verb = sess.spinner_cfg.get_verb "thinking" in
   let enabled = sess.spinner_cfg.enabled in
   let result = Ui.with_spinner clock verb enabled (fun () ->
@@ -366,6 +389,7 @@ let turn net clock sess user_input =
   run_conversations net clock sess'
 
 let rec run_conversations_stream ?max_turns ?on_turn ?on_step net clock sess ~on_token =
+  let sess = stabilize sess in
   let verb = sess.spinner_cfg.get_verb "thinking" in
   let enabled = sess.spinner_cfg.enabled in
   let result_with_meta =

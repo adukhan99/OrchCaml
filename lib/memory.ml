@@ -15,6 +15,7 @@ module type MEMORY = sig
   val clear    : t -> t
   val length   : t -> int
   val set_window : t -> int -> t
+  val map_recent : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json  : t -> Yojson.Safe.t
   val of_json  : Yojson.Safe.t -> t
 end
@@ -30,6 +31,7 @@ module Ring : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
 end = struct
@@ -102,6 +104,16 @@ end = struct
   let get mem =
     mem.system_msgs @ mem.front @ List.rev mem.rear
 
+  (* Apply [f] to every non-system message except the newest [keep].
+     Exists so Session can truncate tool outputs exactly once, when a
+     message ages out of the recent window — after which its serialised
+     bytes never change again (the prompt-cache prefix precondition). *)
+  let map_recent mem ~keep f =
+    let msgs = mem.front @ List.rev mem.rear in
+    let n = List.length msgs in
+    let mapped = List.mapi (fun i m -> if i < n - keep then f m else m) msgs in
+    { mem with front = mapped; rear = [] }
+
   let clear mem =
     { mem with system_msgs = []; front = []; rear = []; len = 0 }
 
@@ -124,6 +136,7 @@ module Noop : MEMORY = struct
   let clear        ()      = ()
   let length       ()      = 0
   let set_window   () _    = ()
+  let map_recent   () ~keep:_ _ = ()
   let to_json      ()      = `List []
   let of_json      _       = ()
 end
@@ -136,6 +149,7 @@ module Summary : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
   val compress    : complete:(chat_message list -> string) -> t -> t
@@ -159,6 +173,9 @@ end = struct
 
   let set_window mem w =
     { mem with buf = Ring.set_window mem.buf w; max_messages = w }
+
+  let map_recent mem ~keep f =
+    { mem with buf = Ring.map_recent mem.buf ~keep f }
 
   let compress ~complete mem =
     let msgs    = Ring.get mem.buf in
@@ -195,6 +212,7 @@ module Hierarchical : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
 end = struct
@@ -243,6 +261,9 @@ end = struct
   let set_window mem w =
     { mem with short_term = Ring.set_window mem.short_term w; max_short = w }
 
+  let map_recent mem ~keep f =
+    { mem with short_term = Ring.map_recent mem.short_term ~keep f }
+
   let to_json mem =
     `Assoc [
       ("short_term",  Ring.to_json mem.short_term);
@@ -272,6 +293,7 @@ module SummaryMemory : MEMORY with type t = Summary.t = struct
   let clear = Summary.clear
   let length = Summary.length
   let set_window = Summary.set_window
+  let map_recent = Summary.map_recent
   let to_json = Summary.to_json
   let of_json = Summary.of_json
 end

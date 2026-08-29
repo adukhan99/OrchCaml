@@ -388,6 +388,7 @@ let%test_unit "usage_parsing" =
       completion_tokens = u |> member "completion_tokens" |> to_int;
       total_tokens      = u |> member "total_tokens"      |> to_int;
       total_duration    = None;
+      cached_tokens     = None;
     } in
     let meta = Types.(wrap_result ~raw_response:"" ~model ~provider ~usage (assistant_msg "Hi")) in
     match meta.Types.usage with
@@ -405,7 +406,7 @@ let%test_unit "usage_parsing" =
 let%expect_test "monitor_format_usage" =
   let usage = Types.{
     prompt_tokens = 5; completion_tokens = 20; total_tokens = 25;
-    total_duration = Some 2.0;
+    total_duration = Some 2.0; cached_tokens = None;
   } in
   let meta = Types.(wrap_result ~raw_response:"" ~model:"llama3" ~provider:"ollama" ~usage
     (assistant_msg "ok")) in
@@ -636,7 +637,10 @@ let%test_unit "session_with_model_override" =
   )
 
 let%test_unit "tool_output_truncation_for_context" =
-  Eio_main.run (fun _env ->
+  (* Truncation now happens in memory (stabilize), on the provider-call
+     path, so aged outputs shrink once and stay byte-identical after —
+     not per-request with a moving boundary. *)
+  Eio_main.run (fun env ->
     let provider = make_mock_provider "ok" in
     let sess = make_session "dummy" provider in
     let sess = Session.set_max_tool_output_len sess (Some 50) in
@@ -652,11 +656,11 @@ let%test_unit "tool_output_truncation_for_context" =
       Types.tool_msg "call_2" "short";
     ] in
     let sess = Session.add_messages sess messages in
-    let llm_hist = Session.history_for_llm sess in
-    (* Long tool message at index 2 (older than 2 most recent messages) should be truncated *)
+    let (sess', _) = Session.turn env#net env#clock sess "carry on" in
+    (* Long tool message aged past the recent window: truncated in memory. *)
     let old_tool_msg = List.find (fun (m : Types.chat_message) ->
       match m.role with Types.Tool "call_1" -> true | _ -> false
-    ) llm_hist in
+    ) (Session.history sess') in
     assert (String.length old_tool_msg.content < 200);
     assert (String.contains old_tool_msg.content 'A');
     let has_omitted = Re.execp (Re.compile (Re.str "bytes omitted")) old_tool_msg.content in
@@ -2152,3 +2156,67 @@ let%test_unit "history_for_llm_filters_orphans_from_restored_checkpoints" =
     m.Types.role = Types.Tool "live") wire);
   assert (not (List.exists (fun (m : Types.chat_message) ->
     m.Types.role = Types.Tool "long_gone_call") wire))
+
+(* ── H3: byte-stable request prefixes ─────────────────────────────────── *)
+
+(* Two consecutive requests must serialise the shared (older) portion of
+   history byte-identically — prompt caching is strict prefix matching,
+   and any drift in an old message invalidates everything after it. *)
+let%test_unit "request_prefix_is_byte_stable_across_turns" =
+  Eio_main.run (fun env ->
+    let requests = ref [] in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "recorder"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ msgs =
+        requests := Yojson.Safe.to_string (Types.messages_to_wire_json msgs) :: !requests;
+        Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"recorder"
+          (Types.assistant_msg "noted")
+      let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+        complete net cfg ?model ?options ?tools msgs
+      let list_models _ _ = []
+    end in
+    let provider = Provider.Provider ((module P), ()) in
+    let tc = Types.{ id = "t1"; name = "bash"; args = "{}"; extra_content = None } in
+    let sess =
+      make_session "m" provider
+      |> (fun s -> Session.set_max_tool_output_len s (Some 40))
+      |> (fun s -> Session.add_messages s [
+          Types.user_msg "start";
+          Types.assistant_tool_msg ~tool_calls:[tc] "";
+          Types.tool_msg "t1" (String.make 300 'B');
+        ])
+    in
+    let (sess, _) = Session.turn env#net env#clock sess "first follow-up" in
+    let (sess, _) = Session.turn env#net env#clock sess "second follow-up" in
+    let (_sess, _) = Session.turn env#net env#clock sess "third follow-up" in
+    (* A message may change exactly once — when it ages past the
+       full-output window (2 messages) and is truncated in place.  So
+       the unchanged portion of request N — everything except its
+       newest 2 messages — must reappear byte-identically at the head
+       of request N+1.  (The old per-request truncation failed this:
+       the moving boundary re-shaped old messages every single turn.) *)
+    let elements r =
+      match Yojson.Safe.from_string r with
+      | `List l -> List.map Yojson.Safe.to_string l
+      | _ -> failwith "wire json must be a list"
+    in
+    let check_stable_portion ra rb =
+      let ea = elements ra and eb = elements rb in
+      let stable = List.length ea - 2 in
+      List.iteri (fun i a ->
+        if i < stable then assert (a = List.nth eb i)
+      ) ea
+    in
+    match List.rev !requests with
+    | [r1; r2; r3] ->
+      check_stable_portion r1 r2;
+      check_stable_portion r2 r3;
+      (* And the truncated tool output itself never drifts again: it
+         serialises identically in every request after its truncation. *)
+      let tool_elt r =
+        List.find (fun e -> Re.execp (Re.compile (Re.str "bytes omitted")) e)
+          (elements r)
+      in
+      assert (tool_elt r2 = tool_elt r3)
+    | rs -> failwith (Printf.sprintf "expected 3 requests, got %d" (List.length rs)))

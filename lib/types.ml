@@ -230,6 +230,11 @@ type usage = {
   completion_tokens : int;
   total_tokens      : int;
   total_duration    : float option;
+  (** Prompt tokens served from the provider's cache, when reported
+      ([usage.prompt_tokens_details.cached_tokens] on OpenAI-shaped
+      APIs, [prompt_cache_hit_tokens] on DeepSeek).  This is how you
+      verify byte-stable prefixes are actually paying off. *)
+  cached_tokens     : int option; [@yojson.option]
 } [@@deriving yojson]
 
 type 'a result_with_meta = {
