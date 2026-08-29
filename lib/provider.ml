@@ -74,6 +74,24 @@ module Retry = struct
   let delay_seconds ~base_delay attempt =
     Float.min 30.0 (base_delay *. (2.0 ** float_of_int (attempt - 1)))
 
+  (* Ceiling on honouring a server-provided wait: long enough for real
+     free-tier windows (commonly tens of seconds), short enough that a
+     pathological header cannot stall the harness for minutes. *)
+  let max_server_delay = 120.0
+
+  (** Seconds to wait before the retry that follows [exn].  A typed
+      [Retry-After]/[x-ratelimit-reset-*] hint from the server wins over
+      exponential backoff — a free tier telling us "come back in 30s"
+      makes 0.5s/1s/2s backoff a guaranteed failure — clamped to
+      [max_server_delay] and floored at the backoff so a zero header
+      cannot busy-loop. *)
+  let delay_for ~base_delay ~attempt exn =
+    let backoff = delay_seconds ~base_delay attempt in
+    match exn with
+    | Caravan_error.Provider_failure { retry_after = Some ra; _ } ->
+      Float.max backoff (Float.min ra max_server_delay)
+    | _ -> backoff
+
   let of_string = function
     | "off" | "none" -> Some Off
     | "low" -> Some Low
@@ -103,7 +121,7 @@ module Retry = struct
          | _ when attempt < max_attempts && retriable exn ->
            on_retry attempt;
            (match clock with
-            | Some c -> Eio.Time.sleep c (delay_seconds ~base_delay attempt)
+            | Some c -> Eio.Time.sleep c (delay_for ~base_delay ~attempt exn)
             | None -> ());
            loop (attempt + 1)
          | _ -> raise exn)

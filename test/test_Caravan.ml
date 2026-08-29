@@ -1569,7 +1569,7 @@ let%test_unit "parse_provider_error_openrouter_and_openai" =
      assert (detail.message = "Provider returned error");
      assert (detail.raw = Some "ERROR");
      assert (detail.user_id = Some "user_123");
-     let exn = Caravan_error.Provider_failure { provider = "openai"; status = 400; body = openrouter_body; detail = Some detail } in
+     let exn = Caravan_error.Provider_failure { provider = "openai"; status = 400; body = openrouter_body; detail = Some detail; retry_after = None } in
      let h = Caravan_error.humanize exn in
      assert (Re.execp (Re.compile (Re.str "Stealth")) h);
      assert (Re.execp (Re.compile (Re.str "Provider returned error")) h)
@@ -1659,7 +1659,7 @@ let%test_unit "provider_retry_mode_parsing" =
 let%test_unit "provider_retry_classification" =
   let mk_failure status =
     Caravan_error.Provider_failure
-      { provider = "p"; status; body = ""; detail = None }
+      { provider = "p"; status; body = ""; detail = None; retry_after = None }
   in
   let check ~(label : string) ~mode ~status ~expected =
     assert (Provider.Retry.classify ~mode (mk_failure status) = expected)
@@ -1723,7 +1723,7 @@ let%test_unit "provider_retry_behavior" =
         incr attempts;
         if !attempts <= !fail_until then
           Caravan_error.raise_provider_failure ~provider:"flaky" ~status:!fail_status
-            ~body:"{\"error\":{\"message\":\"injected\"}}"
+            ~body:"{\"error\":{\"message\":\"injected\"}}" ()
         else
           Types.wrap_result ~raw_response:"ok" ~model:"m" ~provider:"flaky"
             (Types.assistant_msg "recovered")
@@ -1805,7 +1805,7 @@ let%test_unit "provider_retry_token_guard_on_stream" =
       let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token =
         on_token "partial";
         Caravan_error.raise_provider_failure ~provider:"flaky_stream" ~status:500
-          ~body:"{}"
+          ~body:"{}" ()
       let list_models _ _ = []
     end in
     let pstream = Provider.Provider ((module PS), ()) in
@@ -2233,3 +2233,63 @@ let%test_unit "request_prefix_is_byte_stable_across_turns" =
       in
       assert (tool_elt r2 = tool_elt r3)
     | rs -> failwith (Printf.sprintf "expected 3 requests, got %d" (List.length rs)))
+
+(* ── H4: honour Retry-After / rate-limit reset headers ────────────────── *)
+
+let%test_unit "retry_after_duration_parsing" =
+  let check ~s ~expected =
+    match Caravan_error.parse_duration s, expected with
+    | Some got, Some want -> assert (Float.abs (got -. want) < 1e-9)
+    | None, None -> ()
+    | got, want ->
+      failwith (Printf.sprintf "parse_duration %S: got %s, want %s" s
+                  (match got with Some f -> string_of_float f | None -> "None")
+                  (match want with Some f -> string_of_float f | None -> "None"))
+  in
+  (* bare seconds (Retry-After delta form) *)
+  check ~s:"30" ~expected:(Some 30.0);
+  check ~s:"7.66" ~expected:(Some 7.66);
+  check ~s:" 12 " ~expected:(Some 12.0);
+  (* compound rate-limit style (OpenAI/Groq reset headers) *)
+  check ~s:"250ms" ~expected:(Some 0.25);
+  check ~s:"1s" ~expected:(Some 1.0);
+  check ~s:"6m0s" ~expected:(Some 360.0);
+  check ~s:"1h2m3.5s" ~expected:(Some 3723.5);
+  (* garbage must not be misread as a duration *)
+  check ~s:"" ~expected:None;
+  check ~s:"Wed, 21 Oct 2026 07:28:00 GMT" ~expected:None;
+  check ~s:"-5" ~expected:None;
+  check ~s:"soon" ~expected:None
+
+let%test_unit "retry_hint_header_precedence" =
+  let get_of l name = List.assoc_opt (String.lowercase_ascii name) l in
+  (* Retry-After wins *)
+  assert (Caravan_error.retry_hint_of_headers
+            (get_of [("retry-after", "42"); ("x-ratelimit-reset-requests", "1s")])
+          = Some 42.0);
+  (* falls back to the reset family *)
+  assert (Caravan_error.retry_hint_of_headers
+            (get_of [("x-ratelimit-reset-requests", "6m0s")])
+          = Some 360.0);
+  assert (Caravan_error.retry_hint_of_headers (get_of []) = None);
+  (* unparseable Retry-After (HTTP-date) falls through to the family *)
+  assert (Caravan_error.retry_hint_of_headers
+            (get_of [("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT");
+                     ("x-ratelimit-reset-tokens", "2s")])
+          = Some 2.0)
+
+let%test_unit "retry_delay_prefers_server_hint" =
+  let mk retry_after =
+    Caravan_error.Provider_failure
+      { provider = "p"; status = 429; body = ""; detail = None; retry_after }
+  in
+  let d = Provider.Retry.delay_for ~base_delay:0.5 ~attempt:1 in
+  (* server hint wins over the 0.5s backoff *)
+  assert (d (mk (Some 30.0)) = 30.0);
+  (* clamped so a pathological header cannot stall for minutes *)
+  assert (d (mk (Some 100000.0)) = Provider.Retry.max_server_delay);
+  (* floored at the backoff so a zero header cannot busy-loop *)
+  assert (d (mk (Some 0.0)) = 0.5);
+  (* no hint: plain exponential backoff *)
+  assert (d (mk None) = 0.5);
+  assert (Provider.Retry.delay_for ~base_delay:0.5 ~attempt:3 (mk None) = 2.0)

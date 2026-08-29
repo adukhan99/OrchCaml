@@ -34,6 +34,11 @@ exception Provider_failure of {
   status   : int;
   body     : string;
   detail   : provider_error_detail option;
+  retry_after : float option;
+      (** Seconds the server asked us to wait, from typed response
+          headers (Retry-After and the x-ratelimit-reset family). Free tiers
+          commonly return tens of seconds on 429 — exponential backoff
+          alone exhausts its retries long before the window reopens. *)
 }
 
 let get_member field = function
@@ -86,9 +91,60 @@ let parse_provider_error str =
       let user_id = get_string "user_id" json in
       Some { provider_name; code; message; raw; param; user_id }
 
-let raise_provider_failure ~provider ~status ~body =
+(* ── Retry hints from typed response headers ──────────────────────────── *)
+
+(* Parse a rate-limit duration: bare seconds ("30", "7.66"), or the
+   OpenAI/Groq compound style ("250ms", "1s", "6m0s", "1h2m3.5s"). *)
+let parse_duration s =
+  let s = String.trim (String.lowercase_ascii s) in
+  if s = "" then None
+  else
+    match float_of_string_opt s with
+    | Some f when f >= 0.0 -> Some f
+    | Some _ -> None
+    | None ->
+      let re = Re.compile
+          Re.(seq [group (rep1 (alt [digit; char '.']));
+                   group (alt [str "ms"; str "h"; str "m"; str "s"])]) in
+      let ms = Re.all re s in
+      if ms = [] then None
+      else
+        (* Reject strings with leftovers beyond number+unit pairs so we
+           don't misread arbitrary header text as a duration. *)
+        let consumed =
+          List.fold_left (fun acc g -> acc + String.length (Re.Group.get g 0)) 0 ms in
+        if consumed <> String.length s then None
+        else
+          List.fold_left
+            (fun acc g ->
+               match acc, float_of_string_opt (Re.Group.get g 1) with
+               | Some total, Some v ->
+                 let mult = match Re.Group.get g 2 with
+                   | "ms" -> 0.001 | "s" -> 1.0 | "m" -> 60.0 | "h" -> 3600.0
+                   | _ -> 1.0
+                 in
+                 Some (total +. (v *. mult))
+               | _ -> None)
+            (Some 0.0) ms
+
+(** Extract a retry-after hint from response headers via [get] (a
+    case-insensitive header lookup supplied by the transport).  Checks
+    [Retry-After] (delta-seconds form), then the
+    [x-ratelimit-reset-requests] / [x-ratelimit-reset-tokens] family.
+    Reading a typed header is not string-scraping an exception — the
+    value never leaves the provider boundary unstructured. *)
+let retry_hint_of_headers get =
+  let first_some l = List.find_map (fun k -> get k) l in
+  match first_some ["retry-after"; "Retry-After"] with
+  | Some v when parse_duration v <> None -> parse_duration v
+  | _ ->
+    (match first_some ["x-ratelimit-reset-requests"; "x-ratelimit-reset-tokens"] with
+     | Some v -> parse_duration v
+     | None -> None)
+
+let raise_provider_failure ?retry_after ~provider ~status ~body () =
   let detail = parse_provider_error body in
-  raise (Provider_failure { provider; status; body; detail })
+  raise (Provider_failure { provider; status; body; detail; retry_after })
 
 let contains haystack needle =
   try let _ = Re.exec (Re.compile (Re.str needle)) haystack in true
