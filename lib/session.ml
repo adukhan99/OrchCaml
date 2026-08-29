@@ -199,7 +199,13 @@ let summarise ?prompt_fn net clock sess =
       let mem_sum = compress ~complete:(fun _ -> summary_content) mem in
       Memory.Mem ((module Memory.SummaryMemory), mem_sum)
     in
-    let new_sess = { sess with memory = new_mem_t; turn_idx = 0 } in
+    (* [turn_idx] counts turns consumed against the agent budget and is
+       deliberately NOT reset here: compaction is a memory operation, not
+       a new conversation.  Resetting it handed the agent a fresh budget
+       on every compaction, making [max_turns] unenforceable on exactly
+       the runs (confused model, long history) that most need a ceiling.
+       Only [clear] — a genuine new conversation — resets the counter. *)
+    let new_sess = { sess with memory = new_mem_t } in
     (new_sess, summary_content)
 
 (** Why a conversation run ended. Threaded into the returned

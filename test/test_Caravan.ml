@@ -1865,3 +1865,43 @@ let%test_unit "capability_token_estimate" =
   let plain   = Types.assistant_msg "" in
   assert (Capability.estimate_message_tokens with_tc
           > Capability.estimate_message_tokens plain)
+
+(* ── C4: compaction must not reset the turn budget ────────────────────── *)
+
+(* A provider that always asks for a (nonexistent) tool keeps the loop
+   alive; a tiny memory window forces compaction every turn.  Before the
+   fix, each compaction reset [turn_idx] to 0 and the run never hit
+   [max_turns]. *)
+let%test_unit "compaction_does_not_reset_turn_budget" =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let calls = ref 0 in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "looper"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        incr calls;
+        let tc = Types.{ id = Printf.sprintf "c%d" !calls; name = "no_such_tool";
+                         args = "{}"; extra_content = None } in
+        Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"looper"
+          (Types.assistant_tool_msg ~tool_calls:[tc] "")
+      let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+        complete net cfg ?model ?options ?tools msgs
+      let list_models _ _ = []
+    end in
+    let provider = Provider.Provider ((module P), ()) in
+    let sess =
+      make_session "m" provider
+      |> (fun s -> Session.set_memory_size s 3)   (* compact constantly *)
+      |> (fun s -> Session.set_auto_summarize s true)
+    in
+    let sess = Session.add_messages sess [Types.user_msg "loop forever"] in
+    let max_t = 5 in
+    let (final, result) =
+      Session.run_conversations ~max_turns:max_t net clock sess in
+    assert (result.Types.finish_reason = Some "max_turns");
+    assert (Session.turn_idx final >= max_t);
+    (* Each turn costs one work call plus at most one summarise call; the
+       budget must bound total spend even under constant compaction. *)
+    assert (!calls <= 2 * max_t + 1))
