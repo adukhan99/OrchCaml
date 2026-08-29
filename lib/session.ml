@@ -113,9 +113,33 @@ let truncate_tool_output max_len msg =
     { msg with content = Printf.sprintf "%s\n[... %d bytes omitted to preserve context ...]" prefix omitted }
   | _ -> msg
 
+(** Defensive wire-shape validation: drop [tool] messages whose
+    [tool_call_id] is not introduced by a preceding assistant message.
+    Ring eviction is pair-aware, but checkpoint restore ([of_json])
+    reconstructs memory from arbitrary saved JSON, and strict endpoints
+    hard-reject orphaned tool results — cheap insurance here beats a
+    non-retriable 400 mid-run. *)
+let drop_orphan_tool_results msgs =
+  let (rev, _) =
+    List.fold_left
+      (fun (acc, known) msg ->
+         match msg.role with
+         | Tool id ->
+           if List.mem id known then (msg :: acc, known) else (acc, known)
+         | _ ->
+           let known =
+             match msg.tool_calls with
+             | Some tcs -> List.map (fun (tc : tool_call) -> tc.id) tcs @ known
+             | None -> known
+           in
+           (msg :: acc, known))
+      ([], []) msgs
+  in
+  List.rev rev
+
 let history_for_llm sess =
   let Memory.Mem ((module M), mem) = sess.memory in
-  let hist = M.get mem in
+  let hist = drop_orphan_tool_results (M.get mem) in
   let compact_hist =
     match sess.cfg.max_tool_output_len with
     | None -> hist

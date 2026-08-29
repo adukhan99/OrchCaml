@@ -56,11 +56,33 @@ end = struct
     | [] -> { dq with front = List.rev dq.rear; rear = [] }
     | _  -> dq
 
+  let tool_call_ids msg =
+    match msg.tool_calls with
+    | Some tcs when tcs <> [] -> Some (List.map (fun tc -> tc.id) tcs)
+    | _ -> None
+
+  (* Eviction is pair-aware and atomic: an assistant message bearing
+     tool_calls and its result messages form one indivisible unit.
+     Dropping only the assistant half leaves [tool] messages whose
+     tool_call_id no longer appears in the request — a shape OpenAI,
+     Groq, Mistral and DeepSeek all reject with a non-retriable 400,
+     mid-run, after the tokens are already spent. *)
   let drop_oldest dq =
     let dq = rebalance dq in
     match dq.front with
-    | []     -> dq
-    | _ :: t -> rebalance { dq with front = t; len = dq.len - 1 }
+    | []          -> dq
+    | oldest :: t ->
+      let dq = rebalance { dq with front = t; len = dq.len - 1 } in
+      (match tool_call_ids oldest with
+       | None -> dq
+       | Some ids ->
+         let rec drop_results dq =
+           match dq.front with
+           | { role = Tool id; _ } :: t when List.mem id ids ->
+             drop_results (rebalance { dq with front = t; len = dq.len - 1 })
+           | _ -> dq
+         in
+         drop_results dq)
 
   let add mem msg =
     match msg.role with

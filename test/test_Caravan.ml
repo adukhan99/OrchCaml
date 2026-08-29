@@ -641,12 +641,14 @@ let%test_unit "tool_output_truncation_for_context" =
     let sess = make_session "dummy" provider in
     let sess = Session.set_max_tool_output_len sess (Some 50) in
     let long_tool_output = String.make 500 'A' in
+    let tc1 = Types.{ id = "call_1"; name = "bash"; args = "{}"; extra_content = None } in
+    let tc2 = Types.{ id = "call_2"; name = "bash"; args = "{}"; extra_content = None } in
     let messages = [
       Types.user_msg "Run bash tool";
-      Types.assistant_msg "Running bash";
+      Types.assistant_tool_msg ~tool_calls:[tc1] "Running bash";
       Types.tool_msg "call_1" long_tool_output;
       Types.user_msg "What next?";
-      Types.assistant_msg "I will check";
+      Types.assistant_tool_msg ~tool_calls:[tc2] "I will check";
       Types.tool_msg "call_2" "short";
     ] in
     let sess = Session.add_messages sess messages in
@@ -2083,3 +2085,70 @@ let%test_unit "agent_finish_discipline" =
      | Ok (_, result) ->
        assert (result.Types.finish_reason = Some "finish_tool")
      | Error e -> failwith ("late finisher should succeed: " ^ e)))
+
+(* ── C3: window eviction must not orphan tool results ─────────────────── *)
+
+let no_orphans msgs =
+  let ok = ref true in
+  let known = ref [] in
+  List.iter (fun (m : Types.chat_message) ->
+    (match m.Types.tool_calls with
+     | Some tcs -> known := List.map (fun tc -> tc.Types.id) tcs @ !known
+     | None -> ());
+    match m.Types.role with
+    | Types.Tool id -> if not (List.mem id !known) then ok := false
+    | _ -> ()
+  ) msgs;
+  !ok
+
+let%test_unit "ring_eviction_is_pair_aware" =
+  (* Drive a ring past its window with the agentic shape: assistant
+     tool-call messages each followed by two tool results. *)
+  let mk_turn i =
+    let tc1 = Types.{ id = Printf.sprintf "a%d" i; name = "bash"; args = "{}"; extra_content = None } in
+    let tc2 = Types.{ id = Printf.sprintf "b%d" i; name = "bash"; args = "{}"; extra_content = None } in
+    [ Types.assistant_tool_msg ~tool_calls:[tc1; tc2] "";
+      Types.tool_msg (Printf.sprintf "a%d" i) "out a";
+      Types.tool_msg (Printf.sprintf "b%d" i) "out b" ]
+  in
+  let msgs =
+    Types.user_msg "task"
+    :: List.concat_map mk_turn [1; 2; 3; 4; 5; 6; 7; 8]
+  in
+  (* Window sizes chosen so the boundary lands mid-unit in several
+     positions; every resulting history must still be orphan-free. *)
+  List.iter (fun window ->
+    let mem = List.fold_left Memory.Ring.add (Memory.Ring.make ~window ()) msgs in
+    let hist = Memory.Ring.get mem in
+    assert (no_orphans hist);
+    (* the window still bounds the size (units may undershoot, never
+       grossly overshoot) *)
+    assert (Memory.Ring.length mem <= window)
+  ) [4; 5; 6; 7; 10];
+  (* set_window prunes pair-aware too *)
+  let mem = List.fold_left Memory.Ring.add (Memory.Ring.make ~window:0 ()) msgs in
+  let pruned = Memory.Ring.set_window mem 5 in
+  assert (no_orphans (Memory.Ring.get pruned))
+
+let%test_unit "history_for_llm_filters_orphans_from_restored_checkpoints" =
+  (* A checkpoint saved by an older Caravan can contain an orphaned tool
+     result; the wire path must drop it rather than send a 400 shape. *)
+  let provider = make_mock_provider "ok" in
+  let orphan = Types.tool_msg "long_gone_call" "stale output" in
+  let tc = Types.{ id = "live"; name = "bash"; args = "{}"; extra_content = None } in
+  let sess =
+    make_session "m" provider
+    |> (fun s -> Session.add_messages s [
+        orphan;
+        Types.user_msg "hello";
+        Types.assistant_tool_msg ~tool_calls:[tc] "";
+        Types.tool_msg "live" "fresh output";
+      ])
+  in
+  let wire = Session.history_for_llm sess in
+  assert (no_orphans wire);
+  (* the legitimate pair survives *)
+  assert (List.exists (fun (m : Types.chat_message) ->
+    m.Types.role = Types.Tool "live") wire);
+  assert (not (List.exists (fun (m : Types.chat_message) ->
+    m.Types.role = Types.Tool "long_gone_call") wire))
