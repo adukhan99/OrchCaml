@@ -9,6 +9,7 @@
 - [CLI Reference](cli.md)
 - [Configuration](configuration.md)
 - [Providers & Models](providers.md)
+- [Getting Started for Free](free-tier.md)
 - [Agents, Permissions & Transcripts](agents.md)
 - [Subagents](subagents.md)
 - [Slip — the micro-LISP](slip.md)

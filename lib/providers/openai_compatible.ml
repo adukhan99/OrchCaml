@@ -88,6 +88,14 @@ let auth_headers cfg =
 
 let make_client net uri = Caravan.Tls.make_client net uri
 
+(** Retry-after hint from typed response headers — how long the server
+    asked us to wait before the next attempt (free tiers return this on
+    429; see [Provider.Retry]). *)
+let retry_hint resp =
+  let headers = Http.Response.headers resp in
+  Caravan.Caravan_error.retry_hint_of_headers
+    (fun name -> Http.Header.get headers name)
+
 let read_body (body : Cohttp_eio.Body.t) =
   Eio.Buf_read.(of_flow body ~max_size:max_int |> take_all)
 
@@ -104,7 +112,19 @@ let parse_usage json =
       | `Float ns -> Some (ns /. 1e9)
       | _         -> None
     in
-    Some { prompt_tokens; completion_tokens; total_tokens; total_duration }
+    (* Cache-hit accounting: OpenAI-shaped APIs report
+       prompt_tokens_details.cached_tokens; DeepSeek uses
+       prompt_cache_hit_tokens.  Recording it makes the byte-stable
+       prefix work verifiable instead of hopeful. *)
+    let cached_tokens =
+      match u |> member "prompt_tokens_details" |> member "cached_tokens" with
+      | `Int n -> Some n
+      | _ ->
+        (match u |> member "prompt_cache_hit_tokens" with
+         | `Int n -> Some n
+         | _ -> None)
+    in
+    Some { prompt_tokens; completion_tokens; total_tokens; total_duration; cached_tokens }
   | _ -> None
 
 let parse_complete_response body_str provider_name model =
@@ -175,7 +195,9 @@ let complete net cfg ?model ?options ?tools msgs =
     parse_complete_response resp_body cfg.provider_name effective_model
   else begin
     log_structured_error cfg.provider_name status resp_body;
-    Caravan.Caravan_error.raise_provider_failure ~provider:cfg.provider_name ~status ~body:resp_body
+    let retry_after = retry_hint resp in
+    Caravan.Caravan_error.raise_provider_failure ?retry_after
+      ~provider:cfg.provider_name ~status ~body:resp_body ()
   end
 
 let stream net cfg ?model ?options ?tools msgs ~on_token =
@@ -222,7 +244,9 @@ let stream net cfg ?model ?options ?tools msgs ~on_token =
     if status < 200 || status >= 300 then begin
       let err = read_body body in
       log_structured_error cfg.provider_name status err;
-      Caravan.Caravan_error.raise_provider_failure ~provider:cfg.provider_name ~status ~body:err
+      let retry_after = retry_hint resp in
+      Caravan.Caravan_error.raise_provider_failure ?retry_after
+        ~provider:cfg.provider_name ~status ~body:err ()
     end;
     (* HTTP 2xx — the stream is live; disable the fallback from here on. *)
     stream_succeeded := true;
@@ -331,7 +355,7 @@ let stream net cfg ?model ?options ?tools msgs ~on_token =
       if full = "" && tool_calls = None then
         Caravan.Caravan_error.raise_provider_failure
           ~provider:cfg.provider_name ~status:200
-          ~body:"Stream closed without [DONE] and without content"
+          ~body:"Stream closed without [DONE] and without content" ()
       else
         let reply = make_message ?tool_calls ?extra_content:(!extra_content_ref) Assistant full in
         wrap_result ~raw_response:full ~model:effective_model ~provider:cfg.provider_name

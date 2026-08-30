@@ -65,9 +65,10 @@ let entries : entry list = [
   { name = "anthropic"; aliases = ["claude"]; kind = Cloud;
     base_url = "https://api.anthropic.com/v1";
     key_env = Some "ANTHROPIC_API_KEY"; requires_key = true;
-    default_model = "claude-sonnet-4-5";
-    model_hints = ["claude-haiku-4-5"; "claude-sonnet-4-5"; "claude-opus-4-5"];
-    notes = "Anthropic Claude via its OpenAI-compatible endpoint." };
+    default_model = "claude-sonnet-5";
+    model_hints = ["claude-haiku-4-5"; "claude-sonnet-5"; "claude-opus-5"];
+    notes = "Anthropic Claude via its OpenAI-compatible endpoint. \
+             Hardcoded ladders drift: `caravan models` is authoritative." };
 
   { name = "groq"; aliases = []; kind = Cloud;
     base_url = "https://api.groq.com/openai/v1";
@@ -80,8 +81,31 @@ let entries : entry list = [
     base_url = "https://openrouter.ai/api/v1";
     key_env = Some "OPENROUTER_API_KEY"; requires_key = true;
     default_model = "meta-llama/llama-3.3-70b-instruct";
-    model_hints = ["(hundreds — see openrouter.ai/models)"];
-    notes = "OpenRouter — one key, most models." };
+    model_hints = ["(hundreds — see openrouter.ai/models)";
+                   "(append :free for zero-cost variants)"];
+    notes = "OpenRouter — one key, most models. Models with a :free \
+             suffix cost nothing (rate-limited)." };
+
+  { name = "cerebras"; aliases = []; kind = Cloud;
+    base_url = "https://api.cerebras.ai/v1";
+    key_env = Some "CEREBRAS_API_KEY"; requires_key = true;
+    default_model = "llama-3.3-70b";
+    model_hints = ["llama3.1-8b"; "llama-3.3-70b"];
+    notes = "Cerebras — very fast inference, generous free tier." };
+
+  { name = "github_models"; aliases = ["github"; "gh"]; kind = Cloud;
+    base_url = "https://models.github.ai/inference";
+    key_env = Some "GITHUB_TOKEN"; requires_key = true;
+    default_model = "openai/gpt-4o-mini";
+    model_hints = ["openai/gpt-4o-mini"; "meta/llama-3.3-70b-instruct"];
+    notes = "GitHub Models — free with any GitHub token (rate-limited)." };
+
+  { name = "nvidia"; aliases = ["nim"]; kind = Cloud;
+    base_url = "https://integrate.api.nvidia.com/v1";
+    key_env = Some "NVIDIA_API_KEY"; requires_key = true;
+    default_model = "meta/llama-3.3-70b-instruct";
+    model_hints = ["meta/llama-3.1-8b-instruct"; "meta/llama-3.3-70b-instruct"];
+    notes = "NVIDIA NIM — free API credits for development use." };
 
   { name = "together"; aliases = []; kind = Cloud;
     base_url = "https://api.together.xyz/v1";
@@ -140,7 +164,7 @@ let model_ladder = [
   ("small ~4B",    "ollama",    "qwen3:4b",                "fast local reasoning");
   ("medium ~20B",  "ollama",    "gpt-oss:20b",             "strong local, needs ~16GB");
   ("large ~70B",   "groq",      "llama-3.3-70b-versatile", "open weights, hosted fast");
-  ("frontier",     "anthropic", "claude-sonnet-4-5",       "top-tier agentic coding");
+  ("frontier",     "anthropic", "claude-sonnet-5",         "top-tier agentic coding");
   ("frontier",     "openai",    "gpt-4o",                  "general frontier");
   ("frontier",     "gemini",    "gemini-2.5-pro",          "long-context frontier");
 ]

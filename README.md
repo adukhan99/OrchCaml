@@ -31,9 +31,14 @@ Built on OCaml 5 algebraic effects and Eio. *"Correct, efficient, beautiful."*
   summarization is a structured event ([`Caravan.Trace`](lib/trace.ml));
   each session writes an auditable JSONL transcript to `~/.caravan/logs/`.
   No more "what did the agent actually do?"
-- **13 providers, one interface** — from a 1B llama on your laptop through
+- **16 providers, one interface** — from a 1B llama on your laptop through
   Groq-hosted 70Bs to Claude, GPT-4o, and Gemini, all behind one config
   file and one registry (`caravan providers`).
+- **Free-tier ready** — capability-aware defaults for small and free
+  models: text tool-call recovery, token-aware compaction, Retry-After
+  handling, cache-stable prompts, and a
+  [zero-cost getting-started path](docs/src/free-tier.md) (GitHub Models,
+  OpenRouter `:free`, Cerebras, NVIDIA NIM, local Ollama).
 - **Real tool permissions** — `auto`, `ask`, or `readonly`: prompt before
   mutating tools or deny them outright for audit-safe agent runs.
 - **Scripting-native autonomy** — `caravan agent "task" --json` emits one

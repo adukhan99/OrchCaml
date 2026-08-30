@@ -388,6 +388,7 @@ let%test_unit "usage_parsing" =
       completion_tokens = u |> member "completion_tokens" |> to_int;
       total_tokens      = u |> member "total_tokens"      |> to_int;
       total_duration    = None;
+      cached_tokens     = None;
     } in
     let meta = Types.(wrap_result ~raw_response:"" ~model ~provider ~usage (assistant_msg "Hi")) in
     match meta.Types.usage with
@@ -405,7 +406,7 @@ let%test_unit "usage_parsing" =
 let%expect_test "monitor_format_usage" =
   let usage = Types.{
     prompt_tokens = 5; completion_tokens = 20; total_tokens = 25;
-    total_duration = Some 2.0;
+    total_duration = Some 2.0; cached_tokens = None;
   } in
   let meta = Types.(wrap_result ~raw_response:"" ~model:"llama3" ~provider:"ollama" ~usage
     (assistant_msg "ok")) in
@@ -511,7 +512,7 @@ let%expect_test "session_summarise" =
   );
   [%expect {|
     This is a summary.
-    History length: 1
+    History length: 2
     Role: System
     Content: [Conversation summary]: This is a summary.
     |}]
@@ -636,25 +637,30 @@ let%test_unit "session_with_model_override" =
   )
 
 let%test_unit "tool_output_truncation_for_context" =
-  Eio_main.run (fun _env ->
+  (* Truncation now happens in memory (stabilize), on the provider-call
+     path, so aged outputs shrink once and stay byte-identical after —
+     not per-request with a moving boundary. *)
+  Eio_main.run (fun env ->
     let provider = make_mock_provider "ok" in
     let sess = make_session "dummy" provider in
     let sess = Session.set_max_tool_output_len sess (Some 50) in
     let long_tool_output = String.make 500 'A' in
+    let tc1 = Types.{ id = "call_1"; name = "bash"; args = "{}"; extra_content = None } in
+    let tc2 = Types.{ id = "call_2"; name = "bash"; args = "{}"; extra_content = None } in
     let messages = [
       Types.user_msg "Run bash tool";
-      Types.assistant_msg "Running bash";
+      Types.assistant_tool_msg ~tool_calls:[tc1] "Running bash";
       Types.tool_msg "call_1" long_tool_output;
       Types.user_msg "What next?";
-      Types.assistant_msg "I will check";
+      Types.assistant_tool_msg ~tool_calls:[tc2] "I will check";
       Types.tool_msg "call_2" "short";
     ] in
     let sess = Session.add_messages sess messages in
-    let llm_hist = Session.history_for_llm sess in
-    (* Long tool message at index 2 (older than 2 most recent messages) should be truncated *)
+    let (sess', _) = Session.turn env#net env#clock sess "carry on" in
+    (* Long tool message aged past the recent window: truncated in memory. *)
     let old_tool_msg = List.find (fun (m : Types.chat_message) ->
       match m.role with Types.Tool "call_1" -> true | _ -> false
-    ) llm_hist in
+    ) (Session.history sess') in
     assert (String.length old_tool_msg.content < 200);
     assert (String.contains old_tool_msg.content 'A');
     let has_omitted = Re.execp (Re.compile (Re.str "bytes omitted")) old_tool_msg.content in
@@ -723,7 +729,7 @@ let%test_unit "agent_turn_increment_and_max_turns" =
                |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
     
     let on_turn current max = turn_calls := (current, max) :: !turn_calls in
-    let agent_cfg = Agent.{ max_turns = 5; continue_prompt = "continue"; nudge = false } in
+    let agent_cfg = Agent.{ max_turns = 5; continue_prompt = "continue"; nudge = false; require_finish = true; max_plain_replies = 3 } in
     let res = Agent.run ~config:agent_cfg ~on_turn env#net env#clock sess "Execute multi-turn task" in
     (match res with
      | Ok (final_sess, _meta) ->
@@ -736,7 +742,7 @@ let%test_unit "agent_turn_increment_and_max_turns" =
     turn_calls := [];
     let sess2 = Session.create ~tools:[finish_tool; read_tool] "multi" provider
                 |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
-    let agent_cfg_low = Agent.{ max_turns = 2; continue_prompt = "continue"; nudge = false } in
+    let agent_cfg_low = Agent.{ max_turns = 2; continue_prompt = "continue"; nudge = false; require_finish = true; max_plain_replies = 3 } in
     let res_low = Agent.run ~config:agent_cfg_low ~on_turn env#net env#clock sess2 "Task max turns test" in
     (match res_low with
      | Error "Maximum turns reached without completion." -> ()
@@ -747,7 +753,7 @@ let%test_unit "agent_turn_increment_and_max_turns" =
     turn_calls := [];
     let sess3 = Session.create ~tools:[finish_tool; read_tool] "multi" provider
                 |> Session.with_spinner_config { enabled = false; get_verb = fun _ -> "mock" } in
-    let agent_cfg_inf = Agent.{ max_turns = 0; continue_prompt = "continue"; nudge = false } in
+    let agent_cfg_inf = Agent.{ max_turns = 0; continue_prompt = "continue"; nudge = false; require_finish = true; max_plain_replies = 3 } in
     let res_inf = Agent.run ~config:agent_cfg_inf ~on_turn env#net env#clock sess3 "Task infinite max turns test" in
     (match res_inf with
      | Ok (final_sess, _meta) ->
@@ -823,7 +829,7 @@ let%test_unit "registry_lookup_and_errors" =
   let open CaravanProviders.Registry in
   (match find "anthropic" with
    | Some e ->
-     assert (e.default_model = "claude-sonnet-4-5");
+     assert (e.default_model = "claude-sonnet-5");
      assert (e.key_env = Some "ANTHROPIC_API_KEY")
    | None -> failwith "anthropic missing from registry");
   (* Aliases resolve. *)
@@ -850,7 +856,7 @@ let%test_unit "registry_lookup_and_errors" =
   ) entries
 
 let%test_unit "agent_nudge_injection" =
-  let cfg = Agent.{ max_turns = 10; continue_prompt = "continue"; nudge = true } in
+  let cfg = Agent.{ max_turns = 10; continue_prompt = "continue"; nudge = true; require_finish = true; max_plain_replies = 3 } in
   (* Halfway through the budget the nudge fires... *)
   let p_half = Agent.continue_prompt_for cfg ~task:"solve it" ~used:5 in
   assert (Re.execp (Re.compile (Re.str "Caravan nudge")) p_half);
@@ -1261,22 +1267,35 @@ let%test_unit "cli_resolve" =
 (* ── Compaction_policy tests ─────────────────────────────────────────── *)
 
 let%test_unit "compaction_policy_edge_cases" =
-  let check ~auto ~mem_size ~len ~tools =
+  let check ?ctx ?(tokens = 0) ~auto ~mem_size ~len ~tools () =
     Compaction_policy.should_compact
+      ?context_window:ctx
       ~auto_summarize:auto ~memory_size:mem_size ~history_length:len
-      ~tool_call_names:tools
+      ~history_tokens:tokens ~tool_call_names:tools ()
   in
   (* overflow triggers compaction *)
-  assert (check ~auto:true ~mem_size:10 ~len:15 ~tools:[] = true);
+  assert (check ~auto:true ~mem_size:10 ~len:15 ~tools:[] () = true);
   (* size 0 means unlimited *)
-  assert (check ~auto:true ~mem_size:0 ~len:1000 ~tools:[] = false);
+  assert (check ~auto:true ~mem_size:0 ~len:1000 ~tools:[] () = false);
   (* disabled means no auto compaction *)
-  assert (check ~auto:false ~mem_size:5 ~len:10 ~tools:[] = false);
+  assert (check ~auto:false ~mem_size:5 ~len:10 ~tools:[] () = false);
   (* no overflow, no compaction *)
-  assert (check ~auto:true ~mem_size:10 ~len:9 ~tools:[] = false);
+  assert (check ~auto:true ~mem_size:10 ~len:9 ~tools:[] () = false);
   (* explicit tool triggers compaction even if auto=false or memory_size=0 *)
-  assert (check ~auto:false ~mem_size:0 ~len:0 ~tools:["summarize"] = true);
-  assert (check ~auto:true ~mem_size:10 ~len:5 ~tools:["compress_history"] = true)
+  assert (check ~auto:false ~mem_size:0 ~len:0 ~tools:["summarize"] () = true);
+  assert (check ~auto:true ~mem_size:10 ~len:5 ~tools:["compress_history"] () = true);
+  (* — token-aware trigger (H2) — *)
+  (* over 75% of the window: compact even with few messages *)
+  assert (check ~ctx:8192 ~tokens:7000 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = true);
+  (* same token count in a large window: no compaction *)
+  assert (check ~ctx:128000 ~tokens:7000 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = false);
+  (* exactly at the boundary is not over it *)
+  assert (check ~ctx:1000 ~tokens:750 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = false);
+  assert (check ~ctx:1000 ~tokens:751 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = true);
+  (* token trigger respects auto_summarize *)
+  assert (check ~ctx:1000 ~tokens:900 ~auto:false ~mem_size:40 ~len:6 ~tools:[] () = false);
+  (* unknown window: token count alone never triggers *)
+  assert (check ~tokens:1_000_000 ~auto:true ~mem_size:40 ~len:6 ~tools:[] () = false)
 
 (* ── Agent_output tests ──────────────────────────────────────────────── *)
 
@@ -1550,7 +1569,7 @@ let%test_unit "parse_provider_error_openrouter_and_openai" =
      assert (detail.message = "Provider returned error");
      assert (detail.raw = Some "ERROR");
      assert (detail.user_id = Some "user_123");
-     let exn = Caravan_error.Provider_failure { provider = "openai"; status = 400; body = openrouter_body; detail = Some detail } in
+     let exn = Caravan_error.Provider_failure { provider = "openai"; status = 400; body = openrouter_body; detail = Some detail; retry_after = None } in
      let h = Caravan_error.humanize exn in
      assert (Re.execp (Re.compile (Re.str "Stealth")) h);
      assert (Re.execp (Re.compile (Re.str "Provider returned error")) h)
@@ -1640,7 +1659,7 @@ let%test_unit "provider_retry_mode_parsing" =
 let%test_unit "provider_retry_classification" =
   let mk_failure status =
     Caravan_error.Provider_failure
-      { provider = "p"; status; body = ""; detail = None }
+      { provider = "p"; status; body = ""; detail = None; retry_after = None }
   in
   let check ~(label : string) ~mode ~status ~expected =
     assert (Provider.Retry.classify ~mode (mk_failure status) = expected)
@@ -1704,7 +1723,7 @@ let%test_unit "provider_retry_behavior" =
         incr attempts;
         if !attempts <= !fail_until then
           Caravan_error.raise_provider_failure ~provider:"flaky" ~status:!fail_status
-            ~body:"{\"error\":{\"message\":\"injected\"}}"
+            ~body:"{\"error\":{\"message\":\"injected\"}}" ()
         else
           Types.wrap_result ~raw_response:"ok" ~model:"m" ~provider:"flaky"
             (Types.assistant_msg "recovered")
@@ -1786,7 +1805,7 @@ let%test_unit "provider_retry_token_guard_on_stream" =
       let stream _net _cfg ?model:_ ?options:_ ?tools:_ _msgs ~on_token =
         on_token "partial";
         Caravan_error.raise_provider_failure ~provider:"flaky_stream" ~status:500
-          ~body:"{}"
+          ~body:"{}" ()
       let list_models _ _ = []
     end in
     let pstream = Provider.Provider ((module PS), ()) in
@@ -1802,3 +1821,608 @@ let%test_unit "provider_retry_token_guard_on_stream" =
     assert raised;
     assert (!got = "partial"))
 
+
+(* ── Capability table (Tier 0 of the low-cost-model refactor) ─────────── *)
+
+let%test_unit "capability_lookup_table_driven" =
+  let check ~model ~ctx ~fidelity =
+    let cap = Capability.lookup model in
+    assert (cap.Capability.context_window = ctx);
+    assert (cap.Capability.tool_calling = fidelity)
+  in
+  (* frontier cloud *)
+  check ~model:"claude-sonnet-5"   ~ctx:1_000_000 ~fidelity:Capability.Native;
+  check ~model:"claude-haiku-4-5"  ~ctx:200_000   ~fidelity:Capability.Native;
+  check ~model:"gpt-4o-mini"       ~ctx:128_000   ~fidelity:Capability.Native;
+  check ~model:"deepseek-chat"     ~ctx:128_000   ~fidelity:Capability.Native;
+  (* small local — the population the fallback parser exists for *)
+  check ~model:"llama3.2:1b"       ~ctx:8_192     ~fidelity:Capability.Flaky;
+  check ~model:"qwen3:4b"          ~ctx:32_768    ~fidelity:Capability.Flaky;
+  (* unknown models get the conservative default *)
+  check ~model:"totally-unknown-model-7b"
+    ~ctx:Capability.conservative.Capability.context_window
+    ~fidelity:Capability.conservative.Capability.tool_calling;
+  (* specific patterns beat family catch-alls *)
+  let hk = Capability.lookup "claude-haiku-4-5" in
+  let cl = Capability.lookup "claude-opus-5" in
+  assert (hk.Capability.context_window < cl.Capability.context_window);
+  (* deepseek advertises automatic prefix caching *)
+  assert ((Capability.lookup "deepseek-chat").Capability.cache = Capability.Cache_automatic)
+
+let%test_unit "capability_config_override" =
+  with_tmp_config ~name:"test_capability_override"
+    ~toml_content:{|
+[capabilities."my-lab-model"]
+context_window = 65536
+tool_calling = "text"
+cache = "automatic"
+requests_per_minute = 20
+|}
+    (fun _ ->
+      let cap = Capability.lookup "My-Lab-Model-v2" in
+      assert (cap.Capability.context_window = 65536);
+      assert (cap.Capability.tool_calling = Capability.Text_only);
+      assert (cap.Capability.cache = Capability.Cache_automatic);
+      assert (cap.Capability.requests_per_minute = Some 20);
+      (* untouched fields keep their base value *)
+      assert (cap.Capability.streaming_tool_calls
+              = Capability.conservative.Capability.streaming_tool_calls);
+      (* overrides patch on top of a built-in base too *)
+      let unrelated = Capability.lookup "claude-sonnet-5" in
+      assert (unrelated.Capability.context_window = 1_000_000))
+
+let%test_unit "capability_token_estimate" =
+  let check ~s ~expected = assert (Capability.estimate_tokens s = expected) in
+  check ~s:"" ~expected:0;
+  check ~s:"abcd" ~expected:1;
+  check ~s:"abcde" ~expected:2;
+  check ~s:(String.make 4000 'x') ~expected:1000;
+  (* message estimate covers tool-call args, not just content *)
+  let tc = Types.{ id = "c1"; name = "bash";
+                   args = {|{"command":"ls -la"}|}; extra_content = None } in
+  let with_tc = Types.assistant_tool_msg ~tool_calls:[tc] "" in
+  let plain   = Types.assistant_msg "" in
+  assert (Capability.estimate_message_tokens with_tc
+          > Capability.estimate_message_tokens plain)
+
+(* ── C4: compaction must not reset the turn budget ────────────────────── *)
+
+(* A provider that always asks for a (nonexistent) tool keeps the loop
+   alive; a tiny memory window forces compaction every turn.  Before the
+   fix, each compaction reset [turn_idx] to 0 and the run never hit
+   [max_turns]. *)
+let%test_unit "compaction_does_not_reset_turn_budget" =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let calls = ref 0 in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "looper"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        incr calls;
+        let tc = Types.{ id = Printf.sprintf "c%d" !calls; name = "no_such_tool";
+                         args = "{}"; extra_content = None } in
+        Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"looper"
+          (Types.assistant_tool_msg ~tool_calls:[tc] "")
+      let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+        complete net cfg ?model ?options ?tools msgs
+      let list_models _ _ = []
+    end in
+    let provider = Provider.Provider ((module P), ()) in
+    let sess =
+      make_session "m" provider
+      |> (fun s -> Session.set_memory_size s 3)   (* compact constantly *)
+      |> (fun s -> Session.set_auto_summarize s true)
+    in
+    let sess = Session.add_messages sess [Types.user_msg "loop forever"] in
+    let max_t = 5 in
+    let (final, result) =
+      Session.run_conversations ~max_turns:max_t net clock sess in
+    assert (result.Types.finish_reason = Some "max_turns");
+    assert (Session.turn_idx final >= max_t);
+    (* Each turn costs one work call plus at most one summarise call; the
+       budget must bound total spend even under constant compaction. *)
+    assert (!calls <= 2 * max_t + 1))
+
+(* ── C1: default system prompt + environment preamble ─────────────────── *)
+
+let%test_unit "system_prompt_compose_layers" =
+  (* Default composition carries the harness contract and environment. *)
+  (match System_prompt.compose () with
+   | None -> failwith "compose () must produce a prompt"
+   | Some p ->
+     let has needle =
+       let re = Re.compile (Re.str needle) in
+       Re.execp re p
+     in
+     assert (has "finish");
+     assert (has "Working directory:");
+     assert (has "Date:");
+     (* conservative capability => the text tool-call format layer is in *)
+     assert (has "\"tool\""));
+  (* Native-tool models skip the format layer. *)
+  let native = Capability.lookup "claude-sonnet-5" in
+  assert (System_prompt.tool_format_layer native = None);
+  (match System_prompt.compose ~capability:native () with
+   | Some p ->
+     let re = Re.compile (Re.str "EXACTLY one JSON object") in
+     assert (not (Re.execp re p))
+   | None -> failwith "compose ~capability must produce a prompt");
+  (* User text appends as the last layer... *)
+  (match System_prompt.compose ~user_system:"Always answer in French." () with
+   | Some p ->
+     let re = Re.compile (Re.str "Always answer in French.") in
+     assert (Re.execp re p);
+     assert (String.length p > String.length "Always answer in French.")
+   | None -> failwith "append compose must produce a prompt");
+  (* ...and replace mode hands over full control. *)
+  assert (System_prompt.compose ~user_system:"just me" ~replace:true ()
+          = Some "just me");
+  assert (System_prompt.compose ~replace:true () = None)
+
+let%test_unit "system_prompt_preamble_stable" =
+  (* Byte-stability within a session is the caching precondition; the
+     preamble must at minimum be deterministic for an unchanged env. *)
+  let a = System_prompt.environment_preamble () in
+  let b = System_prompt.environment_preamble () in
+  assert (a = b)
+
+(* ── C2: text tool-call fallback ──────────────────────────────────────── *)
+
+let%test_unit "tool_call_fallback_extract_table_driven" =
+  let tools = [Tool.Tool (module CaravanTools.Finish.Finish);
+               Tool.Tool (module CaravanTools.Bash.Bash)] in
+  let ok ~content ~name ~fmt =
+    match Tool_call_fallback.extract ~tools content with
+    | Some ([tc], format) ->
+      assert (tc.Types.name = name);
+      assert (format = fmt)
+    | Some _ -> failwith ("unexpected multi-call for: " ^ content)
+    | None -> failwith ("expected extraction for: " ^ content)
+  in
+  let rejected content =
+    assert (Tool_call_fallback.extract ~tools content = None)
+  in
+  (* bare JSON object *)
+  ok ~content:{|{"tool": "bash", "arguments": {"command": "ls"}}|}
+     ~name:"bash" ~fmt:"json";
+  (* alternate key spellings *)
+  ok ~content:{|{"name": "finish", "args": {"summary": "done"}}|}
+     ~name:"finish" ~fmt:"json";
+  (* fenced *)
+  ok ~content:"```json\n{\"tool\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n```"
+     ~name:"bash" ~fmt:"fenced_json";
+  (* XML wrappers *)
+  ok ~content:{|<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>|}
+     ~name:"bash" ~fmt:"xml";
+  (* OpenAI-style function object *)
+  ok ~content:{|{"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}|}
+     ~name:"bash" ~fmt:"json";
+  (* aliases resolve *)
+  ok ~content:{|{"tool": "sh", "arguments": {"command": "ls"}}|}
+     ~name:"sh" ~fmt:"json";
+  (* multi-call batch *)
+  (match Tool_call_fallback.extract ~tools
+           {|{"tool_calls": [{"function": {"name": "bash", "arguments": "{}"}}, {"function": {"name": "finish", "arguments": "{}"}}]}|}
+   with
+   | Some (tcs, _) -> assert (List.length tcs = 2)
+   | None -> failwith "batch extraction failed");
+  (* — rejections: the false-positive guards — *)
+  (* prose around the invocation *)
+  rejected {|I would run {"tool": "bash", "arguments": {}} if asked.|};
+  (* prose around a fence *)
+  rejected "Here is my plan:\n```json\n{\"tool\": \"bash\", \"arguments\": {}}\n```";
+  (* unregistered tool *)
+  rejected {|{"tool": "rm_rf_everything", "arguments": {}}|};
+  (* ordinary JSON that names no tool *)
+  rejected {|{"result": "ok", "count": 3}|};
+  (* ordinary prose and empty content *)
+  rejected "The bash tool lists files when given ls.";
+  rejected "";
+  (* one bad entry rejects the whole batch *)
+  rejected {|{"tool_calls": [{"function": {"name": "bash", "arguments": "{}"}}, {"function": {"name": "nope", "arguments": "{}"}}]}|}
+
+(* End to end: a model that emits its finish call as fenced text must
+   complete the run — before C2 the harness returned the JSON as prose
+   and reported success with zero tools executed. *)
+let%test_unit "session_executes_text_tool_call" =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+    let provider = make_mock_provider
+        "```json\n{\"tool\": \"finish\", \"arguments\": {\"summary\": \"recovered from text\"}}\n```" in
+    let sess = make_session ~tools:[finish_tool] "m" provider in
+    let (_, result) = Session.turn net clock sess "do the thing" in
+    assert (result.Types.finish_reason = Some "finish_tool");
+    let re = Re.compile (Re.str "recovered from text") in
+    assert (Re.execp re result.Types.value.Types.content))
+
+(* tool_call_mode = "native" disables the fallback. *)
+let%test_unit "tool_call_mode_native_disables_fallback" =
+  with_tmp_config ~name:"test_native_mode" ~toml_content:"tool_call_mode = \"native\"\n"
+    (fun _ ->
+      Eio_main.run (fun env ->
+        let net = Eio.Stdenv.net env in
+        let clock = Eio.Stdenv.clock env in
+        let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+        let text = {|{"tool": "finish", "arguments": {"summary": "nope"}}|} in
+        let provider = make_mock_provider text in
+        let sess = make_session ~tools:[finish_tool] "m" provider in
+        let (_, result) = Session.turn net clock sess "hi" in
+        assert (result.Types.finish_reason = Some "plain_reply");
+        assert (result.Types.value.Types.content = text)))
+
+(* ── H5: plain-reply-means-finished is wrong in agent mode ────────────── *)
+
+let%test_unit "agent_finish_discipline" =
+  Eio_main.run (fun env ->
+    let net = Eio.Stdenv.net env in
+    let clock = Eio.Stdenv.clock env in
+    let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+    let cfg on = Agent.{ max_turns = 20; continue_prompt = "continue";
+                         nudge = false; require_finish = on;
+                         max_plain_replies = 3 } in
+    (* A model that only ever chats must fail fast with a diagnostic. *)
+    let chatty = make_mock_provider "Sure, I'll read that file for you!" in
+    let sess = make_session ~tools:[finish_tool] "m" chatty in
+    (match Agent.run ~config:(cfg true) net clock sess "read the file" with
+     | Ok _ -> failwith "chatty model must not count as finished"
+     | Error msg ->
+       assert (Re.execp (Re.compile (Re.str "without calling")) msg));
+    (* With the discipline off, the old behaviour is preserved. *)
+    let sess = make_session ~tools:[finish_tool] "m" chatty in
+    (match Agent.run ~config:(cfg false) net clock sess "read the file" with
+     | Ok (_, result) ->
+       assert (result.Types.finish_reason = Some "plain_reply")
+     | Error e -> failwith ("require_finish=false should accept plain: " ^ e));
+    (* A model that chats first and finishes after the reminder succeeds. *)
+    let calls = ref 0 in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "late_finisher"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        incr calls;
+        if !calls < 3 then
+          Types.wrap_result ~raw_response:"" ~model:"m" ~provider:name
+            (Types.assistant_msg "Working on it!")
+        else
+          let tc = Types.{ id = "f"; name = "finish";
+                           args = {|{"summary": "done late"}|}; extra_content = None } in
+          Types.wrap_result ~raw_response:"" ~model:"m" ~provider:name
+            (Types.assistant_tool_msg ~tool_calls:[tc] "")
+      let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+        complete net cfg ?model ?options ?tools msgs
+      let list_models _ _ = []
+    end in
+    let late = Provider.Provider ((module P), ()) in
+    let sess = make_session ~tools:[finish_tool] "m" late in
+    (match Agent.run ~config:(cfg true) net clock sess "task" with
+     | Ok (_, result) ->
+       assert (result.Types.finish_reason = Some "finish_tool")
+     | Error e -> failwith ("late finisher should succeed: " ^ e)))
+
+(* ── C3: window eviction must not orphan tool results ─────────────────── *)
+
+let no_orphans msgs =
+  let ok = ref true in
+  let known = ref [] in
+  List.iter (fun (m : Types.chat_message) ->
+    (match m.Types.tool_calls with
+     | Some tcs -> known := List.map (fun tc -> tc.Types.id) tcs @ !known
+     | None -> ());
+    match m.Types.role with
+    | Types.Tool id -> if not (List.mem id !known) then ok := false
+    | _ -> ()
+  ) msgs;
+  !ok
+
+let%test_unit "ring_eviction_is_pair_aware" =
+  (* Drive a ring past its window with the agentic shape: assistant
+     tool-call messages each followed by two tool results. *)
+  let mk_turn i =
+    let tc1 = Types.{ id = Printf.sprintf "a%d" i; name = "bash"; args = "{}"; extra_content = None } in
+    let tc2 = Types.{ id = Printf.sprintf "b%d" i; name = "bash"; args = "{}"; extra_content = None } in
+    [ Types.assistant_tool_msg ~tool_calls:[tc1; tc2] "";
+      Types.tool_msg (Printf.sprintf "a%d" i) "out a";
+      Types.tool_msg (Printf.sprintf "b%d" i) "out b" ]
+  in
+  let msgs =
+    Types.user_msg "task"
+    :: List.concat_map mk_turn [1; 2; 3; 4; 5; 6; 7; 8]
+  in
+  (* Window sizes chosen so the boundary lands mid-unit in several
+     positions; every resulting history must still be orphan-free. *)
+  List.iter (fun window ->
+    let mem = List.fold_left Memory.Ring.add (Memory.Ring.make ~window ()) msgs in
+    let hist = Memory.Ring.get mem in
+    assert (no_orphans hist);
+    (* the window still bounds the size (units may undershoot, never
+       grossly overshoot) *)
+    assert (Memory.Ring.length mem <= window)
+  ) [4; 5; 6; 7; 10];
+  (* set_window prunes pair-aware too *)
+  let mem = List.fold_left Memory.Ring.add (Memory.Ring.make ~window:0 ()) msgs in
+  let pruned = Memory.Ring.set_window mem 5 in
+  assert (no_orphans (Memory.Ring.get pruned))
+
+let%test_unit "history_for_llm_filters_orphans_from_restored_checkpoints" =
+  (* A checkpoint saved by an older Caravan can contain an orphaned tool
+     result; the wire path must drop it rather than send a 400 shape. *)
+  let provider = make_mock_provider "ok" in
+  let orphan = Types.tool_msg "long_gone_call" "stale output" in
+  let tc = Types.{ id = "live"; name = "bash"; args = "{}"; extra_content = None } in
+  let sess =
+    make_session "m" provider
+    |> (fun s -> Session.add_messages s [
+        orphan;
+        Types.user_msg "hello";
+        Types.assistant_tool_msg ~tool_calls:[tc] "";
+        Types.tool_msg "live" "fresh output";
+      ])
+  in
+  let wire = Session.history_for_llm sess in
+  assert (no_orphans wire);
+  (* the legitimate pair survives *)
+  assert (List.exists (fun (m : Types.chat_message) ->
+    m.Types.role = Types.Tool "live") wire);
+  assert (not (List.exists (fun (m : Types.chat_message) ->
+    m.Types.role = Types.Tool "long_gone_call") wire))
+
+(* ── H3: byte-stable request prefixes ─────────────────────────────────── *)
+
+(* Two consecutive requests must serialise the shared (older) portion of
+   history byte-identically — prompt caching is strict prefix matching,
+   and any drift in an old message invalidates everything after it. *)
+let%test_unit "request_prefix_is_byte_stable_across_turns" =
+  Eio_main.run (fun env ->
+    let requests = ref [] in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "recorder"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ msgs =
+        requests := Yojson.Safe.to_string (Types.messages_to_wire_json msgs) :: !requests;
+        Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"recorder"
+          (Types.assistant_msg "noted")
+      let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+        complete net cfg ?model ?options ?tools msgs
+      let list_models _ _ = []
+    end in
+    let provider = Provider.Provider ((module P), ()) in
+    let tc = Types.{ id = "t1"; name = "bash"; args = "{}"; extra_content = None } in
+    let sess =
+      make_session "m" provider
+      |> (fun s -> Session.set_max_tool_output_len s (Some 40))
+      |> (fun s -> Session.add_messages s [
+          Types.user_msg "start";
+          Types.assistant_tool_msg ~tool_calls:[tc] "";
+          Types.tool_msg "t1" (String.make 300 'B');
+        ])
+    in
+    let (sess, _) = Session.turn env#net env#clock sess "first follow-up" in
+    let (sess, _) = Session.turn env#net env#clock sess "second follow-up" in
+    let (_sess, _) = Session.turn env#net env#clock sess "third follow-up" in
+    (* A message may change exactly once — when it ages past the
+       full-output window (2 messages) and is truncated in place.  So
+       the unchanged portion of request N — everything except its
+       newest 2 messages — must reappear byte-identically at the head
+       of request N+1.  (The old per-request truncation failed this:
+       the moving boundary re-shaped old messages every single turn.) *)
+    let elements r =
+      match Yojson.Safe.from_string r with
+      | `List l -> List.map Yojson.Safe.to_string l
+      | _ -> failwith "wire json must be a list"
+    in
+    let check_stable_portion ra rb =
+      let ea = elements ra and eb = elements rb in
+      let stable = List.length ea - 2 in
+      List.iteri (fun i a ->
+        if i < stable then assert (a = List.nth eb i)
+      ) ea
+    in
+    match List.rev !requests with
+    | [r1; r2; r3] ->
+      check_stable_portion r1 r2;
+      check_stable_portion r2 r3;
+      (* And the truncated tool output itself never drifts again: it
+         serialises identically in every request after its truncation. *)
+      let tool_elt r =
+        List.find (fun e -> Re.execp (Re.compile (Re.str "bytes omitted")) e)
+          (elements r)
+      in
+      assert (tool_elt r2 = tool_elt r3)
+    | rs -> failwith (Printf.sprintf "expected 3 requests, got %d" (List.length rs)))
+
+(* ── H4: honour Retry-After / rate-limit reset headers ────────────────── *)
+
+let%test_unit "retry_after_duration_parsing" =
+  let check ~s ~expected =
+    match Caravan_error.parse_duration s, expected with
+    | Some got, Some want -> assert (Float.abs (got -. want) < 1e-9)
+    | None, None -> ()
+    | got, want ->
+      failwith (Printf.sprintf "parse_duration %S: got %s, want %s" s
+                  (match got with Some f -> string_of_float f | None -> "None")
+                  (match want with Some f -> string_of_float f | None -> "None"))
+  in
+  (* bare seconds (Retry-After delta form) *)
+  check ~s:"30" ~expected:(Some 30.0);
+  check ~s:"7.66" ~expected:(Some 7.66);
+  check ~s:" 12 " ~expected:(Some 12.0);
+  (* compound rate-limit style (OpenAI/Groq reset headers) *)
+  check ~s:"250ms" ~expected:(Some 0.25);
+  check ~s:"1s" ~expected:(Some 1.0);
+  check ~s:"6m0s" ~expected:(Some 360.0);
+  check ~s:"1h2m3.5s" ~expected:(Some 3723.5);
+  (* garbage must not be misread as a duration *)
+  check ~s:"" ~expected:None;
+  check ~s:"Wed, 21 Oct 2026 07:28:00 GMT" ~expected:None;
+  check ~s:"-5" ~expected:None;
+  check ~s:"soon" ~expected:None
+
+let%test_unit "retry_hint_header_precedence" =
+  let get_of l name = List.assoc_opt (String.lowercase_ascii name) l in
+  (* Retry-After wins *)
+  assert (Caravan_error.retry_hint_of_headers
+            (get_of [("retry-after", "42"); ("x-ratelimit-reset-requests", "1s")])
+          = Some 42.0);
+  (* falls back to the reset family *)
+  assert (Caravan_error.retry_hint_of_headers
+            (get_of [("x-ratelimit-reset-requests", "6m0s")])
+          = Some 360.0);
+  assert (Caravan_error.retry_hint_of_headers (get_of []) = None);
+  (* unparseable Retry-After (HTTP-date) falls through to the family *)
+  assert (Caravan_error.retry_hint_of_headers
+            (get_of [("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT");
+                     ("x-ratelimit-reset-tokens", "2s")])
+          = Some 2.0)
+
+let%test_unit "retry_delay_prefers_server_hint" =
+  let mk retry_after =
+    Caravan_error.Provider_failure
+      { provider = "p"; status = 429; body = ""; detail = None; retry_after }
+  in
+  let d = Provider.Retry.delay_for ~base_delay:0.5 ~attempt:1 in
+  (* server hint wins over the 0.5s backoff *)
+  assert (d (mk (Some 30.0)) = 30.0);
+  (* clamped so a pathological header cannot stall for minutes *)
+  assert (d (mk (Some 100000.0)) = Provider.Retry.max_server_delay);
+  (* floored at the backoff so a zero header cannot busy-loop *)
+  assert (d (mk (Some 0.0)) = 0.5);
+  (* no hint: plain exponential backoff *)
+  assert (d (mk None) = 0.5);
+  assert (Provider.Retry.delay_for ~base_delay:0.5 ~attempt:3 (mk None) = 2.0)
+
+(* ── H1: compaction is tiered and affordable ──────────────────────────── *)
+
+(* A tool whose output is deliberately bulky, to make old tool results
+   dominate the token estimate the way they do in real agent runs. *)
+module Bulky = struct
+  let name = "bulky"
+  let aliases = []
+  let description = "test tool with a large output"
+  type input = unit
+  type output = string
+  let json_schema () = `Assoc [("type", `String "object"); ("properties", `Assoc [])]
+  let parse_args _ = Ok ()
+  let format_output s = s
+  let is_mutating = false
+  let describe_action _ = "bulky"
+  type _ Effect.t += Exec : input -> output Effect.t
+  let execute () = String.make 5000 'Z'
+end
+
+let%test_unit "structural_compaction_avoids_model_call" =
+  Eio_main.run (fun env ->
+    let calls = ref 0 in
+    let finish_tool = Tool.Tool (module CaravanTools.Finish.Finish) in
+    let bulky_tool = Tool.Tool (module Bulky) in
+    let module P : Provider.PROVIDER with type config = unit = struct
+      type config = unit
+      let name = "worker"
+      let complete _net _cfg ?model:_ ?options:_ ?tools:_ _msgs =
+        incr calls;
+        let tc = Types.{ id = "f1"; name = "finish";
+                         args = {|{"summary":"ok"}|}; extra_content = None } in
+        Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"worker"
+          (Types.assistant_tool_msg ~tool_calls:[tc] "")
+      let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+        complete net cfg ?model ?options ?tools msgs
+      let list_models _ _ = []
+    end in
+    let provider = Provider.Provider ((module P), ()) in
+    (* Seed an agent-shaped history whose bulk is AGED tool output —
+       the case the structural tier exists for.  ~3 x 5000-char results
+       overflow an 800-token window even after the steady-state 1000-
+       byte cap; hard truncation to ~200 bytes brings them under. *)
+    let old_turn i =
+      let id = Printf.sprintf "b%d" i in
+      let tc = Types.{ id; name = "bulky"; args = "{}"; extra_content = None } in
+      [Types.assistant_tool_msg ~tool_calls:[tc] "";
+       Types.tool_msg id (String.make 5000 'Z')]
+    in
+    let sess =
+      make_session ~tools:[bulky_tool; finish_tool] "m" provider
+      |> (fun s -> Session.set_context_window s (Some 800))
+      |> (fun s -> Session.add_messages s
+            (Types.user_msg "do bulky work" :: List.concat_map old_turn [1; 2; 3]))
+    in
+    let (final, result) = Session.run_conversations ~max_turns:5 env#net env#clock sess in
+    assert (result.Types.finish_reason = Some "finish_tool");
+    (* One work call, zero summarisation calls: the structural tier
+       absorbed the overflow without spending a request. *)
+    assert (!calls = 1);
+    (* The aged bulky outputs were hard-truncated in place... *)
+    let hist = Session.history final in
+    let bulky_msg = List.find (fun (m : Types.chat_message) ->
+      m.Types.role = Types.Tool "b1") hist in
+    assert (String.length bulky_msg.Types.content < 300);
+    (* ...and the task statement is still there verbatim (no summary
+       memory swap happened). *)
+    assert (List.exists (fun (m : Types.chat_message) ->
+      m.Types.content = "do bulky work") hist))
+
+let%test_unit "summarise_routes_to_cheap_model_and_keeps_tail" =
+  with_tmp_config ~name:"test_summarize_model"
+    ~toml_content:"summarize_model = \"tiny-summarizer\"\n"
+    (fun _ ->
+      Eio_main.run (fun env ->
+        let summary_model = ref None in
+        let module P : Provider.PROVIDER with type config = unit = struct
+          type config = unit
+          let name = "recorder"
+          let complete _net _cfg ?model ?options:_ ?tools:_ _msgs =
+            summary_model := model;
+            Types.wrap_result ~raw_response:"" ~model:"m" ~provider:"recorder"
+              (Types.assistant_msg "the summary")
+          let stream net cfg ?model ?options ?tools msgs ~on_token:_ =
+            complete net cfg ?model ?options ?tools msgs
+          let list_models _ _ = []
+        end in
+        let provider = Provider.Provider ((module P), ()) in
+        let msgs =
+          Types.user_msg "the original task"
+          :: List.concat_map (fun i ->
+              [Types.user_msg (Printf.sprintf "step %d" i);
+               Types.assistant_msg (Printf.sprintf "did %d" i)])
+            [1; 2; 3; 4; 5]
+        in
+        let sess = make_session "expensive-model" provider in
+        let sess = Session.add_messages sess msgs in
+        let (sess', summary) = Session.summarise env#net env#clock sess in
+        assert (summary = "the summary");
+        (* the call went to the configured cheap model *)
+        assert (!summary_model = Some "tiny-summarizer");
+        let hist = Session.history sess' in
+        (* summary present... *)
+        assert (List.exists (fun (m : Types.chat_message) ->
+          Re.execp (Re.compile (Re.str "the summary")) m.Types.content) hist);
+        (* ...original task preserved verbatim... *)
+        assert (List.exists (fun (m : Types.chat_message) ->
+          Re.execp (Re.compile (Re.str "the original task")) m.Types.content) hist);
+        (* ...and the most recent exchanges survive untouched. *)
+        assert (List.exists (fun (m : Types.chat_message) ->
+          m.Types.content = "did 5") hist);
+        assert (List.exists (fun (m : Types.chat_message) ->
+          m.Types.content = "step 5") hist)))
+
+(* ── M1: tool profiles ────────────────────────────────────────────────── *)
+
+let%test_unit "tool_profile_selection" =
+  let native = Capability.lookup "claude-sonnet-5" in
+  let flaky  = Capability.lookup "llama3.2:1b" in
+  (* auto derives from capability *)
+  assert (not (Capability.use_core_profile ~profile:"auto" native));
+  assert (Capability.use_core_profile ~profile:"auto" flaky);
+  (* unknown models are conservative -> core *)
+  assert (Capability.use_core_profile ~profile:"auto" Capability.conservative);
+  (* explicit settings win in both directions *)
+  assert (Capability.use_core_profile ~profile:"core" native);
+  assert (not (Capability.use_core_profile ~profile:"full" flaky));
+  (* native tool calling but tiny context still argues for core *)
+  let small_native = Capability.{ native with context_window = 8192 } in
+  assert (Capability.use_core_profile ~profile:"auto" small_native);
+  (* the completion protocol is always part of the core surface *)
+  assert (List.mem "finish" Capability.core_tool_names);
+  assert (Config.get_tool_profile () = "auto")

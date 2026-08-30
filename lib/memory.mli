@@ -10,6 +10,13 @@ module type MEMORY = sig
   val clear    : t -> t
   val length   : t -> int
   val set_window : t -> int -> t
+
+  (** [map_recent t ~keep f] applies [f] to every non-system message
+      except the newest [keep].  Session uses it to truncate tool
+      outputs exactly once, as they age out of the recent window, so a
+      message's serialised bytes never change afterwards — the
+      precondition for prompt-cache prefix stability. *)
+  val map_recent : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json  : t -> Yojson.Safe.t
   val of_json  : Yojson.Safe.t -> t
 end
@@ -25,6 +32,7 @@ module Ring : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
 end
@@ -39,6 +47,7 @@ module Summary : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
   val compress    : complete:(chat_message list -> string) -> t -> t
@@ -53,6 +62,7 @@ module Hierarchical : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
 end

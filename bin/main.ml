@@ -11,7 +11,7 @@ module Registry = CaravanProviders.Registry
 
 let strict_mode () =
   Config.get_int_opt (Some "CARAVAN_STRICT_MODE") "strict_mode"
-  |> Option.value ~default:1
+  |> Option.value ~default:0
 
 let base_tools () =
   let base = CaravanTools.All_tools.all_tools in
@@ -96,13 +96,45 @@ let resolve_cli_spec ~provider_cli ~model_cli ~base_url_cli =
     ~provider_cli ~model_cli ~base_url_cli ()
 
 (** Build a session inside [Eio_main.run]: static + MCP tools, plus the
-    config-declared delegate tool when subagents are enabled. *)
+    config-declared delegate tool when subagents are enabled.
+
+    The system prompt is layered (System_prompt.compose): the shipped
+    base + capability-conditioned format guidance + environment
+    preamble, with the user's [system] setting appended on top.
+    [system_replace = true] hands the user full control instead.  The
+    preamble is assembled here — once per session — so the request
+    prefix stays byte-stable for prompt caching. *)
 let make_session ~net ~clock ~provider_name ~model ~base_url ~system =
   let provider = resolve_provider_or_exit ~provider_name ~model ~base_url in
   Plugin_host.set_provider (Lazy.force host) provider;
   let tools = Subagents.session_tools ~net ~clock ~host:(Lazy.force host) (all_tools ()) in
-  let sess = Session.create ~tools model provider in
-  match system with Some s -> Session.set_system sess s | None -> sess
+  let capability = Capability.lookup model in
+  (* Tool profile (M1): low-capability models get the core surface —
+     every schema is a per-turn context tax, and small models choose
+     badly among many options. tool_profile = "full" restores all. *)
+  let tools =
+    if Capability.use_core_profile ~profile:(Config.get_tool_profile ()) capability
+    then begin
+      let kept = List.filter
+          (fun t -> List.mem (Tool.name_of_packed t) Capability.core_tool_names)
+          tools in
+      Trace.log "info"
+        "Tool profile 'core' active for %s (%d of %d tools exposed; set tool_profile = \"full\" to override)"
+        model (List.length kept) (List.length tools);
+      kept
+    end else tools
+  in
+  let sess =
+    Session.create ~tools model provider
+    |> (fun s -> Session.set_context_window s (Some capability.Capability.context_window))
+  in
+  let replace =
+    Config.get_bool_opt (Some "CARAVAN_SYSTEM_REPLACE") "system_replace"
+    |> Option.value ~default:false
+  in
+  match System_prompt.compose ~capability ?user_system:system ~replace () with
+  | Some s -> Session.set_system sess s
+  | None -> sess
 
 (* ── REPL state ───────────────────────────────────────────────────────── *)
 
@@ -136,7 +168,7 @@ let help_groups = [
   { title = "Model and Provider";
     commands = [
       ("/model <name>", "Switch AI model",
-       Some "Example: /model claude-sonnet-4-5");
+       Some "Example: /model claude-sonnet-5");
       ("/provider <p> [url]", "Switch AI provider",
        Some "Example: /provider anthropic");
       ("/models", "Browse available models", None);
@@ -1433,7 +1465,7 @@ let config_cmd =
   let doc = "Show or edit the configuration file (show | path | get | set)." in
   let man = [
     `S Manpage.s_examples;
-    `P "caravan config set model claude-sonnet-4-5"; `Noblank;
+    `P "caravan config set model claude-sonnet-5"; `Noblank;
     `P "caravan config set permissions ask"; `Noblank;
     `P "caravan config get provider";
   ] in
@@ -1596,7 +1628,7 @@ let () =
     `P "caravan init                          # guided setup"; `Noblank;
     `P "caravan                               # chat REPL"; `Noblank;
     `P "caravan agent \"fix the failing test\"  # one-shot autonomy"; `Noblank;
-    `P "caravan -p anthropic -m claude-sonnet-4-5"; `Noblank;
+    `P "caravan -p anthropic -m claude-sonnet-5"; `Noblank;
     `P "caravan providers --ladder            # model suggestions by size";
   ] in
   let info = Cmd.info "caravan" ~doc ~man ~version:Version.v in

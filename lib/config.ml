@@ -318,6 +318,31 @@ let assoc_int_opt fields key =
   | Some (Otoml.TomlInteger n) -> Some n
   | _ -> None
 
+(** Read a TOML boolean field from an association list, returning None on miss. *)
+let assoc_bool_opt fields key =
+  match List.assoc_opt key fields with
+  | Some (Otoml.TomlBoolean b) -> Some b
+  | _ -> None
+
+(** Read the [capabilities] table: each sub-table keyed by a model-name
+    pattern, e.g. [capabilities."my-model"] with capability fields.
+    Returns [(pattern, fields)] in file order; see [Capability.lookup]. *)
+let get_capability_overrides () =
+  match get_ast () with
+  | None -> []
+  | Some ast ->
+    try
+      match Otoml.find ast (fun x -> x) ["capabilities"] with
+      | Otoml.TomlTable entries | Otoml.TomlInlineTable entries ->
+        List.filter_map (fun (pattern, v) ->
+          match v with
+          | Otoml.TomlTable fields | Otoml.TomlInlineTable fields ->
+            Some (pattern, fields)
+          | _ -> None
+        ) entries
+      | _ -> []
+    with _ -> []
+
 (** Get a single MCP server config by name. *)
 let get_mcp_server name =
   List.find_opt (fun (s : mcp_server_config) -> s.name = name) (get_mcp_servers ())
@@ -616,13 +641,49 @@ let get_permission_mode () =
   |> Option.value ~default:"auto"
   |> String.lowercase_ascii
 
-(** Agent turn budget (CLI flag > env > TOML > default 10). *)
+(** Agent turn budget (CLI flag > env > TOML > default 24).  Raised
+    from 10 once C4 made the ceiling actually enforceable: weak models
+    need more steps to reach the same place, and the budget nudges keep
+    long runs pointed at the task. *)
 let get_max_turns () =
-  get_int_opt (Some "CARAVAN_MAX_TURNS") "max_turns" |> Option.value ~default:10
+  get_int_opt (Some "CARAVAN_MAX_TURNS") "max_turns" |> Option.value ~default:24
 
 (** Whether the agent loop injects budget-awareness nudges (default: true). *)
 let get_nudge_enabled () =
   get_bool_opt (Some "CARAVAN_NUDGE") "nudge" |> Option.value ~default:true
+
+(** How tool calls are recognised in model replies:
+    - "auto"   (default) — native tool_calls, plus the text fallback
+      parser when a reply's whole content is a well-formed invocation;
+    - "native" — trust only the API tool_calls field;
+    - "text"   — same recognition as "auto"; the explicit setting exists
+      so text-protocol use is a documented first-class mode, and so
+      front-ends can add text-mode prompt scaffolding on top. *)
+let get_tool_call_mode () =
+  get_string_opt (Some "CARAVAN_TOOL_CALL_MODE") "tool_call_mode"
+  |> Option.value ~default:"auto"
+  |> String.lowercase_ascii
+
+(** Which tools are exposed to the model: "auto" (capability-driven —
+    low-capability models get the core set), "core" (force the reduced
+    set), "full" (everything). Default "auto". *)
+let get_tool_profile () =
+  get_string_opt (Some "CARAVAN_TOOL_PROFILE") "tool_profile"
+  |> Option.value ~default:"auto"
+  |> String.lowercase_ascii
+
+(** Model used for history summarisation calls, when set — routing
+    compaction to a cheap model keeps it off the working model's rate
+    limit and budget.  Unset (default) means use the session's model. *)
+let get_summarize_model () =
+  get_string_opt (Some "CARAVAN_SUMMARIZE_MODEL") "summarize_model"
+
+(** Whether agent runs require an explicit [finish] tool call to count
+    as complete (default: true). When false, a plain text reply ends
+    the run — the pre-refactor behaviour. *)
+let get_require_finish () =
+  get_bool_opt (Some "CARAVAN_REQUIRE_FINISH") "require_finish"
+  |> Option.value ~default:true
 
 (** How aggressively provider calls retry transient failures:
     "off" | "low" | "medium" | "high" (default "medium"). Parsed into a
@@ -720,10 +781,15 @@ let editable_keys : (string * string * string) list = [
   ("provider",    "Backend to talk to",                 "see `caravan providers`");
   ("model",       "Model name",                         "provider-specific");
   ("base_url",    "Endpoint override",                  "URL");
-  ("system",      "Default system prompt",              "text");
+  ("system",      "Extra system prompt (appended to the shipped default)", "text");
+  ("system_replace", "system replaces the shipped default instead of appending", "true | false");
   ("stream",      "Stream tokens as they arrive",       "true | false");
   ("max_turns",   "Agent turn budget",                  "integer");
   ("nudge",       "Budget nudges in agent loops",       "true | false");
+  ("tool_call_mode", "Tool-call recognition",           "auto | native | text");
+  ("require_finish", "Agent runs must call finish to complete", "true | false");
+  ("summarize_model", "Model for compaction summaries",     "model name (default: session model)");
+  ("tool_profile", "Tool surface exposed to the model",     "auto | core | full");
   ("permissions", "Mutating-tool policy",               "auto | ask | readonly");
   ("provider_retry", "Provider error retry aggression", "off | low | medium | high");
   ("provider_retry_base_delay", "Base backoff seconds between provider retries", "float");

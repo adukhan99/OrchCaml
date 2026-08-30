@@ -25,6 +25,8 @@
   Effects
   Config
   Types
+  Capability
+  System_prompt
   Document
   Formatter
   Memory
@@ -38,6 +40,7 @@
   Monitor
   Provider
   Tool
+  Tool_call_fallback
   Session
   Prompt
   Template

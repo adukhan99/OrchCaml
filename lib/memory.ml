@@ -15,6 +15,7 @@ module type MEMORY = sig
   val clear    : t -> t
   val length   : t -> int
   val set_window : t -> int -> t
+  val map_recent : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json  : t -> Yojson.Safe.t
   val of_json  : Yojson.Safe.t -> t
 end
@@ -30,6 +31,7 @@ module Ring : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
 end = struct
@@ -56,11 +58,33 @@ end = struct
     | [] -> { dq with front = List.rev dq.rear; rear = [] }
     | _  -> dq
 
+  let tool_call_ids msg =
+    match msg.tool_calls with
+    | Some tcs when tcs <> [] -> Some (List.map (fun tc -> tc.id) tcs)
+    | _ -> None
+
+  (* Eviction is pair-aware and atomic: an assistant message bearing
+     tool_calls and its result messages form one indivisible unit.
+     Dropping only the assistant half leaves [tool] messages whose
+     tool_call_id no longer appears in the request — a shape OpenAI,
+     Groq, Mistral and DeepSeek all reject with a non-retriable 400,
+     mid-run, after the tokens are already spent. *)
   let drop_oldest dq =
     let dq = rebalance dq in
     match dq.front with
-    | []     -> dq
-    | _ :: t -> rebalance { dq with front = t; len = dq.len - 1 }
+    | []          -> dq
+    | oldest :: t ->
+      let dq = rebalance { dq with front = t; len = dq.len - 1 } in
+      (match tool_call_ids oldest with
+       | None -> dq
+       | Some ids ->
+         let rec drop_results dq =
+           match dq.front with
+           | { role = Tool id; _ } :: t when List.mem id ids ->
+             drop_results (rebalance { dq with front = t; len = dq.len - 1 })
+           | _ -> dq
+         in
+         drop_results dq)
 
   let add mem msg =
     match msg.role with
@@ -79,6 +103,16 @@ end = struct
 
   let get mem =
     mem.system_msgs @ mem.front @ List.rev mem.rear
+
+  (* Apply [f] to every non-system message except the newest [keep].
+     Exists so Session can truncate tool outputs exactly once, when a
+     message ages out of the recent window — after which its serialised
+     bytes never change again (the prompt-cache prefix precondition). *)
+  let map_recent mem ~keep f =
+    let msgs = mem.front @ List.rev mem.rear in
+    let n = List.length msgs in
+    let mapped = List.mapi (fun i m -> if i < n - keep then f m else m) msgs in
+    { mem with front = mapped; rear = [] }
 
   let clear mem =
     { mem with system_msgs = []; front = []; rear = []; len = 0 }
@@ -102,6 +136,7 @@ module Noop : MEMORY = struct
   let clear        ()      = ()
   let length       ()      = 0
   let set_window   () _    = ()
+  let map_recent   () ~keep:_ _ = ()
   let to_json      ()      = `List []
   let of_json      _       = ()
 end
@@ -114,6 +149,7 @@ module Summary : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
   val compress    : complete:(chat_message list -> string) -> t -> t
@@ -137,6 +173,9 @@ end = struct
 
   let set_window mem w =
     { mem with buf = Ring.set_window mem.buf w; max_messages = w }
+
+  let map_recent mem ~keep f =
+    { mem with buf = Ring.map_recent mem.buf ~keep f }
 
   let compress ~complete mem =
     let msgs    = Ring.get mem.buf in
@@ -173,6 +212,7 @@ module Hierarchical : sig
   val clear       : t -> t
   val length      : t -> int
   val set_window  : t -> int -> t
+  val map_recent  : t -> keep:int -> (chat_message -> chat_message) -> t
   val to_json     : t -> Yojson.Safe.t
   val of_json     : Yojson.Safe.t -> t
 end = struct
@@ -221,6 +261,9 @@ end = struct
   let set_window mem w =
     { mem with short_term = Ring.set_window mem.short_term w; max_short = w }
 
+  let map_recent mem ~keep f =
+    { mem with short_term = Ring.map_recent mem.short_term ~keep f }
+
   let to_json mem =
     `Assoc [
       ("short_term",  Ring.to_json mem.short_term);
@@ -250,6 +293,7 @@ module SummaryMemory : MEMORY with type t = Summary.t = struct
   let clear = Summary.clear
   let length = Summary.length
   let set_window = Summary.set_window
+  let map_recent = Summary.map_recent
   let to_json = Summary.to_json
   let of_json = Summary.of_json
 end

@@ -16,6 +16,10 @@ type event =
   | Tool_call_start  of { name : string; args : string }
   | Tool_call_end    of { name : string; output : string; duration : float }
   | Tool_not_found   of { name : string }
+  | Tool_call_fallback of { name : string; format : string }
+      (** a tool call was recovered from plain [content] by the text
+          fallback parser (the model did not use native tool_calls);
+          [format] is the recognised shape (json / fenced_json / xml) *)
   | Permission_denied of { name : string }
   | Task_finished    of { summary : string }
   | Summarize_start
@@ -77,6 +81,8 @@ let event_to_json ev : Yojson.Safe.t =
     base "tool_call_end"
       [("name", `String name); ("output", `String output); ("duration_s", `Float duration)]
   | Tool_not_found { name } -> base "tool_not_found" [("name", `String name)]
+  | Tool_call_fallback { name; format } ->
+    base "tool_call_fallback" [("name", `String name); ("format", `String format)]
   | Permission_denied { name } -> base "permission_denied" [("name", `String name)]
   | Task_finished { summary } -> base "task_finished" [("summary", `String summary)]
   | Summarize_start -> base "summarize_start" []

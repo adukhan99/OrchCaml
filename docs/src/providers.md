@@ -12,7 +12,7 @@ this table live, with key status for your environment.
 | `vllm`      | local | —                    | `default`                         |
 | `lmstudio`  | local | —                    | `default`                         |
 | `openai`    | cloud | `OPENAI_API_KEY`     | `gpt-4o-mini`                     |
-| `anthropic` | cloud | `ANTHROPIC_API_KEY`  | `claude-sonnet-4-5`               |
+| `anthropic` | cloud | `ANTHROPIC_API_KEY`  | `claude-sonnet-5`                 |
 | `groq`      | cloud | `GROQ_API_KEY`       | `llama-3.3-70b-versatile`         |
 | `openrouter`| cloud | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct` |
 | `together`  | cloud | `TOGETHER_API_KEY`   | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
@@ -20,6 +20,13 @@ this table live, with key status for your environment.
 | `mistral`   | cloud | `MISTRAL_API_KEY`    | `mistral-small-latest`            |
 | `gemini`    | cloud | `GEMINI_API_KEY`     | `gemini-2.0-flash`                |
 | `xai`       | cloud | `XAI_API_KEY`        | `grok-3-mini`                     |
+| `cerebras`  | cloud | `CEREBRAS_API_KEY`   | `llama-3.3-70b`                   |
+| `github_models` | cloud | `GITHUB_TOKEN`   | `openai/gpt-4o-mini`              |
+| `nvidia`    | cloud | `NVIDIA_API_KEY`     | `meta/llama-3.3-70b-instruct`     |
+
+Model names drift faster than any table: `caravan models` (live, per
+provider) is authoritative, and the [free-tier guide](free-tier.md) covers
+the zero-cost entries in detail.
 
 ## Key resolution order
 
@@ -37,7 +44,7 @@ this table live, with key status for your environment.
 | small ~4B    | `ollama / qwen3:4b`            | fast local reasoning        |
 | medium ~20B  | `ollama / gpt-oss:20b`         | strong local, ~16 GB        |
 | large ~70B   | `groq / llama-3.3-70b-versatile` | open weights, hosted fast |
-| frontier     | `anthropic / claude-sonnet-4-5`, `openai / gpt-4o`, `gemini / gemini-2.5-pro` | |
+| frontier     | `anthropic / claude-sonnet-5`, `openai / gpt-4o`, `gemini / gemini-2.5-pro` | |
 
 ## Notes and caveats
 

@@ -2,10 +2,13 @@ open Caravan.Tool
 
 (** Strict mode (read lazily so env/config changes are honoured):
     0 = permissive (any shell command), 1 = single-command discipline,
-    2 = tool hidden entirely (filtered out by the front-end). *)
+    2 = tool hidden entirely (filtered out by the front-end).
+    Default 0: single-command discipline doubles or triples round
+    trips, and round trips are the scarce resource on a rate-limited
+    free tier — verification-heavy workflows can opt back in. *)
 let strict_mode () =
   Caravan.Config.get_int_opt (Some "CARAVAN_STRICT_MODE") "strict_mode"
-  |> Option.value ~default:1
+  |> Option.value ~default:0
 
 module Bash : TOOL with type input = string and type output = string = struct
   let name = "bash"

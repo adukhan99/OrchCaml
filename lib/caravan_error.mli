@@ -28,10 +28,23 @@ exception Provider_failure of {
   status   : int;
   body     : string;
   detail   : provider_error_detail option;
+  retry_after : float option;
+      (** Seconds the server asked us to wait, from typed response
+          headers (Retry-After and the x-ratelimit-reset family), when present. *)
 }
 
 (** Raise a {!exception:Provider_failure} exception after parsing the body payload. *)
-val raise_provider_failure : provider:string -> status:int -> body:string -> 'a
+val raise_provider_failure :
+  ?retry_after:float -> provider:string -> status:int -> body:string -> unit -> 'a
+
+(** Parse a rate-limit duration string: bare seconds ("30", "7.66") or
+    compound units ("250ms", "1s", "6m0s", "1h2m3.5s"). *)
+val parse_duration : string -> float option
+
+(** Extract a retry-after hint from response headers via a
+    case-insensitive lookup function supplied by the transport:
+    [Retry-After] first, then the [x-ratelimit-reset-*] family. *)
+val retry_hint_of_headers : (string -> string option) -> float option
 
 (** Attempt to parse a provider error JSON payload into a {!type:provider_error_detail}. *)
 val parse_provider_error : string -> provider_error_detail option
