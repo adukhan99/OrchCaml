@@ -35,8 +35,13 @@ Error: max_turns must be between 1 and 1000 (got 99999)
 ```
 
 Writes are surgical: your comments, key order, and table layout survive an
-edit untouched, and the previous contents are kept as `config.toml.bak`.
-Reading the config never modifies it.
+edit untouched — including `/subagents add` and `/subagents remove`, which
+append and delete `[[subagents]]` blocks in place. The previous contents are
+kept as `config.toml.bak`, and reading the config never modifies it.
+
+`/config` with no arguments opens the settings as a list: arrow to one, press
+Enter, and pick a value (or type one, for the free-text settings). `/config
+show` keeps the old summary of the live session.
 
 If a setting appears to do nothing, an environment variable is usually
 overriding it — `config set`, `config get`, and `caravan doctor` all say so

@@ -1040,6 +1040,104 @@ let config_ast_for_write text =
 let split_dotted dotted_key =
   String.split_on_char '.' dotted_key |> List.filter (fun k -> k <> "")
 
+(** Render a value as TOML source for a freshly written block: scalars,
+    plus arrays of scalars (a subagent's tool list). *)
+let toml_inline_literal (v : Otoml.t) =
+  match toml_scalar_literal v with
+  | Some _ as s -> s
+  | None ->
+    match v with
+    | Otoml.TomlArray items ->
+      let parts = List.map toml_scalar_literal items in
+      if List.for_all Option.is_some parts then
+        Some ("[" ^ String.concat ", " (List.filter_map Fun.id parts) ^ "]")
+      else None
+    | _ -> None
+
+(** Append a [[table]] block with [pairs] to the config, as text.
+
+    Structural edits used to go through the AST printer, which meant
+    declaring a subagent silently deleted every comment in the file.
+    Appending is the one structural edit that is trivially expressible as
+    text, and it is the common one. [None] if any value cannot be
+    rendered, leaving the caller to fall back. *)
+let append_table_array ~table (pairs : (string * Otoml.t) list) =
+  let rendered = List.map (fun (k, v) -> (k, toml_inline_literal v)) pairs in
+  if not (is_bare_key table)
+  || not (List.for_all (fun (k, v) -> is_bare_key k && v <> None) rendered)
+  then None
+  else begin
+    let text = config_text () in
+    let lines = if String.trim text = "" then [] else String.split_on_char '\n' text in
+    let rec drop_trailing = function
+      | l :: rest when String.trim l = "" -> drop_trailing rest
+      | rest -> rest
+    in
+    let body = List.rev (drop_trailing (List.rev lines)) in
+    let block =
+      Printf.sprintf "[[%s]]" table
+      :: List.filter_map
+           (fun (k, v) -> Option.map (Printf.sprintf "%s = %s" k) v) rendered
+    in
+    let sep = if body = [] then [] else [""] in
+    let text' = String.concat "\n" (body @ sep @ block) ^ "\n" in
+    match Otoml.Parser.from_string_result text' with
+    | Error _ -> None
+    | Ok _ -> Some text'
+  end
+
+(** Remove the [[table]] block whose [name] field matches, as text: from
+    its header down to the line before the next table header. *)
+let remove_table_array ~table ~name =
+  let text = config_text () in
+  if String.trim text = "" then None
+  else begin
+    let arr = Array.of_list (String.split_on_char '\n' text) in
+    let n = Array.length arr in
+    let name_re = assignment_re "name" in
+    (* Walk the array-of-tables blocks, looking for the matching name. *)
+    let target = ref None in
+    let block_start = ref None in
+    let matched = ref false in
+    let close i =
+      match !block_start with
+      | Some s when !matched && !target = None -> target := Some (s, i)
+      | _ -> ()
+    in
+    for i = 0 to n - 1 do
+      match parse_table_header arr.(i) with
+      | Some h ->
+        close i;
+        if h.th_array && h.th_path = Some [table] then begin
+          block_start := Some i; matched := false
+        end else block_start := None
+      | None ->
+        if !block_start <> None && Re.execp name_re arr.(i) then
+          (* Compare the parsed value, so quoting style does not matter. *)
+          (match Otoml.Parser.from_string_result (String.trim arr.(i)) with
+           | Ok ast ->
+             (try if Otoml.find ast Otoml.get_string ["name"] = name then matched := true
+              with _ -> ())
+           | Error _ -> ())
+    done;
+    close n;
+    match !target with
+    | None -> None
+    | Some (s, e) ->
+      let keep i = i < s || i >= e in
+      let kept = List.filteri (fun i _ -> keep i) (Array.to_list arr) in
+      (* Collapse the blank line the removed block left behind. *)
+      let rec squeeze = function
+        | a :: b :: rest when String.trim a = "" && String.trim b = "" -> squeeze (b :: rest)
+        | x :: rest -> x :: squeeze rest
+        | [] -> []
+      in
+      let text' = String.concat "\n" (squeeze kept) in
+      (match Otoml.Parser.from_string_result text' with
+       | Error _ -> None
+       | Ok _ -> Some text')
+  end
+
 (** Set a (dotted) key to a TOML value in the config file, creating the
     file and its directory as needed.  The user's comments, ordering and
     indentation survive whenever the edit can be expressed as a splice;
@@ -1386,6 +1484,25 @@ let mistyped_keys () : (string * string) list =
     top @ orch
   | Some _ -> []
 
+(** Write an [orchestrator] table when there is not already one to
+    resolve against.  Declaring a subagent is the only thing that needs
+    it; reading the config resolves the same pair in memory. *)
+let ensure_orchestrator_written ?fallback_provider ?fallback_model () =
+  match get_orchestrator () with
+  | Some _ -> ()
+  | None ->
+    let pick explicit fallback =
+      match explicit with
+      | Some v when String.trim v <> "" -> Some v
+      | _ -> fallback
+    in
+    (match pick (get_string "provider") fallback_provider,
+           pick (get_string "model") fallback_model with
+     | Some p, Some m ->
+       ignore (set_toml_value "orchestrator.provider" (Otoml.string p));
+       ignore (set_toml_value "orchestrator.model" (Otoml.string m))
+     | _ -> ())
+
 (** Field descriptors for the subagent creation UI — single source of truth
     shared by the REPL and web cockpit.
     [(toml_key, label, placeholder, required)]. *)
@@ -1477,10 +1594,19 @@ let add_subagent (fields : (string * string) list) : (string, string) result =
         in
         if dupe then Error (Printf.sprintf "subagent '%s' already exists" name)
         else begin
-          let new_arr = Otoml.TomlTableArray (existing @ [entry]) in
-          let ast' = Otoml.update ast ["subagents"] (Some new_arr) in
-          let ast'' = ensure_orchestrator_in_ast ~fallback_provider:provider ~fallback_model:model ast' in
-          write_ast ast''
+          let written =
+            match append_table_array ~table:"subagents" !pairs with
+            | Some text -> write_config_text text
+            | None ->
+              (* Fall back to the AST printer, which loses comments. *)
+              let new_arr = Otoml.TomlTableArray (existing @ [entry]) in
+              write_ast (Otoml.update ast ["subagents"] (Some new_arr))
+          in
+          (* A roster needs an orchestrator to resolve against. *)
+          (match written with
+           | Ok _ -> ensure_orchestrator_written ~fallback_provider:provider ~fallback_model:model ()
+           | Error _ -> ());
+          written
         end
       with exn -> Error (Printexc.to_string exn)
     end
@@ -1510,14 +1636,12 @@ let delete_subagent name : (string, string) result =
     in
     if List.length filtered = List.length existing then
       Error (Printf.sprintf "subagent '%s' not found" name)
-    else begin
-      let value =
-        if filtered = [] then None
-        else Some (Otoml.TomlTableArray filtered)
-      in
-      let ast' = Otoml.update ast ["subagents"] value in
-      write_ast ast'
-    end
+    else
+      match remove_table_array ~table:"subagents" ~name with
+      | Some text -> write_config_text text
+      | None ->
+        let value = if filtered = [] then None else Some (Otoml.TomlTableArray filtered) in
+        write_ast (Otoml.update ast ["subagents"] value)
   with exn -> Error (Printexc.to_string exn)
 
 (** Serialize a [subagent_config] to a JSON object for the web API. *)

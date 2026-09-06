@@ -41,7 +41,7 @@ let setting_values key =
 let setting_keys () = List.map (fun (s : Config.setting) -> s.Config.key) Config.settings
 
 let complete_config = function
-  | [_] -> ["keys"; "get"; "set"; "unset"; "edit"]
+  | [_] -> ["keys"; "get"; "set"; "unset"; "edit"; "show"]
   | [("set" | "unset" | "get"); _] -> setting_keys ()
   | ["set"; key; _] -> setting_values key
   | _ -> []
@@ -89,7 +89,15 @@ let all : t list = [
     ~complete:(fun a -> if last_is_first a then provider_names () else []);
   cmd "/providers" "List supported providers and key status"
     ~group:"Model and Provider";
-  cmd "/subagents" "Show configured subagent workers" ~group:"Model and Provider";
+  cmd "/subagents" "Configured subagent workers; add or remove one"
+    ~group:"Model and Provider" ~args:"[add|remove <name>]"
+    ~complete:(fun a ->
+      match a with
+      | [_] -> ["add"; "remove"]
+      | [("remove" | "rm"); _] ->
+        List.map (fun (c : Config.subagent_config) -> c.Config.name)
+          (Config.get_subagents ())
+      | _ -> []);
   cmd "/key" "Store an API key (input hidden, file 0600)"
     ~group:"Model and Provider" ~args:"<provider>"
     ~complete:(fun a -> if last_is_first a then key_provider_names () else []);
@@ -123,7 +131,7 @@ let all : t list = [
   cmd "/plugins" "List composed plugins; enable or disable one by id"
     ~group:"Session" ~args:"[enable|disable <id>]"
     ~complete:(fun a -> if last_is_first a then ["enable"; "disable"] else []);
-  cmd "/config" "Show or edit settings, saved to the config file"
+  cmd "/config" "Browse and edit settings (Enter changes one)"
     ~group:"Session" ~args:"[keys|set|unset|get|edit]"
     ~complete:complete_config
     ~example:"/config set permissions ask   (/config keys lists them all)";

@@ -1209,6 +1209,42 @@ let%test_unit "config_write_preserves_comments" =
     assert (Sys.file_exists (path ^ ".bak"));
     (try Sys.remove (path ^ ".bak") with _ -> ()))
 
+let%test_unit "config_subagent_crud_preserves_comments" =
+  with_tmp_config ~name:"test_cfg_subagents" ~toml_content:annotated_config (fun path ->
+    let read () = In_channel.with_open_bin path In_channel.input_all in
+    let contains needle = Re.execp (Re.compile (Re.str needle)) (read ()) in
+    (* Declaring a worker used to reprint the file from the AST, which
+       deleted every comment in it. *)
+    (match Config.add_subagent
+             [("name", "writer"); ("provider", "ollama"); ("model", "llama3");
+              ("tools", "read_file, grep")] with
+     | Ok _ -> () | Error e -> failwith e);
+    assert (contains "# Caravan configuration");
+    assert (contains "permissions = \"auto\"    # auto | ask | readonly");
+    let names = List.map (fun (c : Config.subagent_config) -> c.name)
+                  (Config.get_subagents ()) in
+    assert (names = ["coder"; "writer"]);
+    (* Array values survive the text round-trip. *)
+    (match List.find_opt (fun (c : Config.subagent_config) -> c.name = "writer")
+             (Config.get_subagents ()) with
+     | Some c -> assert (c.tool_names = ["read_file"; "grep"])
+     | None -> failwith "writer not readable back");
+    (* A duplicate name is refused rather than appended. *)
+    (match Config.add_subagent
+             [("name", "writer"); ("provider", "ollama"); ("model", "x")] with
+     | Error _ -> () | Ok _ -> failwith "duplicate name should be refused");
+    (* Removal takes out one block and leaves the rest of the file alone. *)
+    (match Config.delete_subagent "coder" with
+     | Ok _ -> () | Error e -> failwith e);
+    assert (List.map (fun (c : Config.subagent_config) -> c.name)
+              (Config.get_subagents ()) = ["writer"]);
+    assert (contains "# Caravan configuration");
+    assert (contains "# Keep transcripts for auditing");
+    assert (contains "openai = \"sk-1234\"");
+    (match Config.delete_subagent "nobody" with
+     | Error _ -> () | Ok _ -> failwith "removing a missing worker should fail");
+    (try Sys.remove (path ^ ".bak") with _ -> ()))
+
 let%test_unit "config_set_checked_validation" =
   with_tmp_config ~name:"test_cfg_validate" ~toml_content:"" (fun _ ->
     (* [stored] is what the file should hold afterwards, read back through

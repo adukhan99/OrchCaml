@@ -18,7 +18,7 @@ per phase, so each stays independently reviewable.
 | **0** | Stop the data loss: pure reads, comment-preserving writes | **Done** |
 | **1** | A typed setting schema as the single source of truth | **Done** |
 | **5** | One command registry behind `/help`, the palette, and Tab | **Done** |
-| 2 | A picker primitive (`select` / `form` / `confirm`) in `bin/` | Planned |
+| **2** | A picker primitive (`select` / `form` / `confirm`) in `bin/` | **Done** |
 | 4 | Doctor checks that carry a fix, applied from the picker | Planned |
 | 3 | The input line: multi-line, bracketed paste, no fork per keystroke | Planned |
 
@@ -75,10 +75,11 @@ string, a multi-line array, and the same key present at top level, in
 `[orchestrator]`, and in `[[subagents]]`: the right one changed, and nothing
 else moved.
 
-Structural CRUD (`add_subagent`, `delete_subagent`, the MCP commands) still
-goes through the AST printer and still loses comments. That is the honest
-boundary of this phase; appending a `[[table]]` as text is straightforward,
-deleting one is not.
+Structural CRUD was left on the AST printer at first, and closed in phase 2
+once `/subagents add` made the loss reachable from the REPL:
+`append_table_array` writes a `[[subagents]]` block as text and
+`remove_table_array` deletes one by walking to the next header, both verified
+by re-parsing. The MCP commands still fall back to the AST printer.
 
 ### 2.2 The schema as the spine
 
@@ -133,10 +134,50 @@ suggests the nearest real one, and a *known* command used with arguments it
 does not take answers with its usage line instead of "Unknown command:
 /config".
 
-## 5. For the next phase
+## 5. Phase 2 — the picker
 
-Phase 2's picker should take its value lists straight from
-`Config.setting_kind` — `Enum` is a list to arrow through, `Bool` a toggle,
-`Int` a bounds-checked inline edit — so the settings UI is generated rather
-than written. That is the whole reason the schema carries types rather than
-prose.
+`bin/tty.ml` now holds the raw-mode primitives — keypress decoding, raw mode,
+terminal size — that the line editor used to own privately, and `bin/picker.ml`
+sits on top with `select`, `confirm`, `prompt`, `secret` and `form`. (It is
+`Tty` and not `Term` because `bin/main.ml` opens Cmdliner, whose `Term` would
+shadow it.)
+
+Everything that used to print a numbered table and ask the user to retype a
+number now arrows: `/config` (Enter changes a setting, with its values offered
+from `Config.setting_kind` — an `Enum` is a list, a `Bool` a two-row list, an
+`Int` or free-text setting an inline edit pre-filled with the current value),
+`/models`, `/provider`, `/permissions`, `/key`, `/subagents remove`, and the
+provider and model steps of `caravan init`. `/config show` keeps the old
+session summary. Each falls back to the numbered prompt when stdin is not a
+terminal, so scripts are unaffected.
+
+`/subagents add` and `/subagents remove` are new: the REPL had no way to
+declare a worker, only the web cockpit did. Both drive
+`Config.editable_subagent_fields`, so the two surfaces ask for the same
+fields.
+
+Two fixes fell out of building it:
+
+- `read_secret` read through OCaml's buffered `input_line` while the widgets
+  read stdin byte by byte with `Unix.read`. A buffered channel reading
+  alongside a raw one swallows whatever it read ahead, so a pasted key could
+  eat the keystrokes meant for the next prompt. Secrets now read raw, through
+  the same reader as everything else.
+- `caravan init` overwrote an existing config without asking. It now confirms
+  first, and writes through `Config.write_config_text`, so the old file is
+  recoverable from `config.toml.bak`.
+
+`Tty` caches the terminal size and drops the cache on SIGWINCH and at the
+start of each widget. That was scheduled for phase 3, but the editor's redraw
+called `stty size` — a fork and an exec — on every keystroke, and the function
+moved in this phase anyway.
+
+## 6. For the next phase
+
+Phase 4 turns each doctor check's `hint` into a `fix` the picker can apply.
+Phase 3 is then the last one: the line editor itself.
+
+`bin/` is an executable, so `Commands` and `Picker` are not reachable from the
+test library; their behaviour is covered by driving the built binary through a
+pty. Splitting `bin` into a library plus a thin executable would make them
+testable directly, and is worth doing if that layer grows further.

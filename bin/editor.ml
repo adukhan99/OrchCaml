@@ -17,118 +17,9 @@
 
 open Caravan
 
-(* ── Terminal plumbing ────────────────────────────────────────────────── *)
-
-let term_cols () =
-  (* stty gives the live size; COLUMNS is a fallback; 80 the last resort. *)
-  let from_stty () =
-    try
-      let ic = Unix.open_process_in "stty size 2>/dev/null" in
-      let line = try input_line ic with End_of_file -> "" in
-      ignore (Unix.close_process_in ic);
-      match String.split_on_char ' ' (String.trim line) with
-      | [_; cols] -> int_of_string_opt cols
-      | _ -> None
-    with _ -> None
-  in
-  match from_stty () with
-  | Some c when c > 20 -> c
-  | _ ->
-    (match Sys.getenv_opt "COLUMNS" with
-     | Some c -> (try max 40 (int_of_string c) with _ -> 80)
-     | None -> 80)
-
-let with_raw_mode f =
-  let open Unix in
-  let attr = tcgetattr stdin in
-  let raw = { attr with c_icanon = false; c_echo = false;
-                        c_vmin = 1; c_vtime = 0; c_isig = false } in
-  tcsetattr stdin TCSANOW raw;
-  Fun.protect ~finally:(fun () -> tcsetattr stdin TCSANOW attr) f
-
-let read_byte () =
-  let b = Bytes.create 1 in
-  match Unix.read Unix.stdin b 0 1 with
-  | 0 -> None
-  | _ -> Some (Bytes.get b 0)
-  | exception Unix.Unix_error (Unix.EINTR, _, _) -> None
-
-(** One logical keypress. *)
-type key =
-  | Char of string      (* a UTF-8 character *)
-  | Enter | Backspace | Delete | Tab | Esc
-  | Up | Down | Left | Right | Home | End
-  | Word_left | Word_right
-  | Ctrl of char        (* Ctrl-A … Ctrl-Z by letter *)
-  | Eof
-
-let read_key () =
-  match read_byte () with
-  | None -> Eof
-  | Some c ->
-    let code = Char.code c in
-    if c = '\n' || c = '\r' then Enter
-    else if code = 127 || code = 8 then Backspace
-    else if c = '\t' then Tab
-    else if code = 4 then Eof                    (* Ctrl-D *)
-    else if code = 27 then begin                 (* ESC sequence *)
-      match read_byte () with
-      | None -> Esc
-      | Some ('[' | 'O') ->
-        (* Collect parameter bytes until the final byte (@ … ~). *)
-        let buf = Buffer.create 4 in
-        let rec collect () =
-          match read_byte () with
-          | None -> Esc
-          | Some ch when ch >= '@' && ch <= '~' && ch <> '[' ->
-            let seq = Buffer.contents buf in
-            (match ch, seq with
-             | 'A', _  -> Up
-             | 'B', _  -> Down
-             | 'C', "" -> Right
-             | 'C', _  -> Word_right
-             | 'D', "" -> Left
-             | 'D', _  -> Word_left
-             | 'H', _  -> Home
-             | 'F', _  -> End
-             | '~', ("1" | "7") -> Home
-             | '~', ("4" | "8") -> End
-             | '~', "3" -> Delete
-             | _ -> Esc)  (* unknown sequence: swallow *)
-          | Some ch -> Buffer.add_char buf ch; collect ()
-        in
-        collect ()
-      | Some ('b' | 'B') -> Word_left
-      | Some ('f' | 'F') -> Word_right
-      | Some '\027' ->
-        (match read_byte () with
-         | Some ('[' | 'O') ->
-           (match read_byte () with
-            | Some 'D' -> Word_left
-            | Some 'C' -> Word_right
-            | _ -> Esc)
-         | _ -> Esc)
-      | Some _ -> Esc
-    end
-    else if code < 32 then
-      Ctrl (Char.chr (code + 64))                (* 1 → 'A', 3 → 'C', … *)
-    else begin
-      (* UTF-8: pull continuation bytes so a multi-byte char is one key. *)
-      let extra =
-        if code < 0x80 then 0
-        else if code < 0xE0 then 1
-        else if code < 0xF0 then 2
-        else 3
-      in
-      let buf = Buffer.create 4 in
-      Buffer.add_char buf c;
-      for _ = 1 to extra do
-        match read_byte () with
-        | Some b -> Buffer.add_char buf b
-        | None -> ()
-      done;
-      Char (Buffer.contents buf)
-    end
+(* Keypress decoding, raw mode, and the terminal size live in [Term],
+   shared with the picker. *)
+open Tty
 
 (* ── History ──────────────────────────────────────────────────────────── *)
 
@@ -161,8 +52,7 @@ let append_history line =
        if List.length !history > history_max then
          history := List.filteri (fun i _ -> i < history_max) !history;
        (try
-          let dir = Config.caravan_dir () in
-          if not (Sys.file_exists dir) then Unix.mkdir dir 0o700;
+          Config.mkdir_p (Config.caravan_dir ());
           let oc = open_out_gen [Open_creat; Open_trunc; Open_wronly] 0o600 (history_file ()) in
           List.iter (fun l -> output_string oc l; output_char oc '\n')
             (List.rev !history);
@@ -180,21 +70,6 @@ type state = {
   mutable tab_idx  : int;          (* completion cycling *)
   mutable palette_rows : int;      (* rows drawn below the input last time *)
 }
-
-let string_of_chars cs = String.concat "" cs
-
-let chars_of_string s =
-  let len = String.length s in
-  let rec go i acc =
-    if i >= len then List.rev acc
-    else
-      let c = Char.code s.[i] in
-      let step = if c < 0x80 then 1 else if c < 0xE0 then 2
-                 else if c < 0xF0 then 3 else 4 in
-      let step = min step (len - i) in
-      go (i + step) (String.sub s i step :: acc)
-  in
-  go 0 []
 
 let is_word_char s =
   if String.length s <> 1 then true
@@ -282,7 +157,7 @@ let max_palette = 8
 (** Redraw prompt + input (single row, horizontally scrolled) and the
     palette below; leave the cursor inside the input line. *)
 let render ~prompt st ~commands =
-  let cols = term_cols () in
+  let cols = Tty.cols () in
   let pw = Ui.visible_width prompt in
   (* Horizontal window so prompt + slice + margins fit one row. *)
   let avail = max 8 (cols - pw - 2) in
@@ -335,13 +210,17 @@ let cleanup st =
   print_newline ();
   flush stdout
 
-(** Read one line. Returns [None] on EOF (Ctrl-D on empty line). *)
-let read_line ~prompt ~(commands : Commands.t list) () : string option =
-  if not (Unix.isatty Unix.stdin) then
+(** Read one line. [initial] pre-fills the buffer, with the cursor at its
+    end, so a caller can offer the current value for editing.  Returns
+    [None] on EOF (Ctrl-D on an empty line). *)
+let read_line ?(initial = "") ~prompt ~(commands : Commands.t list) () : string option =
+  if not (Tty.is_tty ()) then
     (try Some (input_line stdin) with End_of_file -> None)
   else begin
     load_history ();
-    let st = { chars = []; cursor = 0; hist_pos = -1; stash = [];
+    Tty.invalidate_size ();
+    let chars = Tty.chars_of_string initial in
+    let st = { chars; cursor = List.length chars; hist_pos = -1; stash = [];
                tab_idx = 0; palette_rows = 0 } in
     let insert s =
       let before = List.filteri (fun i _ -> i < st.cursor) st.chars in
@@ -445,7 +324,7 @@ let read_line ~prompt ~(commands : Commands.t list) () : string option =
               let pick = List.nth many ((st.tab_idx - 1) mod List.length many) in
               set_line (String.trim pick.pr_insert))
          | Esc -> st.tab_idx <- 0
-         | Ctrl _ -> ());
+         | Page_up | Page_down | Ctrl _ -> ());
         if not !finished then render ~prompt st ~commands
       done);
     !result

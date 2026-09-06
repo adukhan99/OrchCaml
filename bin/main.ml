@@ -170,28 +170,8 @@ let print_help_grouped () =
 
 (* ── Interactive input helpers (shared by wizard and slash commands) ──── *)
 
-let read_line_default default =
-  match String.trim (try input_line stdin with End_of_file -> "") with
-  | "" -> default
-  | s -> s
-
-(** Read a secret without echoing it to the terminal. *)
-let read_secret prompt =
-  print_ansi (cyan prompt);
-  flush stdout;
-  let read_plain () = try String.trim (input_line stdin) with End_of_file -> "" in
-  if not is_tty then read_plain ()
-  else begin
-    let open Unix in
-    try
-      let attr = tcgetattr stdin in
-      tcsetattr stdin TCSANOW { attr with c_echo = false };
-      let s = Fun.protect
-          ~finally:(fun () -> tcsetattr stdin TCSANOW attr; print_newline ())
-          read_plain
-      in s
-    with Unix_error _ -> read_plain ()
-  end
+(** Read a secret without echoing it. *)
+let read_secret prompt = Picker.secret prompt
 
 (* ── Slash command helpers ────────────────────────────────────────────── *)
 
@@ -310,6 +290,22 @@ let cmd_nudge st rest =
       confirm "nudge queued — it will be injected before the next model call"
     end
 
+(** Move the live session to [e], resetting the model: model names rarely
+    carry across providers. *)
+let switch_provider st (e : Registry.entry) base_url =
+  st.provider_name <- e.name;
+  st.base_url <- base_url;
+  let model = Registry.default_model e.name in
+  st.model <- model;
+  let provider = resolve_provider_or_exit ~provider_name:e.name ~model ~base_url in
+  st.provider <- provider;
+  Plugin_host.set_provider (Lazy.force host) provider;
+  st.session <- Session.with_provider (Session.with_model st.session model) provider;
+  confirm "Provider → %s (model %s)" e.name model;
+  if e.requires_key && Registry.api_key_for e = None then
+    println_ansi (yellow (Printf.sprintf "  ⚠ No API key for %s yet — /key %s stores one."
+                            e.name e.name))
+
 let cmd_model st rest =
     (match rest with
      | [new_model] ->
@@ -317,24 +313,33 @@ let cmd_model st rest =
        confirm "Model → %s" new_model
      | _ -> usage "/model" "<model-name>")
 
+(** The provider registry as picker rows, with key status as the hint so
+    the choice is informed rather than blind. *)
+let provider_items active =
+  List.map (fun (e : Registry.entry) ->
+    let kind = match e.kind with Registry.Local -> "local" | Registry.Cloud -> "cloud" in
+    let key =
+      if not e.requires_key then "no key needed"
+      else match Registry.api_key_for e with
+        | Some _ -> "key ready"
+        | None -> "needs a key"
+    in
+    Picker.item e.name e
+      ~hint:(Printf.sprintf "%s · %s%s" kind key
+               (if e.name = active then " · current" else ""))
+      ~detail:e.notes) Registry.entries
+
 let cmd_provider st rest =
     (match rest with
+     | [] when Tty.is_tty () ->
+       (match Picker.select ~title:"Switch provider" (provider_items st.provider_name) with
+        | None -> ()
+        | Some (e : Registry.entry) -> switch_provider st e None)
      | name :: rest ->
        (match Registry.find name with
         | None -> println_ansi (red (Registry.unknown_provider_message name))
         | Some e ->
-          let base_url = if rest = [] then None else Some (String.concat "" rest) in
-          st.provider_name <- e.name;
-          st.base_url <- base_url;
-          (* Model likely doesn't carry across providers; reset to default. *)
-          let model = Registry.default_model e.name in
-          st.model <- model;
-          let provider =
-            resolve_provider_or_exit ~provider_name:e.name ~model ~base_url in
-          st.provider <- provider;
-          Plugin_host.set_provider (Lazy.force host) provider;
-          st.session <- Session.with_provider (Session.with_model st.session model) provider;
-          confirm "Provider → %s (model %s)" e.name model)
+          switch_provider st e (if rest = [] then None else Some (String.concat "" rest)))
      | [] -> usage "/provider" "<name> [url]")
 
 let cmd_permissions rest =
@@ -342,6 +347,20 @@ let cmd_permissions rest =
      | [mode] when List.mem mode ["auto"; "ask"; "readonly"] ->
        permission_mode := mode;
        confirm "Permissions → %s" mode
+     | [] when Tty.is_tty () ->
+       let modes = [
+         ("auto",     "run every tool without asking");
+         ("ask",      "confirm before each mutating tool");
+         ("readonly", "refuse mutating tools outright");
+       ] in
+       let items =
+         List.map (fun (m, doc) ->
+           Picker.item m m ~detail:doc
+             ~hint:(if m = !permission_mode then "current" else "")) modes
+       in
+       (match Picker.select ~title:"Tool permissions" ~filter:false items with
+        | None -> ()
+        | Some mode -> permission_mode := mode; confirm "Permissions → %s" mode)
      | [] ->
        println_ansi (Printf.sprintf "  Permission mode: %s" (bold !permission_mode))
      | _ -> usage "/permissions" "auto | ask | readonly")
@@ -423,28 +442,59 @@ let cmd_resume st rest =
 
 let cmd_models net st =
     (try
-      let models = Provider.list_models_packed net st.provider in
-      println_ansi (rule ~title:(Printf.sprintf "Models on %s" st.provider_name) ());
-      List.iteri (fun i m ->
-        let mark = if m = st.model then green " ● " else dim " ○ " in
-        let num = cyan (Printf.sprintf "[%d]" (i + 1)) in
-        println_ansi (Printf.sprintf "  %s%s%s" num mark (white m))
-      ) models;
-      if is_tty then begin
-        println_ansi (dim "\n  Enter a number to switch, or press Enter to cancel:");
-        (try
-          let input = String.trim (input_line stdin) in
-          if input <> "" then
-            match int_of_string_opt input with
-            | Some n when n >= 1 && n <= List.length models ->
-              let new_model = List.nth models (n - 1) in
-              switch_model st new_model;
-              confirm "Switched to %s" new_model
-            | _ -> println_ansi (red "  Invalid selection.")
-        with End_of_file -> ())
-      end
+      match Provider.list_models_packed net st.provider with
+      | [] ->
+        println_ansi (yellow (Printf.sprintf
+          "  %s reported no models." st.provider_name))
+      | models ->
+        let items =
+          List.map (fun m ->
+            Picker.item m m ~hint:(if m = st.model then "current" else "")) models
+        in
+        (match Picker.select
+                 ~title:(Printf.sprintf "Models on %s" st.provider_name) items with
+         | None -> ()
+         | Some m when m = st.model -> confirm "Already on %s" m
+         | Some m -> switch_model st m; confirm "Model → %s" m)
     with exn ->
       println_ansi (red ("  " ^ Caravan_error.humanize exn)))
+
+(** Declare a [[subagents]] worker without opening an editor.  The fields
+    are [Config.editable_subagent_fields] — the same list the web cockpit
+    renders — so both surfaces ask for exactly the same thing. *)
+let cmd_subagent_add () =
+    println_ansi (dim "  New subagent — Enter accepts, Ctrl-D cancels.");
+    match Picker.form Config.editable_subagent_fields with
+    | None -> println_ansi (dim "  Cancelled.")
+    | Some fields ->
+      (match Config.add_subagent fields with
+       | Ok path ->
+         confirm "Subagent '%s' added (saved to %s)"
+           (Option.value ~default:"?" (List.assoc_opt "name" fields)) path;
+         println_ansi (dim "  Restart Caravan to load it into a session.")
+       | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
+
+(** Remove one, chosen from the roster rather than retyped. *)
+let cmd_subagent_remove rest =
+    let pick =
+      match rest with
+      | [name] -> Some name
+      | [] when Tty.is_tty () ->
+        let items =
+          List.map (fun ((cfg : Config.subagent_config), status) ->
+            Picker.item cfg.name cfg.name ~hint:cfg.model ~detail:status)
+            (Subagents.describe ())
+        in
+        if items = [] then (println_ansi (dim "  No subagents configured."); None)
+        else Picker.select ~title:"Remove which subagent?" items
+      | _ -> usage "/subagents" "[add | remove <name>]"; None
+    in
+    (match pick with
+     | None -> ()
+     | Some name ->
+       match Config.delete_subagent name with
+       | Ok path -> confirm "Subagent '%s' removed (saved to %s)" name path
+       | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
 
 let cmd_subagents st =
     let roster = Subagents.describe () in
@@ -486,7 +536,8 @@ let cmd_subagents st =
         println_ansi (dim "  delegate tool is live in this session (governed by /permissions).")
       else
         println_ansi (yellow "  Configured but not loaded in this session — check warnings above/at startup.")
-    end
+    end;
+    println_ansi (dim "  /subagents add  ·  /subagents remove [name]")
 
 let cmd_tools st =
     let tools = Session.tools st.session in
@@ -727,6 +778,86 @@ let cmd_config_keys () =
     println_ansi (dim "\n  /config set <key> <value>  ·  /config unset <key>  ·  /config edit");
     println_ansi (dim "  Dim values are defaults — they are not in the file.  ⚠ env = shadowed.")
 
+(** Change one setting, offering its values as a list where they are a
+    closed set and prompting for a line where they are not.  The picker
+    rows come from the setting's own kind, so nothing here is per-key. *)
+let edit_setting (s : Config.setting) =
+    let key = s.Config.key in
+    let current = config_value_string key in
+    let apply raw =
+      match Config.set_checked key raw with
+      | Ok _ ->
+        confirm "%s = %s" key raw;
+        apply_live_setting key;
+        report_effect key
+      | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e))
+    in
+    let clear () =
+      match Config.unset_checked key with
+      | Ok _ ->
+        confirm "%s cleared — back to the default (%s)" key s.Config.default;
+        apply_live_setting key
+      | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e))
+    in
+    match s.Config.kind with
+    | Config.Enum _ | Config.Bool ->
+      let values =
+        match s.Config.kind with
+        | Config.Enum vs -> vs
+        | _ -> ["true"; "false"]
+      in
+      let items =
+        List.map (fun v ->
+          Picker.item v (`Set v) ~hint:(if current = Some v then "current" else ""))
+          values
+        @ (match current with
+           | None -> []
+           | Some _ ->
+             [Picker.item (Printf.sprintf "clear (use the default: %s)" s.Config.default)
+                `Clear])
+      in
+      (match Picker.select ~title:key ~footer:s.Config.doc ~filter:false items with
+       | None -> ()
+       | Some (`Set v) -> apply v
+       | Some `Clear -> clear ())
+    | Config.Int _ | Config.Float _ | Config.Str ->
+      let label =
+        Printf.sprintf "%s  %s" key (dim (Config.accepts_of_kind s.Config.kind))
+      in
+      (match Picker.prompt ~initial:(Option.value ~default:"" current) label with
+       | None -> ()
+       | Some "" -> if current <> None then clear ()
+       | Some v -> apply v)
+
+(** [/config] with no arguments: the settings, live, with Enter to change
+    one.  Replaces reading a table and retyping it as a [/config set]. *)
+let cmd_config_browse () =
+    let rec loop () =
+      let items =
+        List.map (fun (s : Config.setting) ->
+          let value =
+            match config_value_string s.Config.key with
+            | Some v -> white v
+            | None -> dim (s.Config.default ^ " (default)")
+          in
+          let shadow =
+            match Config.env_shadow s.Config.key with
+            | Some (var, _) -> yellow ("  ⚠ " ^ var)
+            | None -> ""
+          in
+          Picker.item s.Config.key s ~hint:(value ^ shadow)
+            ~detail:(Printf.sprintf "%s · %s · %s"
+                       s.Config.doc
+                       (Config.accepts_of_kind s.Config.kind)
+                       (Config.scope_note s.Config.scope))) Config.settings
+      in
+      match Picker.select ~title:"Settings" items
+              ~footer:"↑↓ move · type to filter · ⏎ change · esc done" with
+      | None -> ()
+      | Some s -> edit_setting s; loop ()
+    in
+    loop ()
+
 (** Open the config in $EDITOR and refuse to keep an edit that no longer
     parses: the previous contents go back and the error is reported.
     Returns whether the file on disk is now valid. *)
@@ -760,20 +891,38 @@ let cmd_config_edit () =
        render_opts := { !render_opts with Render.verbose = Config.get_spinner_verbose () };
        true)
 
+let cmd_key_for name =
+    match Registry.find name with
+    | None -> println_ansi (red (Registry.unknown_provider_message name))
+    | Some e when not e.requires_key ->
+      println_ansi (yellow (Printf.sprintf "  %s is a local provider — no API key needed." e.name))
+    | Some e ->
+      let key = read_secret (Printf.sprintf "  Paste the %s API key (input hidden): " e.name) in
+      if key = "" then println_ansi (yellow "  Nothing entered — key unchanged.")
+      else
+        (match Config.set_api_key e.name key with
+         | Ok path -> confirm "API key for %s stored in %s (0600)" e.name path
+         | Error err -> println_ansi (red (Printf.sprintf "  ✗ %s" err)))
+
 let cmd_key rest =
     (match rest with
+     | [] when Tty.is_tty () ->
+       let items =
+         List.filter_map (fun (e : Registry.entry) ->
+           if not e.requires_key then None
+           else Some (Picker.item e.name e.name
+                        ~hint:(match Registry.api_key_for e with
+                               | Some _ -> "key ready"
+                               | None -> "no key yet")
+                        ~detail:(match e.key_env with
+                                 | Some v -> "env: " ^ v
+                                 | None -> ""))) Registry.entries
+       in
+       (match Picker.select ~title:"Store an API key for" items with
+        | None -> ()
+        | Some name -> cmd_key_for name)
      | [name] ->
-       (match Registry.find name with
-        | None -> println_ansi (red (Registry.unknown_provider_message name))
-        | Some e when not e.requires_key ->
-          println_ansi (yellow (Printf.sprintf "  %s is a local provider — no API key needed." e.name))
-        | Some e ->
-          let key = read_secret (Printf.sprintf "  Paste the %s API key (input hidden): " e.name) in
-          if key = "" then println_ansi (yellow "  Nothing entered — key unchanged.")
-          else
-            (match Config.set_api_key e.name key with
-             | Ok path -> confirm "API key for %s stored in %s (0600)" e.name path
-             | Error err -> println_ansi (red (Printf.sprintf "  ✗ %s" err))))
+       cmd_key_for name
      | _ -> usage "/key" "<provider>   (stores the key under [api_keys], input hidden)")
 
 let cmd_config_show st =
@@ -859,6 +1008,10 @@ let handle_slash_command net clock st line =
   | ["/providers"] ->
     print_providers_table st.provider_name
 
+  | ["/subagents"; "add"] -> cmd_subagent_add ()
+
+  | "/subagents" :: ("remove" | "rm") :: rest -> cmd_subagent_remove rest
+
   | ["/subagents"] -> cmd_subagents st
 
   | ["/tools"] -> cmd_tools st
@@ -879,7 +1032,10 @@ let handle_slash_command net clock st line =
 
   | "/key" :: rest -> cmd_key rest
 
-  | ["/config"] -> cmd_config_show st
+  | ["/config"; "show"] -> cmd_config_show st
+
+  | ["/config"] ->
+    if Tty.is_tty () then cmd_config_browse () else cmd_config_show st
 
   | "/temp"       :: rest -> update_float_opt st "/temp" "Temperature" (fun v o -> { o with temperature = Some v }) 0.0 2.0 rest
   | "/top_p"      :: rest -> update_float_opt st "/top_p" "Top P" (fun v o -> { o with top_p = Some v }) 0.0 1.0 rest
@@ -1283,43 +1439,32 @@ let toml_escape s =
 
 let run_init () =
   print_banner ();
+  let path = Config.config_path () in
+  (* Init writes a fresh file, so an existing one is a decision, not a
+     detail — the previous contents survive as config.toml.bak either way. *)
+  if Sys.file_exists path && String.trim (Config.config_text ()) <> "" then begin
+    println_ansi (yellow (Printf.sprintf "  %s already exists." path));
+    if not (Picker.confirm ~default:false "  Replace it?") then begin
+      println_ansi (dim "  Left alone. Use 'caravan config' to change one setting.");
+      exit 0
+    end
+  end;
   println_ansi (bold "  Let's get you set up.\n");
-  println_ansi (bold (yellow "  Pick a provider:"));
-  List.iteri (fun i (e : Registry.entry) ->
-    let kind = match e.kind with
-      | Registry.Local -> dim "local"
-      | Registry.Cloud -> dim "cloud"
-    in
-    let key_note =
-      if not e.requires_key then ""
-      else match Registry.api_key_for e with
-        | Some _ -> green " (key already available)"
-        | None -> ""
-    in
-    println_ansi (Printf.sprintf "  %s %s %s %s%s"
-      (cyan (Printf.sprintf "[%2d]" (i + 1)))
-      (bold (Printf.sprintf "%-11s" e.name))
-      kind (dim ("— " ^ e.notes)) key_note)
-  ) Registry.entries;
-  print_ansi (cyan "\n  Select [1-12] (default 1 · ollama): ");
-  flush stdout;
   let choice =
-    match int_of_string_opt (read_line_default "1") with
-    | Some n when n >= 1 && n <= List.length Registry.entries ->
-      List.nth Registry.entries (n - 1)
-    | _ -> List.hd Registry.entries
+    match Picker.select ~title:"Pick a provider" (provider_items "") with
+    | Some e -> e
+    | None -> println_ansi (dim "  Cancelled."); exit 0
   in
-  (* Base URL: offer override for local providers. *)
+  (* Base URL: offer an override for local providers. *)
   let base_url =
     match choice.kind with
     | Registry.Local ->
-      print_ansi (cyan (Printf.sprintf "  Endpoint URL (default %s): " choice.base_url));
-      flush stdout;
-      let url = read_line_default choice.base_url in
-      if url = choice.base_url then None else Some url
+      (match Picker.prompt ~initial:choice.base_url "Endpoint URL" with
+       | Some url when url <> "" && url <> choice.base_url -> Some url
+       | _ -> None)
     | Registry.Cloud -> None
   in
-  (* API key: env wins; otherwise offer to store one (0600 config). *)
+  (* API key: the environment wins; otherwise offer to store one (0600). *)
   let api_key_to_store =
     if not choice.requires_key then None
     else match choice.key_env with
@@ -1335,7 +1480,7 @@ let run_init () =
           None
         end else Some key
   in
-  (* Model selection: probe local providers, else registry default. *)
+  (* Model: probe local providers so the list is what is actually installed. *)
   let model =
     match choice.name with
     | "ollama" ->
@@ -1344,50 +1489,40 @@ let run_init () =
         try
           let url = Option.value ~default:choice.base_url base_url in
           let provider = Registry.make_provider ~base_url:url ~model:choice.default_model "ollama" in
-          let models = Provider.list_models_packed env#net provider in
-          if models <> [] then begin
-            println_ansi (green "\n  Connected to Ollama. Local models:");
-            List.iteri (fun i m ->
-              println_ansi (Printf.sprintf "  %s %s"
-                (cyan (Printf.sprintf "[%d]" (i + 1))) (white m))
-            ) models;
-            print_ansi (cyan (Printf.sprintf "  Select model [1-%d] (default 1): " (List.length models)));
-            flush stdout;
-            (match int_of_string_opt (read_line_default "1") with
-             | Some n when n >= 1 && n <= List.length models ->
-               selected := List.nth models (n - 1)
-             | _ -> selected := List.hd models)
-          end
+          match Provider.list_models_packed env#net provider with
+          | [] -> ()
+          | models ->
+            (match Picker.select ~title:"Local Ollama models"
+                     (List.map (fun m -> Picker.item m m) models) with
+             | Some m -> selected := m
+             | None -> ())
         with _ ->
           println_ansi (yellow "\n  ⚠ Could not reach Ollama at its default port.");
           println_ansi (dim "    Install & start it first: https://ollama.com  (ollama serve)"));
       !selected
     | _ ->
-      print_ansi (cyan (Printf.sprintf "  Model (default %s): " choice.default_model));
-      flush stdout;
-      read_line_default choice.default_model
+      (match Picker.prompt ~initial:choice.default_model "Model" with
+       | Some m when m <> "" -> m
+       | _ -> choice.default_model)
   in
-  (* Write config, private to the user. *)
-  let path = Config.config_path () in
-  let config_dir = Filename.dirname path in
-  if not (Sys.file_exists config_dir) then (try Unix.mkdir config_dir 0o700 with _ -> ());
-  let oc = open_out_gen [Open_creat; Open_trunc; Open_wronly] 0o600 path in
-  Printf.fprintf oc "# Generated by 'caravan init' — docs: https://adukhan99.github.io/Caravan/\n";
-  Printf.fprintf oc "provider = \"%s\"\n" (toml_escape choice.name);
-  Printf.fprintf oc "model = \"%s\"\n" (toml_escape model);
-  (match base_url with
-   | Some u -> Printf.fprintf oc "base_url = \"%s\"\n" (toml_escape u)
-   | None -> ());
-  Printf.fprintf oc "stream = true\n";
-  Printf.fprintf oc "transcript = true       # JSONL session logs in ~/.caravan/logs\n";
-  Printf.fprintf oc "permissions = \"auto\"    # auto | ask | readonly\n";
+  (* Write the config, private to the user. *)
+  let buf = Buffer.create 512 in
+  let add fmt = Printf.ksprintf (Buffer.add_string buf) fmt in
+  add "# Generated by 'caravan init' — docs: https://adukhan99.github.io/Caravan/\n";
+  add "# Every setting: caravan config keys\n";
+  add "provider = \"%s\"\n" (toml_escape choice.name);
+  add "model = \"%s\"\n" (toml_escape model);
+  (match base_url with Some u -> add "base_url = \"%s\"\n" (toml_escape u) | None -> ());
+  add "stream = true\n";
+  add "transcript = true       # JSONL session logs in ~/.caravan/logs\n";
+  add "permissions = \"auto\"    # auto | ask | readonly\n";
   (match api_key_to_store with
-   | Some k ->
-     Printf.fprintf oc "\n[api_keys]\n%s = \"%s\"\n" choice.name (toml_escape k)
+   | Some k -> add "\n[api_keys]\n%s = \"%s\"\n" choice.name (toml_escape k)
    | None -> ());
-  close_out oc;
-  (try Unix.chmod path 0o600 with _ -> ());
-  println_ansi (green (Printf.sprintf "\n  ✓ Configuration saved to %s (0600)" path));
+  (match Config.write_config_text (Buffer.contents buf) with
+   | Error e -> println_ansi (red (Printf.sprintf "  ✗ could not write %s: %s" path e)); exit 1
+   | Ok path ->
+     println_ansi (green (Printf.sprintf "\n  ✓ Configuration saved to %s (0600)" path)));
   println_ansi (dim  "    caravan            start chatting");
   println_ansi (dim  "    caravan agent \"…\"  run an autonomous task");
   println_ansi (dim  "    caravan doctor      verify everything works\n")
