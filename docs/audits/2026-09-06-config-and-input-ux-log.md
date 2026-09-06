@@ -238,13 +238,25 @@ back. Tab completes either way.
 The new keys are listed by `/help` and named on the startup line, since
 nothing about `alt+enter` is discoverable otherwise.
 
-## 8. Notes for whoever is next
+## 8. The `cli/` split
 
-`bin/` is an executable, so `Commands`, `Picker` and `Editor` are not reachable
-from the test library; their behaviour is covered by driving the built binary
-through a pty. Splitting `bin` into a library plus a thin executable would make
-them testable directly, and is the obvious next structural move if that layer
-grows further.
+`bin/` was an executable, so `Commands`, `Picker`, `Editor` and `Tty` were not
+reachable from the test library and were covered only by driving the built
+binary through a pty. The front-end is now a library, `Caravan_cli`, in `cli/`,
+and `bin/main.ml` is one line over it:
+
+```ocaml
+let () = Caravan_cli.Cli.main ()
+```
+
+Six new test units came straight out of that, covering things a pty test can
+only observe indirectly: that every command reaches a rendered `/help` group
+(a mistyped group name would silently drop one), that argument completion
+reads settings and providers live, that the palette offers a reminder row Tab
+will not insert, that `Tty.char_width` gives 2 for CJK and emoji where
+`Ui.visible_width` deliberately gives 1, that a multi-line history entry
+round-trips through one line of the file, and that the picker's filter is a
+case-insensitive substring match over label *and* hint.
 
 ## 9. Addendum — the stdio MCP transport
 

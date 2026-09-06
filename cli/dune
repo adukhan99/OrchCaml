@@ -1,0 +1,18 @@
+; The CLI is a library so its modules — the line editor, the picker, the
+; command table — are reachable from the test suite; bin/main.ml is a
+; one-line executable over it.
+(library
+ (name Caravan_cli)
+ (libraries
+  Caravan
+  CaravanProviders
+  CaravanTools
+  eio
+  eio_main
+  cohttp-eio
+  otoml
+  cmdliner
+  re
+  fmt
+  unix
+  yojson))

@@ -1,16 +1,4 @@
 (executable
  (public_name caravan)
  (name main)
- (libraries
-  Caravan
-  CaravanProviders
-  CaravanTools
-  eio
-  eio_main
-  cohttp-eio
-  otoml
-  cmdliner
-  re
-  fmt
-  unix
-  yojson))
+ (libraries Caravan_cli))

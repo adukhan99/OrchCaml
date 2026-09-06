@@ -372,11 +372,12 @@ Library features:
 
 ```mermaid
 flowchart TB
-    Entry["bin/main.ml<br/>(CLI Entry: repl · agent · web)"]
+    Entry["cli/cli.ml<br/>(CLI Entry: repl · agent · web)"]
 
-    subgraph UI_Layer ["Front-ends"]
-        Render["bin/render.ml<br/>(Trace renderer)"]
-        WebUI["bin/web.ml<br/>(localhost web UI)"]
+    subgraph UI_Layer ["Front-ends (cli/)"]
+        Editor["editor.ml · picker.ml<br/>(multi-line input, pickers)"]
+        Render["render.ml<br/>(Trace renderer)"]
+        WebUI["web.ml<br/>(localhost web UI)"]
     end
 
     subgraph Orchestrator ["The Brain (lib/)"]

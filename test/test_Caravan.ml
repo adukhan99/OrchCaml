@@ -1423,6 +1423,153 @@ let%test_unit "config_schema_is_well_formed" =
   assert (Config.suggest_key "max_turn" = Some "max_turns");
   assert (Config.suggest_key "zzzzzzzzzzzz" = None)
 
+(* ── CLI layer: command table, completion, line layout ───────────────── *)
+
+module Commands = Caravan_cli.Commands
+module Editor = Caravan_cli.Editor
+module Tty = Caravan_cli.Tty
+module Picker = Caravan_cli.Picker
+
+let%test_unit "commands_table_is_the_single_source" =
+  (* /help and the palette both render from this list. They used to be two
+     hand-maintained lists, and /help had stopped mentioning /doctor,
+     /init, /web, /stop and the sampling knobs. *)
+  let names = List.map (fun (c : Commands.t) -> c.Commands.name) Commands.all in
+  let has n = List.mem n names in
+  List.iter (fun n -> assert (has n))
+    ["/agent"; "/config"; "/doctor"; "/init"; "/web"; "/stop"; "/quit";
+     "/top_p"; "/top_k"; "/max_tokens"; "/seed"; "/help"];
+  (* No duplicates, and every command is complete enough to render. *)
+  assert (List.length (List.sort_uniq compare names) = List.length names);
+  List.iter (fun (c : Commands.t) ->
+    assert (c.Commands.name <> "" && c.Commands.name.[0] = '/');
+    assert (c.Commands.doc <> "");
+    assert (c.Commands.group <> "")) Commands.all;
+  (* Every command lands in a rendered group: a typo in a group name would
+     otherwise silently drop it from /help. *)
+  let grouped =
+    List.concat_map (fun (_, cs) -> cs) (Commands.grouped ()) in
+  assert (List.length grouped = List.length Commands.all);
+  (* Aliases resolve, and a near miss suggests the real thing. *)
+  assert (Commands.find "/exit" <> None);
+  assert (Commands.find "/summarize" <> None);
+  assert (Commands.find "/nope" = None);
+  assert (Commands.suggest "/confg" = Some "/config");
+  assert (Commands.suggest "/doctr" = Some "/doctor");
+  assert (Commands.suggest "/config" = None);       (* already exact *)
+  assert (Commands.suggest "/zzzzzzzzzz" = None)
+
+let%test_unit "commands_argument_completion" =
+  with_tmp_config ~name:"test_cli_completion"
+    ~toml_content:"provider = \"ollama\"\nmodel = \"qwen3:8b\"\n" (fun _ ->
+    let complete name args =
+      match Commands.find name with
+      | None -> failwith (name ^ " missing from the table")
+      | Some c -> c.Commands.complete args
+    in
+    (* Completions are read live, not hand-listed. *)
+    let config_subcommands = complete "/config" [""] in
+    List.iter (fun sub -> assert (List.mem sub config_subcommands))
+      ["keys"; "set"; "unset"; "get"; "edit"];
+    let keys = complete "/config" ["set"; ""] in
+    assert (List.mem "permissions" keys);
+    assert (List.mem "tool_profile" keys);
+    assert (List.length keys = List.length Config.settings);
+    (* A setting's own kind supplies its values. *)
+    assert (complete "/config" ["set"; "tool_profile"; ""] = ["auto"; "core"; "full"]);
+    assert (complete "/config" ["set"; "stream"; ""] = ["true"; "false"]);
+    assert (complete "/config" ["set"; "model"; ""] = []);   (* free text *)
+    assert (List.mem "auto" (complete "/permissions" [""]));
+    assert (List.mem "ollama" (complete "/provider" [""]));
+    (* A provider that needs no key is not offered for /key. *)
+    let key_targets = complete "/key" [""] in
+    assert (not (List.mem "ollama" key_targets));
+    assert (List.mem "openai" key_targets);
+    (* Commands with nothing to offer offer nothing. *)
+    assert (complete "/history" [""] = []))
+
+let%test_unit "editor_palette_rows" =
+  with_tmp_config ~name:"test_cli_palette" ~toml_content:"" (fun _ ->
+    let labels line =
+      List.map (fun (r : Editor.palette_row) -> r.Editor.pr_label)
+        (Editor.palette_rows Commands.all line)
+    in
+    let inserts line =
+      List.map (fun (r : Editor.palette_row) -> r.Editor.pr_insert)
+        (Editor.palette_rows Commands.all line)
+    in
+    (* Plain text opens no palette. *)
+    assert (labels "" = []);
+    assert (labels "hello there" = []);
+    (* A prefix filters the commands. *)
+    assert (labels "/confi" = ["/config"]);
+    assert (List.mem "/model" (labels "/mod"));
+    assert (List.mem "/models" (labels "/mod"));
+    assert (labels "/zzz" = []);
+    (* Once a command is typed, its own arguments are offered, and Tab
+       writes the whole line rather than just the fragment. *)
+    assert (labels "/config set tool_p" = ["tool_profile"]);
+    assert (inserts "/config set tool_profile a" = ["/config set tool_profile auto "]);
+    (* Nothing to offer leaves a reminder row that Tab will not insert. *)
+    assert (labels "/agent summarize the" = ["/agent"]);
+    assert (inserts "/agent summarize the" = [""]);
+    (* An unknown command has nothing to say, and a multi-line buffer is
+       prose, not a command line. *)
+    assert (labels "/nope arg" = []);
+    assert (labels "/config\nset" = []))
+
+let%test_unit "tty_char_width" =
+  (* Ui.visible_width counts every 3-byte sequence as one column to keep
+     box-drawing aligned in tables; the cursor needs the real answer, and
+     getting it wrong desynchronises the cursor for the rest of the line. *)
+  let check ~ch ~expected = assert (Tty.char_width ch = expected) in
+  check ~ch:"a" ~expected:1;
+  check ~ch:" " ~expected:1;
+  check ~ch:"é" ~expected:1;         (* 2-byte *)
+  check ~ch:"─" ~expected:1;         (* 3-byte box drawing *)
+  check ~ch:"漢" ~expected:2;        (* 3-byte CJK *)
+  check ~ch:"한" ~expected:2;        (* Hangul syllable *)
+  check ~ch:"🐫" ~expected:2;        (* 4-byte emoji *)
+  check ~ch:"" ~expected:0;
+  assert (Tty.text_width "abc" = 3);
+  assert (Tty.text_width "漢字" = 4);
+  assert (Tty.text_width "a漢b" = 4)
+
+let%test_unit "editor_history_round_trip" =
+  (* A pasted block is one history entry, so entries can span lines; the
+     file stays one-entry-per-line and older files still load. *)
+  let check s =
+    assert (Editor.decode_entry (Editor.encode_entry s) = s);
+    assert (not (String.contains (Editor.encode_entry s) '\n'))
+  in
+  check "plain";
+  check "with\nnewlines\nin it";
+  check "a backslash \\ and a \\n that is not one";
+  check "";
+  (* An entry written before multi-line existed decodes to itself. *)
+  assert (Editor.decode_entry "/lisp (+ 1 2)" = "/lisp (+ 1 2)")
+
+let%test_unit "picker_filter" =
+  (* Type-to-filter matches the label or the hint, case-insensitively. *)
+  let items = [
+    Picker.item "ollama" 1 ~hint:"local · no key needed";
+    Picker.item "openai" 2 ~hint:"cloud · needs a key";
+    Picker.item "anthropic" 3 ~hint:"cloud · key ready";
+  ] in
+  let matching q =
+    List.filter_map (fun (it : int Picker.item) ->
+      if Picker.contains_ci ~needle:q it.Picker.label
+         || Picker.contains_ci ~needle:q it.Picker.hint
+      then Some it.Picker.value else None) items
+  in
+  assert (matching "" = [1; 2; 3]);
+  assert (matching "openai" = [2]);
+  assert (matching "OPENAI" = [2]);        (* case-insensitive *)
+  assert (matching "cloud" = [2; 3]);      (* hints match too *)
+  (* Substring, not prefix: "op" is inside "anthr(op)ic" as well. *)
+  assert (matching "op" = [2; 3]);
+  assert (matching "zzz" = [])
+
 (* ── Cli_resolve tests ───────────────────────────────────────────────── *)
 
 (** Stub default_model that mirrors Registry.default_model for the

@@ -48,12 +48,16 @@ Caravan/
 ├── lib/                    # Core library (package: Caravan)
 │   ├── providers/          # Sub-library: CaravanProviders
 │   └── tools/              # Sub-library: CaravanTools
-├── bin/                    # CLI binary entry point
-│   ├── main.ml             # REPL, slash commands, CLI subcommands
-│   ├── editor.ml           # Line-editing engine
+├── cli/                    # Front-end library (package: Caravan_cli)
+│   ├── cli.ml              # REPL, slash commands, CLI subcommands
+│   ├── commands.ml         # The command table: /help, palette, completion
+│   ├── editor.ml           # Multi-line raw-mode line editor
+│   ├── picker.ml           # select / confirm / prompt / form widgets
+│   ├── tty.ml              # Raw mode, keypress decoding, terminal size
 │   ├── render.ml           # Trace renderer sink
 │   ├── subagents.ml        # Subagent composition for the CLI
 │   └── web.ml              # Web cockpit HTTP server
+├── bin/                    # The `caravan` executable (one line over cli/)
 ├── test/                   # ppx_expect + ppx_inline_test test suite
 ├── docs/                   # mdbook documentation
 ├── examples/               # Example configurations and scripts
@@ -72,7 +76,10 @@ Caravan/
 | `Memory`          | `MEMORY` module type, `Ring`, `Summary`, `Hierarchical`, `Noop` backends |
 | `Plugin`          | Spatiotemporal composability runtime (typed keys, services, events, fibers, reconciliation) |
 | `Plugin_host`     | Config-driven plugin composition, MCP mount, builtin-tool fibers |
-| `Config`          | TOML reading/writing, env-var resolution, editable settings    |
+| `Config`          | TOML reading/writing (comment-preserving), env-var resolution, the setting schema |
+| `Doctor`          | Diagnostics as data: each check carries an optional `fix`      |
+| `Commands`        | The one command table behind `/help`, the palette, and Tab     |
+| `Tty` / `Picker`  | Raw-mode primitives; `select` / `confirm` / `prompt` / `form`  |
 | `Effects`         | OCaml 5 algebraic effects for tool execution, permissions, networking |
 | `Trace`           | Structured event stream + JSONL audit sink                     |
 | `Parser`          | Typed output parsers (monadic combinator library)              |
@@ -194,7 +201,7 @@ let sess = Session.set_options sess (fun o -> { o with temperature = Some 0.7 })
 ```
 
 **Never** add mutable fields to `Session.t`.  The REPL state (`repl_state` in
-`bin/main.ml`) is the only mutable session holder — it re-binds `st.session`
+`cli/cli.ml`) is the only mutable session holder — it re-binds `st.session`
 after each turn.
 
 ### 4.3  Result Types for Fallibility

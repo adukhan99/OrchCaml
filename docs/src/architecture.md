@@ -6,10 +6,11 @@ can be swapped or observed without touching the others.
 
 ```mermaid
 flowchart TB
-    Entry["bin/main.ml<br/>(CLI: repl · agent · web)"]
+    Entry["cli/cli.ml<br/>(CLI: repl · agent · web)"]
 
-    subgraph Frontends ["Front-ends (bin/)"]
-        Editor["editor.ml<br/>(raw-mode line editor,<br/>palette, history)"]
+    subgraph Frontends ["Front-ends (cli/)"]
+        Editor["editor.ml · tty.ml<br/>(multi-line editor,<br/>palette, history, paste)"]
+        Picker["picker.ml · commands.ml<br/>(select/form widgets,<br/>the command table)"]
         Render["render.ml<br/>(Trace → terminal)"]
         WebUI["web.ml<br/>(localhost cockpit)"]
         SubW["subagents.ml<br/>(config → delegate tool)"]

@@ -1,0 +1,2009 @@
+(** Caravan's command line: REPL, one-shot agent runs, and utilities. *)
+
+open Caravan
+open Caravan.Types
+open Ui
+open Cmdliner
+
+module Registry = CaravanProviders.Registry
+
+(* ── Tool assembly ────────────────────────────────────────────────────── *)
+
+let strict_mode () =
+  Config.get_int_opt (Some "CARAVAN_STRICT_MODE") "strict_mode"
+  |> Option.value ~default:0
+
+let base_tools () =
+  let base = CaravanTools.All_tools.all_tools in
+  if strict_mode () = 2 then
+    List.filter (fun t -> Tool.name_of_packed t <> "bash") base
+  else base
+
+(* The plugin host owns the live tool composition: built-in tools and
+   MCP mounts run as plugin fibers (config: [[plugins]], defaulting to
+   the classic built-ins + [[mcp.servers]] composition). *)
+let host = lazy (
+  let h = Plugin_host.create ~builtin_tools:base_tools () in
+  Plugin_host.load h;
+  h)
+
+let all_tools () = Plugin_host.tools (Lazy.force host)
+
+(** (Re)compose the plugin set from config. Safe to call repeatedly —
+    reconciliation only touches entries that changed. *)
+let init_plugins () =
+  if Lazy.is_val host then Plugin_host.load (Lazy.force host)
+  else ignore (Lazy.force host)
+
+(* ── Front-end plumbing: renderer, transcript, permissions ────────────── *)
+
+let render_opts = ref Render.{ streaming = true; quiet = false; verbose = false }
+let renderer_installed = ref false
+
+let permission_mode = ref (Config.get_permission_mode ())
+
+(** Install the trace renderer and (if enabled) the JSONL transcript sink.
+    Returns the transcript path when one was opened. *)
+let setup_frontend ?(quiet = false) ?(verbose = false) () =
+  if not !renderer_installed then begin
+    Render.install render_opts;
+    renderer_installed := true
+  end;
+  let is_verbose = verbose || Config.get_spinner_verbose () in
+  render_opts := Render.{ streaming = Config.get_stream (); quiet; verbose = is_verbose };
+  permission_mode := Config.get_permission_mode ();
+  if Config.get_transcript_enabled () then
+    (try Some (Trace.open_transcript ~dir:(Config.log_dir ()))
+     with _ -> None)
+  else None
+
+(** Run [f] under the active tool-permission policy. *)
+let with_permissions f =
+  let is_mutating name =
+    match Tool.find_tool (all_tools ()) name with
+    | Some t -> Tool.is_mutating_packed t
+    | None -> true
+  in
+  let describe_action name args =
+    match Tool.find_tool (all_tools ()) name with
+    | Some t -> Tool.describe_action_packed t args
+    | None -> Printf.sprintf "Use tool '%s'" name
+  in
+  Effects.run_with_effects
+    ~permission_policy:(Permission.policy_of_mode ~is_mutating ~describe_action !permission_mode)
+    f
+
+let on_token token =
+  print_ansi (green token);
+  flush stdout
+
+(* ── Provider resolution ──────────────────────────────────────────────── *)
+
+let resolve_provider ~provider_name ~model ~base_url =
+  Registry.make_provider ?base_url ?model:(Some model) provider_name
+
+(** Fail fast, in plain language, when the provider name is unknown. *)
+let resolve_provider_or_exit ~provider_name ~model ~base_url =
+  try resolve_provider ~provider_name ~model ~base_url
+  with Registry.Unknown_provider msg ->
+    Printf.eprintf "%s\n%!" msg;
+    exit 2
+
+(** Unified resolution of (provider_name, model, base_url) given optional CLI overrides with README claim *)
+let resolve_cli_spec ~provider_cli ~model_cli ~base_url_cli =
+  Cli_resolve.resolve
+    ~default_model:Registry.default_model
+    ~provider_cli ~model_cli ~base_url_cli ()
+
+(** Build a session inside [Eio_main.run]: static + MCP tools, plus the
+    config-declared delegate tool when subagents are enabled.
+
+    The system prompt is layered (System_prompt.compose): the shipped
+    base + capability-conditioned format guidance + environment
+    preamble, with the user's [system] setting appended on top.
+    [system_replace = true] hands the user full control instead.  The
+    preamble is assembled here — once per session — so the request
+    prefix stays byte-stable for prompt caching. *)
+let make_session ~net ~clock ~provider_name ~model ~base_url ~system =
+  let provider = resolve_provider_or_exit ~provider_name ~model ~base_url in
+  Plugin_host.set_provider (Lazy.force host) provider;
+  let tools = Subagents.session_tools ~net ~clock ~host:(Lazy.force host) (all_tools ()) in
+  let capability = Capability.lookup model in
+  (* Tool profile (M1): low-capability models get the core surface —
+     every schema is a per-turn context tax, and small models choose
+     badly among many options. tool_profile = "full" restores all. *)
+  let tools =
+    if Capability.use_core_profile ~profile:(Config.get_tool_profile ()) capability
+    then begin
+      let kept = List.filter
+          (fun t -> List.mem (Tool.name_of_packed t) Capability.core_tool_names)
+          tools in
+      Trace.log "info"
+        "Tool profile 'core' active for %s (%d of %d tools exposed; set tool_profile = \"full\" to override)"
+        model (List.length kept) (List.length tools);
+      kept
+    end else tools
+  in
+  let sess =
+    Session.create ~tools model provider
+    |> (fun s -> Session.set_context_window s (Some capability.Capability.context_window))
+  in
+  let replace =
+    Config.get_bool_opt (Some "CARAVAN_SYSTEM_REPLACE") "system_replace"
+    |> Option.value ~default:false
+  in
+  match System_prompt.compose ~capability ?user_system:system ~replace () with
+  | Some s -> Session.set_system sess s
+  | None -> sess
+
+(* ── REPL state ───────────────────────────────────────────────────────── *)
+
+type repl_state = {
+  mutable session          : Session.t;
+  mutable provider_name    : string;
+  mutable model            : string;
+  mutable provider         : Provider.packed_provider;
+  mutable base_url         : string option;
+  mutable total_tokens_in  : int;
+  mutable total_tokens_out : int;
+  mutable pending_nudge    : string option;
+}
+
+(** [/help], rendered from [Commands] so it can never fall behind the
+    commands the REPL actually accepts. *)
+let print_help_grouped () =
+  List.iter (fun (title, cmds) ->
+    println_ansi (bold (yellow (Printf.sprintf "\n  %s" title)));
+    List.iter (fun (c : Commands.t) ->
+      let label =
+        if c.Commands.args = "" then c.Commands.name
+        else c.Commands.name ^ " " ^ c.Commands.args
+      in
+      println_ansi (Printf.sprintf "    %s  %s"
+        (cyan (pad_visible 30 label)) (dim c.Commands.doc));
+      match c.Commands.example with
+      | Some e -> println_ansi (Printf.sprintf "      %s" (green e))
+      | None -> ()
+    ) cmds
+  ) (Commands.grouped ());
+  println_ansi (bold (yellow "\n  Keys"));
+  List.iter (fun (k, doc) ->
+    println_ansi (Printf.sprintf "    %s  %s" (cyan (pad_visible 30 k)) (dim doc)))
+    [ "alt+enter · ctrl+o",   "insert a line break (enter submits)";
+      "ctrl+r",               "search history; enter runs the match";
+      "tab · ↑↓",             "complete a command or its argument";
+      "ctrl+a/e · ctrl+k/u/w", "start/end of line · kill to end/start/word";
+      "ctrl+c · ctrl+d",      "clear the line · exit on an empty one" ];
+  print_newline ()
+
+(* ── Interactive input helpers (shared by wizard and slash commands) ──── *)
+
+(** Read a secret without echoing it. *)
+let read_secret prompt = Picker.secret prompt
+
+(* ── Slash command helpers ────────────────────────────────────────────── *)
+
+let usage cmd msg = println_ansi (red (Printf.sprintf "Usage: %s %s" cmd msg))
+
+let confirm fmt = Printf.ksprintf (fun s -> println_ansi (yellow ("  ✓ " ^ s))) fmt
+
+let update_float_opt st cmd name setter min_v max_v = function
+  | [v_str] ->
+    (match float_of_string_opt v_str with
+     | Some v when v >= min_v && v <= max_v ->
+       st.session <- Session.set_options st.session (setter v);
+       confirm "%s → %.2f" name v
+     | _ -> usage cmd (Printf.sprintf "<float %.1f-%.1f>" min_v max_v))
+  | _ -> usage cmd (Printf.sprintf "<float %.1f-%.1f>" min_v max_v)
+
+let update_int_opt st cmd name setter = function
+  | [v_str] ->
+    (match int_of_string_opt v_str with
+     | Some v ->
+       st.session <- Session.set_options st.session (setter v);
+       confirm "%s → %d" name v
+     | _ -> usage cmd "<int>")
+  | _ -> usage cmd "<int>"
+
+let switch_model st new_model =
+  st.model <- new_model;
+  let provider =
+    resolve_provider_or_exit ~provider_name:st.provider_name
+      ~model:new_model ~base_url:st.base_url
+  in
+  st.provider <- provider;
+  Plugin_host.set_provider (Lazy.force host) provider;
+  st.session <- Session.with_provider (Session.with_model st.session new_model) provider
+
+let print_providers_table active =
+  println_ansi (rule ~title:"Providers" ());
+  List.iter (fun (e : Registry.entry) ->
+    let mark = if e.name = active then green "●" else dim "○" in
+    let key_status =
+      if not e.requires_key then dim "local · no key needed"
+      else match Registry.api_key_for e with
+        | Some _ -> green "key found"
+        | None ->
+          (match e.key_env with
+           | Some ev -> red (Printf.sprintf "key missing (set %s)" ev)
+           | None -> red "key missing")
+    in
+    println_ansi (Printf.sprintf "  %s %s %s %s"
+      mark
+      (bold (Printf.sprintf "%-11s" e.name))
+      (Printf.sprintf "%-24s" (dim (truncate_visible e.default_model 24)))
+      key_status)
+  ) Registry.entries;
+  println_ansi (dim "\n  Switch with /provider <name>, or see 'caravan providers' for details.")
+
+(* ── Slash command handling ───────────────────────────────────────────── *)
+
+let cmd_agent net clock st rest =
+    let task = String.concat " " rest |> String.trim in
+    if task = "" then usage "/agent" "<task description>"
+    else begin
+      println_ansi (rule ~title:"Agent" ());
+      println_ansi (Printf.sprintf "  %s %s" (dim "task:") (white task));
+      let on_turn current max =
+        let max_str = if max <= 0 then "∞" else string_of_int max in
+        println_ansi (dim (Printf.sprintf "  ── turn %d/%s ──" current max_str))
+      in
+      let on_step step_sess =
+        st.session <- step_sess;
+        ignore (Session.save_checkpoint step_sess)
+      in
+      (try
+        let stream_enabled = Config.get_stream () in
+        let result =
+          with_permissions (fun () ->
+            if stream_enabled then
+              Agent.run_stream ~on_turn ~on_step net clock st.session task ~on_token
+            else
+              Agent.run ~on_turn ~on_step net clock st.session task)
+        in
+        match result with
+        | Ok (new_sess, res) ->
+          st.session <- new_sess;
+          ignore (Session.save_checkpoint new_sess);
+          print_newline ();
+          println_ansi (rule ~title:"Result" ());
+          if String.trim res.value.content <> "" then begin
+            println_ansi (render_markdown (String.trim res.value.content));
+            print_newline ()
+          end;
+          println_ansi (dim ("  " ^ Monitor.format_usage res))
+        | Error e ->
+          ignore (Session.save_checkpoint st.session);
+          Trace.error "repl-agent" "%s" e;
+          println_ansi (red (Printf.sprintf "  ✗ agent: %s" e))
+      with exn ->
+        ignore (Session.save_checkpoint st.session);
+        Trace.error "repl-agent" "%s" (Caravan_error.humanize exn);
+        println_ansi (red (Printf.sprintf "  ✗ %s" (Caravan_error.humanize exn))))
+    end
+
+let cmd_lisp rest =
+    let src = String.concat " " rest |> String.trim in
+    if src = "" then usage "/lisp" "<program>   e.g. /lisp (sum (range 1 101))"
+    else
+      (match Caravan.Lisp.run_to_string src with
+       | Ok out -> println_ansi (green ("  " ^ out))
+       | Error e -> println_ansi (red ("  ✗ " ^ e)))
+
+let cmd_nudge st rest =
+    let text = String.concat " " rest |> String.trim in
+    if text = "" then usage "/nudge" "<steering note>"
+    else begin
+      st.pending_nudge <- Some text;
+      confirm "nudge queued — it will be injected before the next model call"
+    end
+
+(** Move the live session to [e], resetting the model: model names rarely
+    carry across providers. *)
+let switch_provider st (e : Registry.entry) base_url =
+  st.provider_name <- e.name;
+  st.base_url <- base_url;
+  let model = Registry.default_model e.name in
+  st.model <- model;
+  let provider = resolve_provider_or_exit ~provider_name:e.name ~model ~base_url in
+  st.provider <- provider;
+  Plugin_host.set_provider (Lazy.force host) provider;
+  st.session <- Session.with_provider (Session.with_model st.session model) provider;
+  confirm "Provider → %s (model %s)" e.name model;
+  if e.requires_key && Registry.api_key_for e = None then
+    println_ansi (yellow (Printf.sprintf "  ⚠ No API key for %s yet — /key %s stores one."
+                            e.name e.name))
+
+let cmd_model st rest =
+    (match rest with
+     | [new_model] ->
+       switch_model st new_model;
+       confirm "Model → %s" new_model
+     | _ -> usage "/model" "<model-name>")
+
+(** The provider registry as picker rows, with key status as the hint so
+    the choice is informed rather than blind. *)
+let provider_items active =
+  List.map (fun (e : Registry.entry) ->
+    let kind = match e.kind with Registry.Local -> "local" | Registry.Cloud -> "cloud" in
+    let key =
+      if not e.requires_key then "no key needed"
+      else match Registry.api_key_for e with
+        | Some _ -> "key ready"
+        | None -> "needs a key"
+    in
+    Picker.item e.name e
+      ~hint:(Printf.sprintf "%s · %s%s" kind key
+               (if e.name = active then " · current" else ""))
+      ~detail:e.notes) Registry.entries
+
+let cmd_provider st rest =
+    (match rest with
+     | [] when Tty.is_tty () ->
+       (match Picker.select ~title:"Switch provider" (provider_items st.provider_name) with
+        | None -> ()
+        | Some (e : Registry.entry) -> switch_provider st e None)
+     | name :: rest ->
+       (match Registry.find name with
+        | None -> println_ansi (red (Registry.unknown_provider_message name))
+        | Some e ->
+          switch_provider st e (if rest = [] then None else Some (String.concat "" rest)))
+     | [] -> usage "/provider" "<name> [url]")
+
+let cmd_permissions rest =
+    (match rest with
+     | [mode] when List.mem mode ["auto"; "ask"; "readonly"] ->
+       permission_mode := mode;
+       confirm "Permissions → %s" mode
+     | [] when Tty.is_tty () ->
+       let modes = [
+         ("auto",     "run every tool without asking");
+         ("ask",      "confirm before each mutating tool");
+         ("readonly", "refuse mutating tools outright");
+       ] in
+       let items =
+         List.map (fun (m, doc) ->
+           Picker.item m m ~detail:doc
+             ~hint:(if m = !permission_mode then "current" else "")) modes
+       in
+       (match Picker.select ~title:"Tool permissions" ~filter:false items with
+        | None -> ()
+        | Some mode -> permission_mode := mode; confirm "Permissions → %s" mode)
+     | [] ->
+       println_ansi (Printf.sprintf "  Permission mode: %s" (bold !permission_mode))
+     | _ -> usage "/permissions" "auto | ask | readonly")
+
+let cmd_system st rest =
+    let text = String.concat " " rest |> String.trim in
+    st.session <- Session.set_system st.session text;
+    if text = "" then confirm "System prompt cleared"
+    else confirm "System prompt set (%d chars)" (String.length text)
+
+let cmd_memory st rest =
+    (match rest with
+     | [n_str] ->
+       (match int_of_string_opt n_str with
+        | Some n ->
+          st.session <- Session.set_memory_size st.session n;
+          confirm "Memory window → %s" (if n = 0 then "unlimited" else string_of_int n)
+        | None -> usage "/memory" "<n>")
+     | _ -> usage "/memory" "<n>")
+
+let cmd_summarise net clock st =
+    let hist = Session.history st.session in
+    if hist = [] then
+      println_ansi (yellow "  ⚠ Conversation history is empty; nothing to summarize.")
+    else begin
+      (try
+         let (new_sess, summary) = Session.summarise net clock st.session in
+         st.session <- new_sess;
+         confirm "Context compacted";
+         println_ansi (dim (Printf.sprintf "  %s" summary))
+       with exn ->
+         Trace.error "summarize" "%s" (Caravan_error.humanize exn);
+         println_ansi (red (Printf.sprintf "  ✗ summarize: %s" (Caravan_error.humanize exn))))
+    end
+
+let cmd_clear st =
+    st.session <- Session.clear st.session;
+    confirm "History cleared"
+
+let cmd_history st =
+    let hist = Session.history st.session in
+    if hist = [] then println_ansi (dim "  (empty history)")
+    else
+      List.iter (fun msg ->
+        let role_str = role_to_string msg.role in
+        let colour = match msg.role with
+          | System -> yellow | User -> cyan | Assistant -> green | Tool _ -> magenta in
+        println_ansi (Printf.sprintf "%s: %s" (bold (colour role_str)) (dim msg.content))
+      ) hist
+
+let cmd_export st rest =
+    (match rest with
+     | [file] ->
+       (try
+         let oc = open_out file in
+         output_string oc (Yojson.Safe.pretty_to_string (Session.export_json st.session));
+         close_out oc;
+         confirm "Exported to %s" file
+       with exn -> println_ansi (red (Printf.sprintf "  ✗ %s" (Caravan_error.humanize exn))))
+     | [] -> print_endline (Yojson.Safe.pretty_to_string (Session.export_json st.session))
+     | _ -> usage "/export" "[file]")
+
+let cmd_resume st rest =
+    let path = match rest with [] -> None | [file] -> Some file | _ -> None in
+    (match Session.load_checkpoint ~provider:st.provider ~tools:(Session.tools st.session) ?path () with
+     | Ok sess ->
+       let turns = List.length (Session.history sess) in
+       let resume_note =
+         Printf.sprintf
+           "[Caravan system note]: Previous task execution was interrupted. \
+            The conversation history above contains all completed steps and tool outputs up to turn %d. \
+            Please review the previous tool execution history and resume working on the task."
+           (Session.turn_idx sess)
+       in
+       let sess' = Session.add_messages sess [system_msg resume_note] in
+       st.session <- sess';
+       confirm "Resumed session checkpoint (%d messages, turn %d)" turns (Session.turn_idx sess')
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
+
+let cmd_models net st =
+    (try
+      match Provider.list_models_packed net st.provider with
+      | [] ->
+        println_ansi (yellow (Printf.sprintf
+          "  %s reported no models." st.provider_name))
+      | models ->
+        let items =
+          List.map (fun m ->
+            Picker.item m m ~hint:(if m = st.model then "current" else "")) models
+        in
+        (match Picker.select
+                 ~title:(Printf.sprintf "Models on %s" st.provider_name) items with
+         | None -> ()
+         | Some m when m = st.model -> confirm "Already on %s" m
+         | Some m -> switch_model st m; confirm "Model → %s" m)
+    with exn ->
+      println_ansi (red ("  " ^ Caravan_error.humanize exn)))
+
+(** Declare a [[subagents]] worker without opening an editor.  The fields
+    are [Config.editable_subagent_fields] — the same list the web cockpit
+    renders — so both surfaces ask for exactly the same thing. *)
+let cmd_subagent_add () =
+    println_ansi (dim "  New subagent — Enter accepts, Ctrl-D cancels.");
+    match Picker.form Config.editable_subagent_fields with
+    | None -> println_ansi (dim "  Cancelled.")
+    | Some fields ->
+      (match Config.add_subagent fields with
+       | Ok path ->
+         confirm "Subagent '%s' added (saved to %s)"
+           (Option.value ~default:"?" (List.assoc_opt "name" fields)) path;
+         println_ansi (dim "  Restart Caravan to load it into a session.")
+       | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
+
+(** Remove one, chosen from the roster rather than retyped. *)
+let cmd_subagent_remove rest =
+    let pick =
+      match rest with
+      | [name] -> Some name
+      | [] when Tty.is_tty () ->
+        let items =
+          List.map (fun ((cfg : Config.subagent_config), status) ->
+            Picker.item cfg.name cfg.name ~hint:cfg.model ~detail:status)
+            (Subagents.describe ())
+        in
+        if items = [] then (println_ansi (dim "  No subagents configured."); None)
+        else Picker.select ~title:"Remove which subagent?" items
+      | _ -> usage "/subagents" "[add | remove <name>]"; None
+    in
+    (match pick with
+     | None -> ()
+     | Some name ->
+       match Config.delete_subagent name with
+       | Ok path -> confirm "Subagent '%s' removed (saved to %s)" name path
+       | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
+
+let cmd_subagents st =
+    let roster = Subagents.describe () in
+    if roster = [] then begin
+      println_ansi (dim "  No subagents configured.");
+      println_ansi (dim "  Declare [[subagents]] tables in the config to enable the delegate tool —");
+      println_ansi (dim "  see the Subagents chapter of the docs and examples/heterogeneous_agent_swarms/.")
+    end else begin
+      println_ansi (rule ~title:"Subagents" ());
+      let installed =
+        List.exists (fun t -> Tool.name_of_packed t = "delegate") (Session.tools st.session)
+      in
+      List.iter (fun ((cfg : Config.subagent_config), provider_status) ->
+        let health =
+          if String.length provider_status >= 10
+             && (String.sub provider_status 0 10 = "UNRESOLVED") then red "✗"
+          else if Re.execp (Re.compile (Re.str "unset")) provider_status then yellow "⚠"
+          else green "●"
+        in
+        println_ansi (Printf.sprintf "  %s %s %s %s"
+          health
+          (bold (Printf.sprintf "%-14s" cfg.name))
+          (Printf.sprintf "%-28s" (white (truncate_visible cfg.model 28)))
+          (dim provider_status));
+        if cfg.tool_names <> [] then
+          println_ansi (dim (Printf.sprintf "      tools: %s" (String.concat ", " cfg.tool_names)));
+        (match cfg.realm with
+         | Some realm ->
+           let sandbox = Plugin_host.realm_tools (Lazy.force host) ~realm in
+           println_ansi (dim (Printf.sprintf "      realm: %s (%d sandbox tool%s)"
+             realm (List.length sandbox)
+             (if List.length sandbox = 1 then "" else "s")))
+         | None -> ())
+      ) roster;
+      print_newline ();
+      if not (Subagents.enabled ()) then
+        println_ansi (yellow "  Disabled by enable_subagents = false — /config set enable_subagents true")
+      else if installed then
+        println_ansi (dim "  delegate tool is live in this session (governed by /permissions).")
+      else
+        println_ansi (yellow "  Configured but not loaded in this session — check warnings above/at startup.")
+    end;
+    println_ansi (dim "  /subagents add  ·  /subagents remove [name]")
+
+let cmd_tools st =
+    let tools = Session.tools st.session in
+    if tools = [] then println_ansi (yellow "  No tools registered.")
+    else begin
+      println_ansi (rule ~title:"Tools" ());
+      List.iter (fun p ->
+        let name = Tool.name_of_packed p in
+        let mut = if Tool.is_mutating_packed p then yellow "✎" else dim "·" in
+        println_ansi (Printf.sprintf "  %s %s  %s"
+          mut (cyan (Printf.sprintf "%-14s" name))
+          (dim (truncate_visible (Tool.description_of_packed p) 60)))
+      ) tools;
+      println_ansi (dim "\n  ✎ = can modify state (governed by /permissions)")
+    end
+
+let cmd_plugins net clock st rest =
+    let h = Lazy.force host in
+    (match rest with
+     | [] ->
+       let entries = Plugin_host.entries h in
+       if entries = [] then println_ansi (dim "  No plugins composed.")
+       else begin
+         println_ansi (rule ~title:"Plugins" ());
+         List.iter (fun (e : Config.plugin_config) ->
+           let fiber = Plugin_host.fiber h e.id in
+           let state = match fiber with
+             | Some f ->
+               Format.asprintf "%a" Plugin.Fiber.pp_state (Plugin.Fiber.state f)
+             | None -> if e.enabled then "not instantiated" else "disabled"
+           in
+           let mark = match fiber with
+             | Some f when Plugin.Fiber.state f = Plugin.Fiber.Active -> green " ● "
+             | Some f when Plugin.Fiber.state f = Plugin.Fiber.Failed -> red " ✗ "
+             | _ -> dim " ○ "
+           in
+           println_ansi (Printf.sprintf "  %s%s %s"
+             mark (cyan (Printf.sprintf "%-18s" e.id))
+             (dim (Printf.sprintf "(%s · %s)" e.plugin state)));
+           (match Option.bind fiber Plugin.Fiber.error with
+            | Some exn ->
+              println_ansi (red (Printf.sprintf "        %s" (Caravan_error.humanize exn)))
+            | None -> ())
+         ) entries;
+         println_ansi
+           (dim "\n  /plugins enable|disable <id> (session-only) · declared via [[plugins]] in config")
+       end
+     | [action; id] when action = "enable" || action = "disable" ->
+       (match Plugin_host.set_enabled h ~id (action = "enable") with
+        | Ok () ->
+          st.session <-
+            Session.with_tools st.session
+              (Subagents.session_tools ~net ~clock ~host:h (all_tools ()));
+          confirm "plugin '%s' %sd" id action
+        | Error e -> println_ansi (red ("  ✗ " ^ e)))
+     | _ -> usage "/plugins" "[enable|disable <id>]")
+
+let cmd_mcp net clock st rest =
+    let h = Lazy.force host in
+    (match rest with
+     | [] | ["list"] ->
+       let mcp_servers = Config.get_mcp_servers () in
+       if mcp_servers = [] then println_ansi (dim "  No MCP servers configured.")
+       else begin
+         println_ansi (rule ~title:"MCP Servers" ());
+         List.iter (fun (cfg : Config.mcp_server_config) ->
+           let id = "mcp:" ^ cfg.name in
+           let fiber = Plugin_host.fiber h id in
+           let status_mark, status_str = match fiber with
+             | Some f when Plugin.Fiber.state f = Plugin.Fiber.Active -> (green "●", "active")
+             | Some f when Plugin.Fiber.state f = Plugin.Fiber.Failed -> (red "✗", "failed")
+             | _ -> (yellow "○", "inactive")
+           in
+           println_ansi (Printf.sprintf "  %s %s  %s  %s %s (%s)"
+             status_mark
+             (bold (Printf.sprintf "%-14s" cfg.name))
+             (cyan (Printf.sprintf "%-6s" cfg.transport))
+             (white cfg.command)
+             (dim (String.concat " " cfg.args))
+             (dim status_str))
+         ) mcp_servers;
+         println_ansi (dim "\n  /mcp get <name> · /mcp add <name> -- <cmd> · /mcp remove <name>")
+       end
+     | ["get"; name] ->
+       (match Config.get_mcp_server name with
+        | None -> println_ansi (red (Printf.sprintf "  ✗ MCP server '%s' not found." name))
+        | Some cfg ->
+          println_ansi (rule ~title:(Printf.sprintf "MCP Server: %s" cfg.name) ());
+          println_ansi (kv_line "Name" cfg.name);
+          println_ansi (kv_line "Transport" cfg.transport);
+          println_ansi (kv_line "Command" (cfg.command ^ " " ^ String.concat " " cfg.args));
+          let prefix = cfg.name ^ "_" in
+          let mcp_tools = List.filter (fun t ->
+            let n = Tool.name_of_packed t in
+            String.length n > String.length prefix && String.sub n 0 (String.length prefix) = prefix
+          ) (Session.tools st.session) in
+          println_ansi (kv_line "Tools" (string_of_int (List.length mcp_tools)));
+          List.iter (fun t ->
+            println_ansi (Printf.sprintf "    %s  %s"
+              (cyan (Tool.name_of_packed t))
+              (dim (truncate_visible (Tool.description_of_packed t) 60)))
+          ) mcp_tools)
+     | "add" :: name :: rest_args ->
+       let no_probe = List.mem "--no-probe" rest_args in
+       let rest_args = List.filter (fun a -> a <> "--no-probe") rest_args in
+       let (command, args) =
+         match rest_args with
+         | "--" :: cmd :: a -> (cmd, a)
+         | cmd :: a -> (cmd, a)
+         | [] -> ("", [])
+       in
+       if command = "" then
+         usage "/mcp add" "<name> [--no-probe] -- <command> [args...]"
+       else begin
+         let save tools =
+           let cfg = { Config.name; transport = "stdio"; command; args } in
+           match Config.add_mcp_server cfg with
+           | Ok path ->
+             Plugin_host.load h;
+             st.session <- Session.with_tools st.session
+                 (Subagents.session_tools ~net ~clock ~host:h (all_tools ()));
+             (match tools with
+              | Some n ->
+                confirm "MCP server '%s' added (%d tools registered, saved to %s)"
+                  name n path
+              | None -> confirm "MCP server '%s' added unchecked (saved to %s)" name path)
+           | Error e -> println_ansi (red ("  ✗ " ^ e))
+         in
+         if no_probe then save None
+         else begin
+           println_ansi (dim (Printf.sprintf
+             "  Probing MCP server '%s' (up to %gs)…" name Mcp.default_probe_timeout));
+           match Mcp.probe_server name command args with
+           | Error err -> println_ansi (red (Printf.sprintf "  ✗ Probe failed: %s" err))
+           | Ok (client, tools) ->
+             (try client.close () with _ -> ());
+             save (Some (List.length tools))
+         end
+       end
+     | ["remove"; name] | ["rm"; name] ->
+       (match Config.delete_mcp_server name with
+        | Ok path ->
+          Plugin_host.load h;
+          st.session <- Session.with_tools st.session (Subagents.session_tools ~net ~clock ~host:h (all_tools ()));
+          confirm "MCP server '%s' removed (saved to %s)" name path
+        | Error e -> println_ansi (red ("  ✗ " ^ e)))
+     | _ ->
+       usage "/mcp"
+         "[list | get <name> | add <name> [--no-probe] -- <cmd> [args...] | remove <name>]")
+
+(** The value a key currently resolves to in the config file, as text. *)
+let config_value_string key =
+  match Config.get_string key with
+  | Some v -> Some v
+  | None ->
+    match Config.get_int key with
+    | Some i -> Some (string_of_int i)
+    | None ->
+      match Config.get_bool key with
+      | Some b -> Some (string_of_bool b)
+      | None -> Option.map (Printf.sprintf "%g") (Config.get_float key)
+
+(* Settings the running REPL can adopt without being restarted. *)
+let apply_live_setting key =
+  match key with
+  | "permissions" -> permission_mode := Config.get_permission_mode ()
+  | "verbose" | "spinner.verbose" ->
+    render_opts := { !render_opts with Render.verbose = Config.get_spinner_verbose () }
+  | _ -> ()
+
+(** Say when a change takes effect, and warn when the environment is
+    quietly overriding the file — the usual reason a saved setting
+    appears to do nothing at all. *)
+let report_effect key =
+  (match Config.find_setting key with
+   | Some { Config.scope = Config.Live; _ } | None -> ()
+   | Some { Config.scope = Config.New_session; _ } ->
+     println_ansi (dim "  Applies to new sessions — /provider and /model switch live.")
+   | Some { Config.scope = Config.Restart; _ } ->
+     println_ansi (dim "  Applies the next time Caravan starts."));
+  match Config.env_shadow key with
+  | Some (var, v) ->
+    println_ansi (yellow (Printf.sprintf
+      "  ⚠ %s=%s is set in your environment and overrides the config file." var v))
+  | None -> ()
+
+(** Report anything in the file the schema disagrees with. *)
+let report_config_problems () =
+  List.iter (fun k ->
+    println_ansi (yellow (Printf.sprintf "  ⚠ unknown setting '%s' in the config file%s" k
+      (match Config.suggest_key k with
+       | Some s -> Printf.sprintf " — did you mean '%s'?" s
+       | None -> ""))))
+    (Config.unknown_keys ());
+  List.iter (fun (k, why) ->
+    println_ansi (yellow (Printf.sprintf "  ⚠ %s %s" k why)))
+    (Config.mistyped_keys ())
+
+let cmd_config_set _st key rest =
+    let value = String.concat " " rest in
+    (match Config.set_checked key value with
+     | Ok path ->
+       confirm "%s = %s  (saved to %s)" key value path;
+       apply_live_setting key;
+       report_effect key
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
+
+let cmd_config_unset key =
+    (match Config.unset_checked key with
+     | Ok path ->
+       let back =
+         match Config.find_setting key with
+         | Some s -> Printf.sprintf " — back to the default (%s)" s.Config.default
+         | None -> ""
+       in
+       confirm "%s cleared%s  (saved to %s)" key back path;
+       apply_live_setting key
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
+
+let cmd_config_get key =
+    match config_value_string key with
+    | Some v ->
+      println_ansi (kv_line key (white v));
+      (match Config.env_shadow key with
+       | Some (var, ev) ->
+         println_ansi (yellow (Printf.sprintf
+           "  ⚠ overridden by %s=%s in your environment." var ev))
+       | None -> ())
+    | None ->
+      match Config.find_setting key with
+      | Some s ->
+        println_ansi (kv_line key (dim (Printf.sprintf "%s (default)" s.Config.default)))
+      | None -> println_ansi (yellow (Printf.sprintf "  '%s' is not set" key))
+
+(** Every editable setting, its current value, and what it accepts —
+    rendered straight from [Config.settings]. *)
+let cmd_config_keys () =
+    println_ansi (rule ~title:"Settings" ());
+    List.iter (fun (s : Config.setting) ->
+      let value =
+        match config_value_string s.Config.key with
+        | Some v -> white v
+        | None   -> dim s.Config.default
+      in
+      println_ansi (Printf.sprintf "  %s %s %s%s"
+        (pad_visible 28 (cyan s.Config.key))
+        (pad_visible 22 value)
+        (dim s.Config.doc)
+        (if Config.env_shadow s.Config.key <> None then yellow "  ⚠ env" else ""));
+      println_ansi (Printf.sprintf "  %s%s"
+        (String.make 28 ' ')
+        (dim (Config.accepts_of_kind s.Config.kind ^ "  ·  "
+              ^ Config.scope_note s.Config.scope)))
+    ) Config.settings;
+    println_ansi (dim "\n  /config set <key> <value>  ·  /config unset <key>  ·  /config edit");
+    println_ansi (dim "  Dim values are defaults — they are not in the file.  ⚠ env = shadowed.")
+
+(** Change one setting, offering its values as a list where they are a
+    closed set and prompting for a line where they are not.  The picker
+    rows come from the setting's own kind, so nothing here is per-key. *)
+let edit_setting (s : Config.setting) =
+    let key = s.Config.key in
+    let current = config_value_string key in
+    let apply raw =
+      match Config.set_checked key raw with
+      | Ok _ ->
+        confirm "%s = %s" key raw;
+        apply_live_setting key;
+        report_effect key
+      | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e))
+    in
+    let clear () =
+      match Config.unset_checked key with
+      | Ok _ ->
+        confirm "%s cleared — back to the default (%s)" key s.Config.default;
+        apply_live_setting key
+      | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e))
+    in
+    match s.Config.kind with
+    | Config.Enum _ | Config.Bool ->
+      let values =
+        match s.Config.kind with
+        | Config.Enum vs -> vs
+        | _ -> ["true"; "false"]
+      in
+      let items =
+        List.map (fun v ->
+          Picker.item v (`Set v) ~hint:(if current = Some v then "current" else ""))
+          values
+        @ (match current with
+           | None -> []
+           | Some _ ->
+             [Picker.item (Printf.sprintf "clear (use the default: %s)" s.Config.default)
+                `Clear])
+      in
+      (match Picker.select ~title:key ~footer:s.Config.doc ~filter:false items with
+       | None -> ()
+       | Some (`Set v) -> apply v
+       | Some `Clear -> clear ())
+    | Config.Int _ | Config.Float _ | Config.Str ->
+      let label =
+        Printf.sprintf "%s (%s)" key (Config.accepts_of_kind s.Config.kind)
+      in
+      (* Only offer the stored value for editing when it is one the
+         setting would accept — when the stored value is itself the
+         problem, pre-filling it just makes the user delete it first. *)
+      let initial =
+        match current with
+        | Some v when Result.is_ok (Config.validate_value s v) -> v
+        | _ -> ""
+      in
+      (match Picker.prompt ~initial label with
+       | None -> ()
+       | Some "" -> if current <> None then clear ()
+       | Some v -> apply v)
+
+(** [/config] with no arguments: the settings, live, with Enter to change
+    one.  Replaces reading a table and retyping it as a [/config set]. *)
+let cmd_config_browse () =
+    let rec loop () =
+      let items =
+        List.map (fun (s : Config.setting) ->
+          let value =
+            match config_value_string s.Config.key with
+            | Some v -> white v
+            | None -> dim (s.Config.default ^ " (default)")
+          in
+          let shadow =
+            match Config.env_shadow s.Config.key with
+            | Some (var, _) -> yellow ("  ⚠ " ^ var)
+            | None -> ""
+          in
+          Picker.item s.Config.key s ~hint:(value ^ shadow)
+            ~detail:(Printf.sprintf "%s · %s · %s"
+                       s.Config.doc
+                       (Config.accepts_of_kind s.Config.kind)
+                       (Config.scope_note s.Config.scope))) Config.settings
+      in
+      match Picker.select ~title:"Settings" items
+              ~footer:"↑↓ move · type to filter · ⏎ change · esc done" with
+      | None -> ()
+      | Some s -> edit_setting s; loop ()
+    in
+    loop ()
+
+(** Open the config in $EDITOR and refuse to keep an edit that no longer
+    parses: the previous contents go back and the error is reported.
+    Returns whether the file on disk is now valid. *)
+let cmd_config_edit () =
+    let path = Config.config_path () in
+    let editor =
+      match Sys.getenv_opt "VISUAL", Sys.getenv_opt "EDITOR" with
+      | Some e, _ when e <> "" -> e
+      | _, Some e when e <> "" -> e
+      | _ -> "nano"
+    in
+    if not (Sys.file_exists path) then
+      ignore (Config.write_config_text
+                "# Caravan configuration — see `caravan config keys`\n");
+    let before = Config.config_text () in
+    let rc = Sys.command (Printf.sprintf "%s %s" editor (Filename.quote path)) in
+    if rc <> 0 then
+      println_ansi (yellow (Printf.sprintf "  %s exited with status %d" editor rc));
+    Config.reload ();
+    (match Config.parse_check () with
+     | Error e ->
+       println_ansi (red (Printf.sprintf "  ✗ %s no longer parses: %s" path e));
+       (match Config.write_config_text before with
+        | Ok _    -> println_ansi (yellow "  Your previous config has been restored.")
+        | Error e -> println_ansi (red (Printf.sprintf "  ✗ could not restore it: %s" e)));
+       false
+     | Ok () ->
+       confirm "Reloaded %s" path;
+       report_config_problems ();
+       permission_mode := Config.get_permission_mode ();
+       render_opts := { !render_opts with Render.verbose = Config.get_spinner_verbose () };
+       true)
+
+let cmd_key_for name =
+    match Registry.find name with
+    | None -> println_ansi (red (Registry.unknown_provider_message name))
+    | Some e when not e.requires_key ->
+      println_ansi (yellow (Printf.sprintf "  %s is a local provider — no API key needed." e.name))
+    | Some e ->
+      let key = read_secret (Printf.sprintf "  Paste the %s API key (input hidden): " e.name) in
+      if key = "" then println_ansi (yellow "  Nothing entered — key unchanged.")
+      else
+        (match Config.set_api_key e.name key with
+         | Ok path -> confirm "API key for %s stored in %s (0600)" e.name path
+         | Error err -> println_ansi (red (Printf.sprintf "  ✗ %s" err)))
+
+let cmd_key rest =
+    (match rest with
+     | [] when Tty.is_tty () ->
+       let items =
+         List.filter_map (fun (e : Registry.entry) ->
+           if not e.requires_key then None
+           else Some (Picker.item e.name e.name
+                        ~hint:(match Registry.api_key_for e with
+                               | Some _ -> "key ready"
+                               | None -> "no key yet")
+                        ~detail:(match e.key_env with
+                                 | Some v -> "env: " ^ v
+                                 | None -> ""))) Registry.entries
+       in
+       (match Picker.select ~title:"Store an API key for" items with
+        | None -> ()
+        | Some name -> cmd_key_for name)
+     | [name] ->
+       cmd_key_for name
+     | _ -> usage "/key" "<provider>   (stores the key under [api_keys], input hidden)")
+
+let cmd_config_show st =
+    let cfg = Session.config st.session in
+    let opts = cfg.options in
+    println_ansi (rule ~title:"Configuration" ());
+    let p k v = println_ansi (kv_line k (white v)) in
+    p "Provider" st.provider_name;
+    p "Model" st.model;
+    p "URL" (Option.value ~default:"(default)" st.base_url);
+    p "Memory" (string_of_int cfg.memory_size);
+    p "Permissions" !permission_mode;
+    p "System" (match cfg.system with
+      | Some s -> Printf.sprintf "%s…" (truncate_visible s 40)
+      | None -> "(none)");
+    p "Streaming" (string_of_bool (Config.get_stream ()));
+    p "Verbose" (string_of_bool (Config.get_spinner_verbose ()));
+    p "Transcript" (if Config.get_transcript_enabled ()
+                    then Config.log_dir () else "disabled");
+    println_ansi (bold (dim "  Generation options:"));
+    let po n = function
+      | Some v -> println_ansi (kv_line ~key_width:12 ("  " ^ n) (white v))
+      | None -> ()
+    in
+    po "Temp" (Option.map (Printf.sprintf "%.2f") opts.temperature);
+    po "Top P" (Option.map (Printf.sprintf "%.2f") opts.top_p);
+    po "Top K" (Option.map string_of_int opts.top_k);
+    po "Max Tokens" (Option.map string_of_int opts.max_tokens);
+    po "Seed" (Option.map string_of_int opts.seed);
+    if opts.stop <> [] then
+      println_ansi (kv_line ~key_width:12 "  Stop" (white (String.concat ", " opts.stop)))
+
+let cmd_stop st rest =
+    if rest = [] then begin
+      st.session <- Session.set_options st.session (fun o -> { o with stop = [] });
+      confirm "Stop sequences cleared"
+    end else begin
+      st.session <- Session.set_options st.session (fun o -> { o with stop = rest });
+      confirm "Stop sequences → %s" (String.concat ", " rest)
+    end
+
+
+(* ── doctor ───────────────────────────────────────────────────────────── *)
+
+(** Collect the checks.  [net] is threaded through so the REPL can run
+    diagnostics inside its own Eio loop instead of shelling out to a
+    subprocess and losing the live session. *)
+let doctor_checks ?net () =
+  Doctor.run_checks
+    ~find_provider:(fun n ->
+      match Registry.find n with
+      | Some e -> Some Doctor.{
+          name = e.name;
+          kind = (match e.kind with Registry.Local -> Local | Registry.Cloud -> Cloud);
+          base_url = e.base_url;
+          requires_key = e.requires_key;
+          key_env = e.key_env;
+        }
+      | None -> None)
+    ~api_key_for:(fun info ->
+      let e = Option.get (Registry.find info.Doctor.name) in
+      Registry.api_key_for e)
+    ~list_models:(fun info base_url ->
+      let e = Option.get (Registry.find info.Doctor.name) in
+      let model =
+        Config.get_string_opt (Some "CARAVAN_MODEL") "model"
+        |> Option.value ~default:e.default_model
+      in
+      let probe net = Provider.list_models_packed net (Registry.make_provider ?base_url ~model e.name) in
+      match net with
+      | Some net -> probe net
+      | None -> Eio_main.run (fun env -> probe env#net))
+    ~subagents_roster:(Subagents.describe ())
+    ~subagents_enabled:(Subagents.enabled ())
+    ()
+
+let severity_mark = function
+  | Doctor.Pass -> green "  ✓ "
+  | Doctor.Warn -> yellow "  ⚠ "
+  | Doctor.Fail -> red "  ✗ "
+
+let print_check (c : Doctor.check) =
+  let hint =
+    match c.hint with Some h -> dim ("\n      " ^ h) | None -> ""
+  in
+  println_ansi (Printf.sprintf "%s%s: %s%s"
+    (severity_mark c.severity) (bold c.label) c.message hint)
+
+(** Apply one fix.  Returns whether the config changed, so the caller can
+    re-run the checks. *)
+let apply_fix (f : Doctor.fix) =
+  match f with
+  | Doctor.Set_setting (key, value) ->
+    (match Config.set_checked key value with
+     | Ok _ -> confirm "%s = %s" key value; apply_live_setting key; true
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)); false)
+  | Doctor.Edit_setting key ->
+    (match Config.find_setting key with
+     | Some s -> edit_setting s; true
+     | None -> println_ansi (red (Printf.sprintf "  ✗ '%s' is not a setting" key)); false)
+  | Doctor.Remove_key key ->
+    (* Deliberately the unchecked removal: the whole point is that the
+       schema does not recognise this key. *)
+    (match Config.unset_toml_value key with
+     | Ok _ -> confirm "'%s' removed from the config" key; true
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)); false)
+  | Doctor.Store_api_key provider -> cmd_key_for provider; true
+  | Doctor.Fix_permissions (path, mode) ->
+    (try Unix.chmod path mode; confirm "chmod %o %s" mode path; true
+     with e -> println_ansi (red (Printf.sprintf "  ✗ %s" (Printexc.to_string e))); false)
+  | Doctor.Edit_config -> cmd_config_edit ()
+  | Doctor.Run_init ->
+    ignore (Sys.command (Filename.quote Sys.executable_name ^ " init"));
+    Config.reload ();
+    true
+
+let checks_to_json (checks : Doctor.check list) =
+  `Assoc [
+    ("ok", `Bool (List.for_all (fun (c : Doctor.check) -> c.severity <> Doctor.Fail) checks));
+    ("checks", `List (List.map (fun (c : Doctor.check) ->
+       `Assoc [
+         ("label", `String c.label);
+         ("severity", `String (match c.severity with
+            | Doctor.Pass -> "pass" | Doctor.Warn -> "warn" | Doctor.Fail -> "fail"));
+         ("message", `String c.message);
+         ("hint", (match c.hint with Some h -> `String h | None -> `Null));
+         ("fix", (match c.fix with
+            | Some f -> `String (Doctor.describe_fix f)
+            | None -> `Null));
+       ]) checks));
+  ]
+
+(** Run the diagnostics and, on a terminal, offer to fix what can be
+    fixed: arrow to a failing check, press Enter, and the change is
+    applied and the suite re-run. *)
+let rec run_doctor ?net ?(json = false) ?(fix = false) ?(depth = 0) () =
+  let checks = doctor_checks ?net () in
+  if json then begin
+    print_endline (Yojson.Safe.pretty_to_string (checks_to_json checks));
+    if List.exists (fun (c : Doctor.check) -> c.severity = Doctor.Fail) checks
+    then 1 else 0
+  end else begin
+    if depth = 0 then println_ansi (bold (cyan "\n  Caravan system diagnostics\n"));
+    List.iter print_check checks;
+    print_newline ();
+    let failed = List.exists (fun (c : Doctor.check) -> c.severity = Doctor.Fail) checks in
+    let fixable =
+      List.filter (fun (c : Doctor.check) ->
+        c.severity <> Doctor.Pass && c.fix <> None) checks
+    in
+    if fixable = [] then begin
+      if failed then println_ansi (bold (yellow "  Some checks failed — see hints above.\n"))
+      else println_ansi (bold (green "  All diagnostics passed. Caravan is ready.\n"));
+      if failed then 1 else 0
+    end else if fix then begin
+      (* Non-interactive: apply only what needs no input from anyone. *)
+      let applied =
+        List.filter_map (fun (c : Doctor.check) ->
+          match c.fix with
+          | Some f when Doctor.is_automatic f -> if apply_fix f then Some c else None
+          | _ -> None) fixable
+      in
+      if applied = [] then begin
+        println_ansi (yellow "  Nothing could be fixed without input — run 'caravan doctor' to do it interactively.\n");
+        if failed then 1 else 0
+      end else if depth >= 3 then (if failed then 1 else 0)
+      else run_doctor ?net ~fix ~depth:(depth + 1) ()
+    end else if not (Tty.is_tty ()) || depth >= 8 then begin
+      if failed then println_ansi (bold (yellow "  Some checks failed — see hints above.\n"))
+      else println_ansi (bold (yellow "  Some checks need attention — see hints above.\n"));
+      if failed then 1 else 0
+    end else begin
+      let items =
+        List.map (fun (c : Doctor.check) ->
+          let f = Option.get c.fix in
+          Picker.item (Doctor.describe_fix f) (Some f)
+            ~hint:(match c.severity with Doctor.Fail -> "✗" | _ -> "⚠")
+            ~detail:c.message) fixable
+        @ [Picker.item "leave it for now" None]
+      in
+      match Picker.select ~title:"Fix something?" ~filter:false items with
+      | None | Some None ->
+        if failed then println_ansi (bold (yellow "  Some checks failed — see hints above.\n"));
+        if failed then 1 else 0
+      | Some (Some f) ->
+        ignore (apply_fix f);
+        Config.reload ();
+        println_ansi (dim "\n  Re-checking…\n");
+        run_doctor ?net ~depth:(depth + 1) ()
+    end
+  end
+
+let handle_slash_command net clock st line =
+  let parts = String.split_on_char ' ' (String.trim line) |> List.filter (fun s -> s <> "") in
+  match parts with
+  | [] -> ()
+
+  | ["/quit"] | ["/exit"] | ["/q"] ->
+    println_ansi (dim "\nGoodbye.");
+    exit 0
+
+  | ["/help"] | ["/?"] ->
+    print_help_grouped ()
+
+  | "/agent" :: rest -> cmd_agent net clock st rest
+
+  | "/lisp" :: rest -> cmd_lisp rest
+
+  | "/nudge" :: rest -> cmd_nudge st rest
+
+  | "/model" :: rest -> cmd_model st rest
+
+  | "/provider" :: rest -> cmd_provider st rest
+
+  | "/permissions" :: rest -> cmd_permissions rest
+
+  | "/system" :: rest -> cmd_system st rest
+
+  | "/memory" :: rest -> cmd_memory st rest
+
+  | ["/summarise"] | ["/summarize"] -> cmd_summarise net clock st
+
+  | ["/clear"] -> cmd_clear st
+
+  | ["/history"] -> cmd_history st
+
+  | "/export" :: rest -> cmd_export st rest
+
+  | "/resume" :: rest -> cmd_resume st rest
+
+  | ["/models"] -> cmd_models net st
+
+  | ["/providers"] ->
+    print_providers_table st.provider_name
+
+  | ["/subagents"; "add"] -> cmd_subagent_add ()
+
+  | "/subagents" :: ("remove" | "rm") :: rest -> cmd_subagent_remove rest
+
+  | ["/subagents"] -> cmd_subagents st
+
+  | ["/tools"] -> cmd_tools st
+
+  | "/plugins" :: rest -> cmd_plugins net clock st rest
+
+  | "/mcp" :: rest -> cmd_mcp net clock st rest
+
+  | "/config" :: "set" :: key :: rest when rest <> [] -> cmd_config_set st key rest
+
+  | ["/config"; "unset"; key] | ["/config"; "clear"; key] -> cmd_config_unset key
+
+  | ["/config"; "get"; key] -> cmd_config_get key
+
+  | ["/config"; "keys"] | ["/config"; "list"] -> cmd_config_keys ()
+
+  | ["/config"; "edit"] -> ignore (cmd_config_edit ())
+
+  | "/key" :: rest -> cmd_key rest
+
+  | ["/config"; "show"] -> cmd_config_show st
+
+  | ["/config"] ->
+    if Tty.is_tty () then cmd_config_browse () else cmd_config_show st
+
+  | "/temp"       :: rest -> update_float_opt st "/temp" "Temperature" (fun v o -> { o with temperature = Some v }) 0.0 2.0 rest
+  | "/top_p"      :: rest -> update_float_opt st "/top_p" "Top P" (fun v o -> { o with top_p = Some v }) 0.0 1.0 rest
+  | "/top_k"      :: rest -> update_int_opt st "/top_k" "Top K" (fun v o -> { o with top_k = Some v }) rest
+  | "/max_tokens" :: rest -> update_int_opt st "/max_tokens" "Max Tokens" (fun v o -> { o with max_tokens = Some v }) rest
+  | "/seed"       :: rest -> update_int_opt st "/seed" "Seed" (fun v o -> { o with seed = Some v }) rest
+
+  | "/stop" :: rest -> cmd_stop st rest
+
+  (* Pre-run commands, reachable from inside the REPL too — one command
+     surface instead of two.  Doctor runs in-process on the session's own
+     net; init still needs a subprocess, since its Ollama probe opens an
+     Eio loop that must not nest inside ours. *)
+  | ["/doctor"] -> ignore (run_doctor ~net ())
+
+  | ["/init"] ->
+    ignore (Sys.command (Filename.quote Sys.executable_name ^ " init"));
+    Config.reload ();
+    println_ansi (dim "  Config reloaded — /provider or /model to apply changes live.")
+
+  | ["/web"] ->
+    println_ansi (yellow "  The web UI blocks a terminal, so run it in another one:");
+    println_ansi (cyan "    caravan web    ")
+
+  | cmd :: _ ->
+    if String.length cmd > 0 && cmd.[0] = '/' then
+      (match Commands.find cmd with
+       (* A command that exists, used with arguments it does not take:
+          answer with what it does take, not "unknown command". *)
+       | Some c -> usage c.Commands.name c.Commands.args
+       | None ->
+         println_ansi (red (Printf.sprintf "  Unknown command: %s%s" cmd
+           (match Commands.suggest cmd with
+            | Some s -> Printf.sprintf "  (did you mean %s?)" s
+            | None -> "  (try /help)"))))
+    else ()
+
+(* ── REPL loop ────────────────────────────────────────────────────────── *)
+
+(* The command table lives in [Commands]; /help, the palette and Tab all
+   read it, so they cannot drift. *)
+
+let repl net clock st =
+  let status_line () =
+    if is_tty then begin
+      let turns = List.length (Session.history st.session) in
+      let status = render_status_bar
+        ~provider:st.provider_name
+        ~model:st.model
+        ~turns
+        ~tokens_in:st.total_tokens_in
+        ~tokens_out:st.total_tokens_out
+      in
+      println_ansi (Printf.sprintf "\n%s" status)
+    end;
+    flush stdout
+  in
+  let prompt_str = Printf.sprintf "%s " (bold (cyan "❯")) in
+  let rec loop () =
+    status_line ();
+    let line_opt = Editor.read_line ~prompt:prompt_str ~commands:Commands.all () in
+    let line = match line_opt with
+      | Some l -> String.trim l
+      | None -> "/quit"
+    in
+    if line = "" then loop ()
+    else if String.length line > 0 && line.[0] = '/' then begin
+      handle_slash_command net clock st line;
+      loop ()
+    end else begin
+      (* Inject any queued nudge as a system note ahead of the user turn. *)
+      (match st.pending_nudge with
+       | Some n ->
+         st.session <- Session.add_messages st.session
+           [system_msg ("[User steering note]: " ^ n)];
+         st.pending_nudge <- None
+       | None -> ());
+      (try
+        let stream_enabled = Config.get_stream () in
+        let (new_sess, result) =
+          with_permissions (fun () ->
+            if stream_enabled then
+              Session.turn_stream net clock st.session line ~on_token
+            else
+              Session.turn net clock st.session line)
+        in
+        st.session <- new_sess;
+        ignore (Session.save_checkpoint new_sess);
+        (match result.usage with
+         | Some u ->
+           st.total_tokens_in  <- st.total_tokens_in + u.prompt_tokens;
+           st.total_tokens_out <- st.total_tokens_out + u.completion_tokens
+         | None -> ());
+        if not stream_enabled then begin
+          if is_tty then
+            println_ansi (Printf.sprintf "\n%s" (bold (green "Assistant:")));
+          println_ansi (render_markdown result.value.content)
+        end;
+        if is_tty then begin
+          print_newline ();
+          println_ansi (dim ("  " ^ Monitor.format_usage result))
+        end;
+        if not is_tty && stream_enabled then print_newline ()
+      with exn ->
+        ignore (Session.save_checkpoint st.session);
+        if is_tty then print_newline ();
+        Trace.error "repl" "%s" (Caravan_error.humanize exn);
+        println_ansi (red (Printf.sprintf "\n  ✗ %s" (Caravan_error.humanize exn))));
+      loop ()
+    end
+  in
+  loop ()
+
+(* ── CLI arguments ────────────────────────────────────────────────────── *)
+
+let provider_arg =
+  let doc = "Provider to use (defaults to config provider or ollama). See $(b,caravan providers) for the list." in
+  Arg.(value & opt (some string) None & info ["p"; "provider"] ~docv:"PROVIDER" ~doc)
+
+let model_arg =
+  let doc = "Model name (defaults to config model or provider default)." in
+  Arg.(value & opt (some string) None & info ["m"; "model"] ~docv:"MODEL" ~doc)
+
+let base_url_arg =
+  let doc = "Base URL override for the provider API." in
+  Arg.(value & opt (some string) None & info ["base-url"] ~docv:"URL" ~doc)
+
+let system_arg =
+  let doc = "System prompt for the session or completion." in
+  let default = Config.get_string "system" in
+  Arg.(value & opt (some string) default & info ["s"; "system"] ~docv:"PROMPT" ~doc)
+
+let verbose_arg =
+  let doc = "Show verbose tool call details and trace output." in
+  Arg.(value & flag & info ["v"; "verbose"] ~doc)
+
+(* ── repl command ─────────────────────────────────────────────────────── *)
+
+let run_repl model_cli provider_cli base_url_cli system verbose =
+  init_plugins ();
+  let transcript = setup_frontend ~verbose () in
+  let (provider_name, model, base_url) =
+    resolve_cli_spec ~provider_cli ~model_cli ~base_url_cli
+  in
+  if is_tty && Config.is_first_run () then
+    println_ansi (yellow "  First time here? Run 'caravan init' for guided setup.\n");
+  Eio_main.run (fun env ->
+    Effects.with_net env#net @@ fun () ->
+    let provider = resolve_provider_or_exit ~provider_name ~model ~base_url in
+    let sess = make_session ~net:env#net ~clock:env#clock
+        ~provider_name ~model ~base_url ~system in
+    let st = {
+      session          = sess;
+      provider_name;
+      model;
+      provider;
+      base_url;
+      total_tokens_in  = 0;
+      total_tokens_out = 0;
+      pending_nudge    = None;
+    } in
+    print_banner ();
+    if is_tty then begin
+      println_ansi (dim "  Type a message to chat, " ^ cyan "/help" ^
+                    dim " for commands, " ^ cyan "/agent <task>" ^
+                    dim " for autonomy.");
+      println_ansi (dim "  " ^ cyan "alt+enter" ^ dim " for a new line · " ^
+                    cyan "ctrl+r" ^ dim " to search history · paste is one message.");
+      println_ansi (Printf.sprintf "  %s %s %s %s"
+        (dim "Model") (bold (white model)) (dim "on") (bold (white provider_name)));
+      (match transcript with
+       | Some path -> println_ansi (dim (Printf.sprintf "  Transcript: %s" path))
+       | None -> ());
+      print_newline ()
+    end;
+    repl env#net env#clock st
+  )
+
+let repl_cmd =
+  let doc = "Start an interactive chat session (default command)." in
+  let info = Cmd.info "repl" ~doc in
+  Cmd.v info Term.(const run_repl $ model_arg $ provider_arg $ base_url_arg $ system_arg $ verbose_arg)
+
+(* ── agent command (one-shot autonomy) ────────────────────────────────── *)
+
+let run_agent model_cli provider_cli base_url_cli system max_turns quiet json_out verbose task =
+  init_plugins ();
+  let quiet = quiet || json_out in
+  let transcript = setup_frontend ~quiet ~verbose () in
+  let (provider_name, model, base_url) =
+    resolve_cli_spec ~provider_cli ~model_cli ~base_url_cli
+  in
+  let exit_code = ref 0 in
+  Eio_main.run (fun env ->
+    Effects.with_net env#net @@ fun () ->
+    let sess = make_session ~net:env#net ~clock:env#clock
+        ~provider_name ~model ~base_url ~system in
+    let config =
+      let base = Agent.default_config () in
+      { base with Agent.max_turns = Option.value ~default:base.Agent.max_turns max_turns }
+    in
+    let on_turn current max =
+      if not quiet && is_tty then
+        let max_str = if max <= 0 then "∞" else string_of_int max in
+        println_ansi (dim (Printf.sprintf "  ── turn %d/%s ──" current max_str))
+    in
+    let stream_enabled = Config.get_stream () && not quiet && not json_out in
+    let result =
+      with_permissions (fun () ->
+        if stream_enabled then
+          Agent.run_stream ~config ~on_turn env#net env#clock sess task ~on_token
+        else
+          Agent.run ~config ~on_turn env#net env#clock sess task)
+    in
+    let mode = if json_out then Agent_output.Json else Agent_output.Plain in
+    match result with
+    | Ok (_sess, res) ->
+      if json_out then
+        print_endline (Agent_output.format_success ~mode ~result:res ~transcript)
+      else begin
+        if not stream_enabled then begin
+          print_newline ();
+          println_ansi (render_markdown (Agent_output.format_success ~mode ~result:res ~transcript))
+        end else print_newline ();
+        if not quiet && is_tty then
+          println_ansi (dim ("  " ^ Monitor.format_usage res))
+      end
+    | Error e ->
+      exit_code := 1;
+      Trace.error "agent" "%s" e;
+      let msg = Agent_output.format_error ~mode ~message:e ~transcript in
+      if json_out then
+        print_endline msg
+      else
+        Printf.eprintf "%s\n%!" msg
+  );
+  exit !exit_code
+
+let agent_cmd =
+  let task_arg =
+    let doc = "The task for the agent to accomplish." in
+    Arg.(required & pos 0 (some string) None & info [] ~docv:"TASK" ~doc)
+  in
+  let max_turns_arg =
+    let doc = "Turn budget for this run (overrides config max_turns)." in
+    Arg.(value & opt (some int) None & info ["max-turns"] ~docv:"N" ~doc)
+  in
+  let quiet_arg =
+    let doc = "Suppress progress output; print only the final result." in
+    Arg.(value & flag & info ["q"; "quiet"] ~doc)
+  in
+  let json_arg =
+    let doc = "Emit the outcome as a single JSON object (implies --quiet)." in
+    Arg.(value & flag & info ["json"] ~doc)
+  in
+  let doc = "Run an autonomous agent on a task and exit (scripting-friendly)." in
+  let man = [
+    `S Manpage.s_description;
+    `P "Runs the full agentic loop (tools, turn budget, nudges) without \
+        the interactive REPL. Exit status is 0 on completion, 1 when the \
+        agent fails or exhausts its turn budget.";
+    `P "Combine with $(b,--json) in pipelines: the result, token usage and \
+        transcript path arrive as one JSON object on stdout.";
+  ] in
+  let info = Cmd.info "agent" ~doc ~man in
+  Cmd.v info Term.(const run_agent $ model_arg $ provider_arg $ base_url_arg
+                   $ system_arg $ max_turns_arg $ quiet_arg $ json_arg $ verbose_arg $ task_arg)
+
+(* Alias: caravan run "<task>" *)
+let run_cmd =
+  let task_arg =
+    let doc = "The task for the agent to accomplish." in
+    Arg.(required & pos 0 (some string) None & info [] ~docv:"TASK" ~doc)
+  in
+  let max_turns_arg =
+    Arg.(value & opt (some int) None & info ["max-turns"] ~docv:"N"
+           ~doc:"Turn budget for this run.")
+  in
+  let quiet_arg = Arg.(value & flag & info ["q"; "quiet"] ~doc:"Suppress progress output.") in
+  let json_arg = Arg.(value & flag & info ["json"] ~doc:"Emit JSON outcome.") in
+  let info = Cmd.info "run" ~doc:"Alias of $(b,caravan agent)." in
+  Cmd.v info Term.(const run_agent $ model_arg $ provider_arg $ base_url_arg
+                   $ system_arg $ max_turns_arg $ quiet_arg $ json_arg $ verbose_arg $ task_arg)
+
+(* ── complete command ─────────────────────────────────────────────────── *)
+
+let run_complete model_cli provider_cli base_url_cli system verbose prompt_text =
+  init_plugins ();
+  let _transcript = setup_frontend ~verbose () in
+  let (provider_name, model, base_url) =
+    resolve_cli_spec ~provider_cli ~model_cli ~base_url_cli
+  in
+  Eio_main.run (fun env ->
+    Effects.with_net env#net @@ fun () ->
+    let sess = make_session ~net:env#net ~clock:env#clock
+        ~provider_name ~model ~base_url ~system in
+    (try
+      let stream_enabled = Config.get_stream () in
+      let (_sess, result) =
+        with_permissions (fun () ->
+          if stream_enabled then
+            Session.turn_stream env#net env#clock sess prompt_text ~on_token
+          else
+            Session.turn env#net env#clock sess prompt_text)
+      in
+      if not stream_enabled then
+        print_ansi (green result.value.content);
+      print_newline ();
+      if is_tty then println_ansi (dim ("  " ^ Monitor.format_usage result))
+    with exn ->
+      Trace.error "complete" "%s" (Caravan_error.humanize exn);
+      Printf.eprintf "[Caravan] Error: %s\n%!" (Caravan_error.humanize exn);
+      exit 1)
+  )
+
+let complete_cmd =
+  let prompt_arg =
+    let doc = "The prompt text to send." in
+    Arg.(required & pos 0 (some string) None & info [] ~docv:"PROMPT" ~doc)
+  in
+  let doc = "Send a single prompt and print the response." in
+  let info = Cmd.info "complete" ~doc in
+  Cmd.v info Term.(const run_complete $ model_arg $ provider_arg $ base_url_arg
+                   $ system_arg $ verbose_arg $ prompt_arg)
+
+(* ── models command ───────────────────────────────────────────────────── *)
+
+let run_models model_cli provider_cli base_url_cli =
+  let (provider_name, model, base_url) =
+    resolve_cli_spec ~provider_cli ~model_cli ~base_url_cli
+  in
+  Eio_main.run (fun env ->
+    let provider = resolve_provider_or_exit ~provider_name ~model ~base_url in
+    (try
+      let models = Provider.list_models_packed env#net provider in
+      List.iter (fun m ->
+        print_endline (if m = model then "* " ^ m else "  " ^ m)
+      ) models
+    with exn ->
+      Printf.eprintf "[Caravan] Error: %s\n%!" (Caravan_error.humanize exn);
+      exit 1)
+  )
+
+let models_cmd =
+  let doc = "List models available on the chosen provider." in
+  let info = Cmd.info "models" ~doc in
+  Cmd.v info Term.(const run_models $ model_arg $ provider_arg $ base_url_arg)
+
+(* ── providers command ────────────────────────────────────────────────── *)
+
+let run_providers ladder =
+  if ladder then begin
+    println_ansi (bold "  Model ladder — a default for every weight class:\n");
+    List.iter (fun (cls, prov, model, note) ->
+      println_ansi (Printf.sprintf "  %s %s %s"
+        (yellow (Printf.sprintf "%-13s" cls))
+        (Printf.sprintf "%-36s" (cyan (Printf.sprintf "%s/%s" prov model)))
+        (dim note))
+    ) Registry.model_ladder;
+    println_ansi (dim "\n  Try one: caravan -p <provider> -m <model>")
+  end else begin
+    println_ansi (bold "  Supported providers:\n");
+    List.iter (fun (e : Registry.entry) ->
+      let key_status =
+        if not e.requires_key then green "ready (local)"
+        else match Registry.api_key_for e with
+          | Some _ -> green "key found"
+          | None ->
+            (match e.key_env with
+             | Some ev -> yellow (Printf.sprintf "set %s" ev)
+             | None -> yellow "key missing")
+      in
+      println_ansi (Printf.sprintf "  %s %s %s"
+        (bold (Printf.sprintf "%-11s" e.name))
+        (Printf.sprintf "%-22s" key_status)
+        (dim e.notes));
+      println_ansi (Printf.sprintf "    %s %s  %s %s"
+        (dim "url:") (dim e.base_url)
+        (dim "default:") (dim e.default_model))
+    ) Registry.entries;
+    println_ansi (dim "\n  caravan providers --ladder  shows a curated model per weight class.")
+  end
+
+let providers_cmd =
+  let ladder_arg =
+    let doc = "Show a curated model ladder from ~1B local weights to frontier." in
+    Arg.(value & flag & info ["ladder"] ~doc)
+  in
+  let doc = "List supported providers, their endpoints, and key status." in
+  let info = Cmd.info "providers" ~doc in
+  Cmd.v info Term.(const run_providers $ ladder_arg)
+
+(* ── init command (setup wizard) ──────────────────────────────────────── *)
+
+let toml_escape s =
+  let buf = Buffer.create (String.length s) in
+  String.iter (function
+    | '"' -> Buffer.add_string buf "\\\""
+    | '\\' -> Buffer.add_string buf "\\\\"
+    | '\n' -> Buffer.add_string buf "\\n"
+    | c -> Buffer.add_char buf c) s;
+  Buffer.contents buf
+
+let run_init () =
+  print_banner ();
+  let path = Config.config_path () in
+  (* Init writes a fresh file, so an existing one is a decision, not a
+     detail — the previous contents survive as config.toml.bak either way. *)
+  if Sys.file_exists path && String.trim (Config.config_text ()) <> "" then begin
+    println_ansi (yellow (Printf.sprintf "  %s already exists." path));
+    if not (Picker.confirm ~default:false "  Replace it?") then begin
+      println_ansi (dim "  Left alone. Use 'caravan config' to change one setting.");
+      exit 0
+    end
+  end;
+  println_ansi (bold "  Let's get you set up.\n");
+  let choice =
+    match Picker.select ~title:"Pick a provider" (provider_items "") with
+    | Some e -> e
+    | None -> println_ansi (dim "  Cancelled."); exit 0
+  in
+  (* Base URL: offer an override for local providers. *)
+  let base_url =
+    match choice.kind with
+    | Registry.Local ->
+      (match Picker.prompt ~initial:choice.base_url "Endpoint URL" with
+       | Some url when url <> "" && url <> choice.base_url -> Some url
+       | _ -> None)
+    | Registry.Cloud -> None
+  in
+  (* API key: the environment wins; otherwise offer to store one (0600). *)
+  let api_key_to_store =
+    if not choice.requires_key then None
+    else match choice.key_env with
+      | Some ev when Sys.getenv_opt ev <> None && Sys.getenv_opt ev <> Some "" ->
+        println_ansi (green (Printf.sprintf "  ✓ Using %s from your environment (not stored)." ev));
+        None
+      | _ ->
+        let key = read_secret (Printf.sprintf "  Paste your %s API key (input hidden): " choice.name) in
+        if key = "" then begin
+          println_ansi (yellow (Printf.sprintf
+            "  ⚠ No key entered. Set %s before using this provider."
+            (Option.value ~default:"the provider's API key" choice.key_env)));
+          None
+        end else Some key
+  in
+  (* Model: probe local providers so the list is what is actually installed. *)
+  let model =
+    match choice.name with
+    | "ollama" ->
+      let selected = ref choice.default_model in
+      Eio_main.run (fun env ->
+        try
+          let url = Option.value ~default:choice.base_url base_url in
+          let provider = Registry.make_provider ~base_url:url ~model:choice.default_model "ollama" in
+          match Provider.list_models_packed env#net provider with
+          | [] -> ()
+          | models ->
+            (match Picker.select ~title:"Local Ollama models"
+                     (List.map (fun m -> Picker.item m m) models) with
+             | Some m -> selected := m
+             | None -> ())
+        with _ ->
+          println_ansi (yellow "\n  ⚠ Could not reach Ollama at its default port.");
+          println_ansi (dim "    Install & start it first: https://ollama.com  (ollama serve)"));
+      !selected
+    | _ ->
+      (match Picker.prompt ~initial:choice.default_model "Model" with
+       | Some m when m <> "" -> m
+       | _ -> choice.default_model)
+  in
+  (* Write the config, private to the user. *)
+  let buf = Buffer.create 512 in
+  let add fmt = Printf.ksprintf (Buffer.add_string buf) fmt in
+  add "# Generated by 'caravan init' — docs: https://adukhan99.github.io/Caravan/\n";
+  add "# Every setting: caravan config keys\n";
+  add "provider = \"%s\"\n" (toml_escape choice.name);
+  add "model = \"%s\"\n" (toml_escape model);
+  (match base_url with Some u -> add "base_url = \"%s\"\n" (toml_escape u) | None -> ());
+  add "stream = true\n";
+  add "transcript = true       # JSONL session logs in ~/.caravan/logs\n";
+  add "permissions = \"auto\"    # auto | ask | readonly\n";
+  (match api_key_to_store with
+   | Some k -> add "\n[api_keys]\n%s = \"%s\"\n" choice.name (toml_escape k)
+   | None -> ());
+  (match Config.write_config_text (Buffer.contents buf) with
+   | Error e -> println_ansi (red (Printf.sprintf "  ✗ could not write %s: %s" path e)); exit 1
+   | Ok path ->
+     println_ansi (green (Printf.sprintf "\n  ✓ Configuration saved to %s (0600)" path)));
+  println_ansi (dim  "    caravan            start chatting");
+  println_ansi (dim  "    caravan agent \"…\"  run an autonomous task");
+  println_ansi (dim  "    caravan doctor      verify everything works\n")
+
+let init_cmd =
+  let doc = "Interactive first-run setup wizard." in
+  let info = Cmd.info "init" ~doc in
+  Cmd.v info Term.(const run_init $ const ())
+
+let doctor_cmd =
+  let json_arg =
+    let doc = "Emit the checks as one JSON object instead of a report." in
+    Arg.(value & flag & info ["json"] ~doc)
+  in
+  let fix_arg =
+    let doc = "Apply every fix that needs no input, then re-check." in
+    Arg.(value & flag & info ["fix"] ~doc)
+  in
+  let doc = "Run system and configuration diagnostics." in
+  let man = [
+    `S Manpage.s_description;
+    `P "Reports on the config file, the provider and its key, the transcript \
+        directory, subagents, and MCP servers. On a terminal it then offers to \
+        fix what it can: pick a failing check and the change is applied and the \
+        suite re-run.";
+    `P "Exits non-zero when any check fails, so it can gate a script.";
+  ] in
+  let info = Cmd.info "doctor" ~doc ~man in
+  let run json fix = exit (run_doctor ~json ~fix ()) in
+  Cmd.v info Term.(const run $ json_arg $ fix_arg)
+
+(* ── config command ───────────────────────────────────────────────────── *)
+
+let run_config args =
+  let path = Config.config_path () in
+  match args with
+  | [] | ["show"] ->
+    if Sys.file_exists path then begin
+      println_ansi (dim (Printf.sprintf "# %s" path));
+      let ic = open_in path in
+      (try
+         while true do print_endline (input_line ic) done
+       with End_of_file -> close_in ic);
+      report_config_problems ()
+    end else
+      println_ansi (yellow (Printf.sprintf "No config file at %s (run 'caravan init')" path))
+  | ["path"] -> print_endline path
+  | ["get"; key] ->
+    (match config_value_string key with
+     | Some v -> print_endline v
+     | None ->
+       match Config.find_setting key with
+       | Some s -> print_endline s.Config.default
+       | None -> Printf.eprintf "Key '%s' not set.\n%!" key; exit 1)
+  | "set" :: key :: (_ :: _ as rest) ->
+    let value = String.concat " " rest in
+    (match Config.set_checked key value with
+     | Ok _ ->
+       println_ansi (green (Printf.sprintf "✓ %s = %s" key value));
+       (match Config.env_shadow key with
+        | Some (var, v) ->
+          println_ansi (yellow (Printf.sprintf
+            "⚠ %s=%s is set in your environment and overrides the config file." var v))
+        | None -> ())
+     | Error e -> Printf.eprintf "Error: %s\n%!" e; exit 1)
+  | ["unset"; key] ->
+    (match Config.unset_checked key with
+     | Ok _ -> println_ansi (green (Printf.sprintf "✓ %s cleared" key))
+     | Error e -> Printf.eprintf "Error: %s\n%!" e; exit 1)
+  | ["keys"] ->
+    List.iter (fun (s : Config.setting) ->
+      Printf.printf "%-28s %-22s %s\n"
+        s.Config.key
+        (Option.value ~default:s.Config.default (config_value_string s.Config.key))
+        s.Config.doc;
+      Printf.printf "%-28s %s  ·  %s\n" ""
+        (Config.accepts_of_kind s.Config.kind)
+        (Config.scope_note s.Config.scope)
+    ) Config.settings
+  | ["edit"] -> if not (cmd_config_edit ()) then exit 1
+  | ["check"] ->
+    (match Config.parse_check () with
+     | Error e -> Printf.eprintf "%s: %s\n%!" path e; exit 1
+     | Ok () ->
+       let unknown = Config.unknown_keys () and bad = Config.mistyped_keys () in
+       List.iter (fun k ->
+         Printf.eprintf "unknown setting '%s'%s\n" k
+           (match Config.suggest_key k with
+            | Some s -> Printf.sprintf " (did you mean '%s'?)" s
+            | None -> "")) unknown;
+       List.iter (fun (k, why) -> Printf.eprintf "%s %s\n" k why) bad;
+       if unknown = [] && bad = [] then
+         println_ansi (green (Printf.sprintf "✓ %s is valid" path))
+       else exit 1)
+  | _ ->
+    Printf.eprintf
+      "Usage: caravan config \
+       [show|path|keys|check|edit|get KEY|set KEY VALUE|unset KEY]\n%!";
+    exit 2
+
+let config_cmd =
+  let args = Arg.(value & pos_all string [] & info [] ~docv:"ACTION") in
+  let doc = "Show or edit the configuration file (show | keys | check | get | set | unset)." in
+  let man = [
+    `S Manpage.s_examples;
+    `P "caravan config keys                       # every setting, its value, what it accepts"; `Noblank;
+    `P "caravan config set model claude-sonnet-5"; `Noblank;
+    `P "caravan config set permissions ask"; `Noblank;
+    `P "caravan config unset base_url             # fall back to the provider default"; `Noblank;
+    `P "caravan config check                      # validate the file against the schema"; `Noblank;
+    `P "caravan config edit                       # $EDITOR, restored if it stops parsing"; `Noblank;
+    `P "caravan config get provider";
+    `S Manpage.s_description;
+    `P "Values are checked against the setting they are written to, so a \
+        mistyped key or an out-of-range value is refused instead of being \
+        stored and silently ignored. Edits preserve the file's comments, \
+        ordering, and layout, and the previous contents are kept as \
+        $(b,config.toml.bak).";
+  ] in
+  let info = Cmd.info "config" ~doc ~man in
+  Cmd.v info Term.(const run_config $ args)
+
+(* ── web command ──────────────────────────────────────────────────────── *)
+
+let run_web model_cli provider_cli base_url_cli system port =
+  init_plugins ();
+  let _transcript = setup_frontend ~quiet:true () in
+  let (provider_name, model, base_url) =
+    resolve_cli_spec ~provider_cli ~model_cli ~base_url_cli
+  in
+  Web.serve ~port ~provider_name ~model
+    ~make_session:(fun env ->
+      make_session ~net:env#net ~clock:env#clock
+        ~provider_name ~model ~base_url ~system)
+
+let web_cmd =
+  let port_arg =
+    let doc = "Port to listen on (127.0.0.1 only)." in
+    Arg.(value & opt int 8787 & info ["port"] ~docv:"PORT" ~doc)
+  in
+  let doc = "Serve a local web chat UI (single embedded page, localhost only)." in
+  let info = Cmd.info "web" ~doc in
+  Cmd.v info Term.(const run_web $ model_arg $ provider_arg $ base_url_arg
+                   $ system_arg $ port_arg)
+
+(* ── mcp command ──────────────────────────────────────────────────────── *)
+
+let run_mcp_list () =
+  init_plugins ();
+  let mcp_servers = Config.get_mcp_servers () in
+  if mcp_servers = [] then
+    println_ansi (dim "No MCP servers configured.")
+  else begin
+    println_ansi (rule ~title:"MCP Servers" ());
+    let h = Lazy.force host in
+    List.iter (fun (cfg : Config.mcp_server_config) ->
+      let id = "mcp:" ^ cfg.name in
+      let fiber = Plugin_host.fiber h id in
+      let status_mark, status_str = match fiber with
+        | Some f when Plugin.Fiber.state f = Plugin.Fiber.Active -> (green "●", "active")
+        | Some f when Plugin.Fiber.state f = Plugin.Fiber.Failed -> (red "✗", "failed")
+        | _ -> (yellow "○", "inactive")
+      in
+      println_ansi (Printf.sprintf "  %s %s  %s  %s %s (%s)"
+        status_mark
+        (bold (Printf.sprintf "%-14s" cfg.name))
+        (cyan (Printf.sprintf "%-6s" cfg.transport))
+        (white cfg.command)
+        (dim (String.concat " " cfg.args))
+        (dim status_str))
+    ) mcp_servers
+  end
+
+let run_mcp_get name =
+  init_plugins ();
+  match Config.get_mcp_server name with
+  | None ->
+    Printf.eprintf "MCP server '%s' not found.\n%!" name;
+    exit 1
+  | Some cfg ->
+    println_ansi (rule ~title:(Printf.sprintf "MCP Server: %s" cfg.name) ());
+    println_ansi (kv_line "Name" cfg.name);
+    println_ansi (kv_line "Transport" cfg.transport);
+    println_ansi (kv_line "Command" (cfg.command ^ " " ^ String.concat " " cfg.args));
+    let h = Lazy.force host in
+    let prefix = cfg.name ^ "_" in
+    let tools = List.filter (fun t ->
+      let n = Tool.name_of_packed t in
+      String.length n > String.length prefix && String.sub n 0 (String.length prefix) = prefix
+    ) (Plugin_host.tools h) in
+    println_ansi (kv_line "Tools" (string_of_int (List.length tools)));
+    List.iter (fun t ->
+      println_ansi (Printf.sprintf "  %s  %s"
+        (cyan (Tool.name_of_packed t))
+        (dim (truncate_visible (Tool.description_of_packed t) 60)))
+    ) tools
+
+let run_mcp_add transport no_probe timeout name command args =
+  let transport = Option.value ~default:"stdio" transport in
+  let timeout = Option.value ~default:Mcp.default_probe_timeout timeout in
+  if not no_probe then begin
+    println_ansi (dim (Printf.sprintf "Probing MCP server '%s' (%s %s), up to %gs..."
+                         name command (String.concat " " args) timeout));
+    match Mcp.probe_server ~timeout name command args with
+    | Error err ->
+      Printf.eprintf "Error: Probe failed for '%s': %s\n%!" name err;
+      exit 1
+    | Ok (client, tools) ->
+      (try client.close () with _ -> ());
+      println_ansi (green (Printf.sprintf "✓ Probe successful (%d tools discovered)" (List.length tools)))
+  end;
+  let cfg = { Config.name; transport; command; args } in
+  match Config.add_mcp_server cfg with
+  | Ok path ->
+    println_ansi (green (Printf.sprintf "✓ Added MCP server '%s' to %s" name path))
+  | Error err ->
+    Printf.eprintf "Error: %s\n%!" err;
+    exit 1
+
+let run_mcp_remove name =
+  match Config.delete_mcp_server name with
+  | Ok path ->
+    println_ansi (green (Printf.sprintf "✓ Removed MCP server '%s' from %s" name path))
+  | Error err ->
+    Printf.eprintf "Error: %s\n%!" err;
+    exit 1
+
+let mcp_cmd =
+  let name_pos = Arg.(required & pos 0 (some string) None & info [] ~docv:"NAME" ~doc:"Server name.") in
+  let cmd_pos = Arg.(required & pos 1 (some string) None & info [] ~docv:"COMMAND" ~doc:"Command to execute.") in
+  let args_pos = Arg.(value & pos_right 1 string [] & info [] ~docv:"ARGS" ~doc:"Arguments to pass to command.") in
+  let transport_opt = Arg.(value & opt (some string) None & info ["transport"] ~docv:"TRANSPORT" ~doc:"Transport type (stdio).") in
+  let no_probe_flag = Arg.(value & flag & info ["no-probe"] ~doc:"Skip probing the connection before saving.") in
+  let probe_timeout_opt =
+    let doc = "Seconds to wait for the server to respond while probing (default 45)." in
+    Arg.(value & opt (some float) None & info ["probe-timeout"] ~docv:"SECONDS" ~doc)
+  in
+
+  let list_cmd =
+    let doc = "List configured MCP servers and their health status." in
+    let info = Cmd.info "list" ~doc in
+    Cmd.v info Term.(const run_mcp_list $ const ())
+  in
+  let get_cmd =
+    let doc = "Show details and tools for an MCP server." in
+    let info = Cmd.info "get" ~doc in
+    Cmd.v info Term.(const run_mcp_get $ name_pos)
+  in
+  let add_cmd =
+    let doc = "Add an MCP server configuration." in
+    let man = [
+      `S Manpage.s_examples;
+      `P "caravan mcp add github -- npx -y @modelcontextprotocol/server-github";
+      `P "caravan mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp";
+    ] in
+    let info = Cmd.info "add" ~doc ~man in
+    Cmd.v info Term.(const run_mcp_add $ transport_opt $ no_probe_flag
+                     $ probe_timeout_opt $ name_pos $ cmd_pos $ args_pos)
+  in
+  let remove_cmd =
+    let doc = "Remove an MCP server configuration." in
+    let info = Cmd.info "remove" ~doc in
+    Cmd.v info Term.(const run_mcp_remove $ name_pos)
+  in
+  let rm_cmd =
+    let doc = "Alias of $(b,caravan mcp remove)." in
+    let info = Cmd.info "rm" ~doc in
+    Cmd.v info Term.(const run_mcp_remove $ name_pos)
+  in
+  let info = Cmd.info "mcp" ~doc:"Manage Model Context Protocol (MCP) servers." in
+  Cmd.group ~default:Term.(const run_mcp_list $ const ()) info [list_cmd; get_cmd; add_cmd; remove_cmd; rm_cmd]
+
+(* ── Entry point ──────────────────────────────────────────────────────── *)
+
+(** Parse the command line and run.  The executable in [bin/] is a
+    one-liner over this, so every module here stays reachable from the
+    test suite. *)
+let main () =
+  let doc = "Typed agentic CLI harness and LLM orchestration framework." in
+  let man = [
+    `S Manpage.s_description;
+    `P "Caravan is a typed, self-documenting harness for LLM agents. \
+        Run it bare for an interactive REPL, or use $(b,caravan agent) \
+        for scripted autonomous runs.";
+    `S Manpage.s_examples;
+    `P "caravan init                          # guided setup"; `Noblank;
+    `P "caravan                               # chat REPL"; `Noblank;
+    `P "caravan agent \"fix the failing test\"  # one-shot autonomy"; `Noblank;
+    `P "caravan -p anthropic -m claude-sonnet-5"; `Noblank;
+    `P "caravan providers --ladder            # model suggestions by size";
+  ] in
+  let info = Cmd.info "caravan" ~doc ~man ~version:Version.v in
+  let default_cmd = Term.(const run_repl $ model_arg $ provider_arg $ base_url_arg $ system_arg $ verbose_arg) in
+  let cmd = Cmd.group ~default:default_cmd info
+    [ repl_cmd; agent_cmd; run_cmd; complete_cmd; models_cmd; providers_cmd;
+      init_cmd; doctor_cmd; config_cmd; web_cmd; mcp_cmd ]
+  in
+  exit (Cmd.eval cmd)
+

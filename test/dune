@@ -2,5 +2,5 @@
  (name test_Caravan)
  (inline_tests)
  (preprocess (pps ppx_expect ppx_inline_test))
- (libraries Caravan CaravanTools CaravanProviders eio eio_main))
+ (libraries Caravan Caravan_cli CaravanTools CaravanProviders eio eio_main))
 
