@@ -1,11 +1,44 @@
 type severity = Pass | Warn | Fail
 
+(** What would put a failing check right.
+
+    A fix is data, not an action: [lib] has no business prompting, opening
+    an editor, or writing to a terminal, so it says what to do and each
+    front-end decides how — the REPL and CLI apply it interactively, a
+    `--fix` run applies the unambiguous ones, and a JSON report just
+    prints it. *)
+type fix =
+  | Set_setting of string * string   (** write this exact value *)
+  | Edit_setting of string           (** ask the user for a value *)
+  | Remove_key of string             (** delete a key the schema rejects *)
+  | Store_api_key of string          (** prompt for a provider's key *)
+  | Fix_permissions of string * int  (** chmod a path *)
+  | Edit_config                      (** open the file in $EDITOR *)
+  | Run_init                         (** re-run the setup wizard *)
+
 type check = {
   label    : string;
   severity : severity;
   message  : string;
   hint     : string option;
+  fix      : fix option;
 }
+
+(** One-line imperative description, so every surface labels a fix the
+    same way. *)
+let describe_fix = function
+  | Set_setting (k, v)      -> Printf.sprintf "set %s = %s" k v
+  | Edit_setting k          -> Printf.sprintf "choose a value for %s" k
+  | Remove_key k            -> Printf.sprintf "remove '%s' from the config" k
+  | Store_api_key p         -> Printf.sprintf "store an API key for %s" p
+  | Fix_permissions (p, m)  -> Printf.sprintf "chmod %o %s" m p
+  | Edit_config             -> "open the config in $EDITOR"
+  | Run_init                -> "run the setup wizard"
+
+(** Whether a fix can be applied without asking the user anything. *)
+let is_automatic = function
+  | Set_setting _ | Remove_key _ | Fix_permissions _ -> true
+  | Edit_setting _ | Store_api_key _ | Edit_config | Run_init -> false
 
 type provider_kind = Local | Cloud
 
@@ -19,8 +52,8 @@ type provider_info = {
 
 let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subagents_enabled () =
   let checks = ref [] in
-  let add ~label ~severity ~message ?hint () =
-    checks := { label; severity; message; hint } :: !checks
+  let add ~label ~severity ~message ?hint ?fix () =
+    checks := { label; severity; message; hint; fix } :: !checks
   in
 
   (* 1. Config file: parses, is private, and says what the schema means *)
@@ -33,11 +66,14 @@ let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subag
      | Error e ->
        add ~label:"Config file" ~severity:Fail
          ~message:(Printf.sprintf "Config file has TOML syntax errors (%s)" path)
-         ~hint:e ());
+         ~hint:e ~fix:Edit_config ());
     (try
        let st = Unix.stat path in
        if st.Unix.st_perm land 0o077 <> 0 then
-         add ~label:"Config permissions" ~severity:Warn ~message:(Printf.sprintf "Config is group/world-readable") ~hint:(Printf.sprintf "consider: chmod 600 %s" path) ()
+         add ~label:"Config permissions" ~severity:Warn
+           ~message:"Config is group/world-readable"
+           ~hint:(Printf.sprintf "it holds API keys — chmod 600 %s" path)
+           ~fix:(Fix_permissions (path, 0o600)) ()
      with _ -> ());
 
     (* A key no setting describes is a typo that will never take effect. *)
@@ -46,7 +82,8 @@ let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subag
         ~message:(Printf.sprintf "'%s' is not a Caravan setting — it is ignored" key)
         ~hint:(match Config.suggest_key key with
                | Some s -> Printf.sprintf "did you mean '%s'?  (caravan config keys)" s
-               | None -> "caravan config keys lists every setting") ()
+               | None -> "caravan config keys lists every setting")
+        ~fix:(Remove_key key) ()
     ) (Config.unknown_keys ());
 
     (* A value of the wrong TOML type reads back as nothing, so the
@@ -54,7 +91,8 @@ let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subag
     List.iter (fun (key, why) ->
       add ~label:"Config value" ~severity:Fail
         ~message:(Printf.sprintf "%s %s" key why)
-        ~hint:(Printf.sprintf "caravan config set %s <value>" key) ()
+        ~hint:(Printf.sprintf "caravan config set %s <value>" key)
+        ~fix:(Edit_setting key) ()
     ) (Config.mistyped_keys ());
 
     (* An environment variable beats the file, which is the usual reason a
@@ -70,7 +108,9 @@ let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subag
       | _ -> ()
     ) Config.settings
   end else
-    add ~label:"Config file" ~severity:Warn ~message:(Printf.sprintf "No config file at %s" path) ~hint:"run 'caravan init'" ();
+    add ~label:"Config file" ~severity:Warn
+      ~message:(Printf.sprintf "No config file at %s" path)
+      ~hint:"run 'caravan init'" ~fix:Run_init ();
 
   (* 2. Provider *)
   let provider_name =
@@ -89,7 +129,8 @@ let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subag
        | Some _ -> add ~label:"API Key" ~severity:Pass ~message:(Printf.sprintf "API key for %s found" e.name) ()
        | None ->
          add ~label:"API Key" ~severity:Fail ~message:(Printf.sprintf "API key for %s missing" e.name)
-             ~hint:(Printf.sprintf "set %s or [api_keys] %s in config" (Option.value ~default:"its env var" e.key_env) e.name) ()
+             ~hint:(Printf.sprintf "set %s or [api_keys] %s in config" (Option.value ~default:"its env var" e.key_env) e.name)
+             ~fix:(Store_api_key e.name) ()
      end;
      
      match e.kind with
@@ -115,12 +156,16 @@ let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subag
   (* 4. Subagents *)
   if subagents_roster <> [] then begin
     if not subagents_enabled then
-      add ~label:"Subagents" ~severity:Warn ~message:(Printf.sprintf "%d subagent(s) configured but enable_subagents = false" (List.length subagents_roster)) ();
+      add ~label:"Subagents" ~severity:Warn
+        ~message:(Printf.sprintf "%d subagent(s) configured but enable_subagents = false"
+                    (List.length subagents_roster))
+        ~fix:(Set_setting ("enable_subagents", "true")) ();
     List.iter (fun ((cfg : Config.subagent_config), status) ->
       if String.length status >= 10 && String.sub status 0 10 = "UNRESOLVED" then
         add ~label:(Printf.sprintf "Subagent '%s'" cfg.name) ~severity:Fail
             ~message:(Printf.sprintf "provider '%s' unresolved" cfg.provider_ref)
-            ~hint:(Printf.sprintf "no [providers.%s] table, not in registry" cfg.provider_ref) ()
+            ~hint:(Printf.sprintf "no [providers.%s] table, not in registry" cfg.provider_ref)
+            ~fix:Edit_config ()
       else if Re.execp (Re.compile (Re.str "unset")) status then
         add ~label:(Printf.sprintf "Subagent '%s'" cfg.name) ~severity:Warn ~message:status ()
       else

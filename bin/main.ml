@@ -824,7 +824,15 @@ let edit_setting (s : Config.setting) =
       let label =
         Printf.sprintf "%s  %s" key (dim (Config.accepts_of_kind s.Config.kind))
       in
-      (match Picker.prompt ~initial:(Option.value ~default:"" current) label with
+      (* Only offer the stored value for editing when it is one the
+         setting would accept — when the stored value is itself the
+         problem, pre-filling it just makes the user delete it first. *)
+      let initial =
+        match current with
+        | Some v when Result.is_ok (Config.validate_value s v) -> v
+        | _ -> ""
+      in
+      (match Picker.prompt ~initial label with
        | None -> ()
        | Some "" -> if current <> None then clear ()
        | Some v -> apply v)
@@ -965,6 +973,156 @@ let cmd_stop st rest =
     end
 
 
+(* ── doctor ───────────────────────────────────────────────────────────── *)
+
+(** Collect the checks.  [net] is threaded through so the REPL can run
+    diagnostics inside its own Eio loop instead of shelling out to a
+    subprocess and losing the live session. *)
+let doctor_checks ?net () =
+  Doctor.run_checks
+    ~find_provider:(fun n ->
+      match Registry.find n with
+      | Some e -> Some Doctor.{
+          name = e.name;
+          kind = (match e.kind with Registry.Local -> Local | Registry.Cloud -> Cloud);
+          base_url = e.base_url;
+          requires_key = e.requires_key;
+          key_env = e.key_env;
+        }
+      | None -> None)
+    ~api_key_for:(fun info ->
+      let e = Option.get (Registry.find info.Doctor.name) in
+      Registry.api_key_for e)
+    ~list_models:(fun info base_url ->
+      let e = Option.get (Registry.find info.Doctor.name) in
+      let model =
+        Config.get_string_opt (Some "CARAVAN_MODEL") "model"
+        |> Option.value ~default:e.default_model
+      in
+      let probe net = Provider.list_models_packed net (Registry.make_provider ?base_url ~model e.name) in
+      match net with
+      | Some net -> probe net
+      | None -> Eio_main.run (fun env -> probe env#net))
+    ~subagents_roster:(Subagents.describe ())
+    ~subagents_enabled:(Subagents.enabled ())
+    ()
+
+let severity_mark = function
+  | Doctor.Pass -> green "  ✓ "
+  | Doctor.Warn -> yellow "  ⚠ "
+  | Doctor.Fail -> red "  ✗ "
+
+let print_check (c : Doctor.check) =
+  let hint =
+    match c.hint with Some h -> dim ("\n      " ^ h) | None -> ""
+  in
+  println_ansi (Printf.sprintf "%s%s: %s%s"
+    (severity_mark c.severity) (bold c.label) c.message hint)
+
+(** Apply one fix.  Returns whether the config changed, so the caller can
+    re-run the checks. *)
+let apply_fix (f : Doctor.fix) =
+  match f with
+  | Doctor.Set_setting (key, value) ->
+    (match Config.set_checked key value with
+     | Ok _ -> confirm "%s = %s" key value; apply_live_setting key; true
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)); false)
+  | Doctor.Edit_setting key ->
+    (match Config.find_setting key with
+     | Some s -> edit_setting s; true
+     | None -> println_ansi (red (Printf.sprintf "  ✗ '%s' is not a setting" key)); false)
+  | Doctor.Remove_key key ->
+    (* Deliberately the unchecked removal: the whole point is that the
+       schema does not recognise this key. *)
+    (match Config.unset_toml_value key with
+     | Ok _ -> confirm "'%s' removed from the config" key; true
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)); false)
+  | Doctor.Store_api_key provider -> cmd_key_for provider; true
+  | Doctor.Fix_permissions (path, mode) ->
+    (try Unix.chmod path mode; confirm "chmod %o %s" mode path; true
+     with e -> println_ansi (red (Printf.sprintf "  ✗ %s" (Printexc.to_string e))); false)
+  | Doctor.Edit_config -> cmd_config_edit ()
+  | Doctor.Run_init ->
+    ignore (Sys.command (Filename.quote Sys.executable_name ^ " init"));
+    Config.reload ();
+    true
+
+let checks_to_json (checks : Doctor.check list) =
+  `Assoc [
+    ("ok", `Bool (List.for_all (fun (c : Doctor.check) -> c.severity <> Doctor.Fail) checks));
+    ("checks", `List (List.map (fun (c : Doctor.check) ->
+       `Assoc [
+         ("label", `String c.label);
+         ("severity", `String (match c.severity with
+            | Doctor.Pass -> "pass" | Doctor.Warn -> "warn" | Doctor.Fail -> "fail"));
+         ("message", `String c.message);
+         ("hint", (match c.hint with Some h -> `String h | None -> `Null));
+         ("fix", (match c.fix with
+            | Some f -> `String (Doctor.describe_fix f)
+            | None -> `Null));
+       ]) checks));
+  ]
+
+(** Run the diagnostics and, on a terminal, offer to fix what can be
+    fixed: arrow to a failing check, press Enter, and the change is
+    applied and the suite re-run. *)
+let rec run_doctor ?net ?(json = false) ?(fix = false) ?(depth = 0) () =
+  let checks = doctor_checks ?net () in
+  if json then begin
+    print_endline (Yojson.Safe.pretty_to_string (checks_to_json checks));
+    if List.exists (fun (c : Doctor.check) -> c.severity = Doctor.Fail) checks
+    then 1 else 0
+  end else begin
+    if depth = 0 then println_ansi (bold (cyan "\n  Caravan system diagnostics\n"));
+    List.iter print_check checks;
+    print_newline ();
+    let failed = List.exists (fun (c : Doctor.check) -> c.severity = Doctor.Fail) checks in
+    let fixable =
+      List.filter (fun (c : Doctor.check) ->
+        c.severity <> Doctor.Pass && c.fix <> None) checks
+    in
+    if fixable = [] then begin
+      if failed then println_ansi (bold (yellow "  Some checks failed — see hints above.\n"))
+      else println_ansi (bold (green "  All diagnostics passed. Caravan is ready.\n"));
+      if failed then 1 else 0
+    end else if fix then begin
+      (* Non-interactive: apply only what needs no input from anyone. *)
+      let applied =
+        List.filter_map (fun (c : Doctor.check) ->
+          match c.fix with
+          | Some f when Doctor.is_automatic f -> if apply_fix f then Some c else None
+          | _ -> None) fixable
+      in
+      if applied = [] then begin
+        println_ansi (yellow "  Nothing could be fixed without input — run 'caravan doctor' to do it interactively.\n");
+        if failed then 1 else 0
+      end else if depth >= 3 then (if failed then 1 else 0)
+      else run_doctor ?net ~fix ~depth:(depth + 1) ()
+    end else if not (Tty.is_tty ()) || depth >= 8 then begin
+      if failed then println_ansi (bold (yellow "  Some checks failed — see hints above.\n"))
+      else println_ansi (bold (yellow "  Some checks need attention — see hints above.\n"));
+      if failed then 1 else 0
+    end else begin
+      let items =
+        List.map (fun (c : Doctor.check) ->
+          let f = Option.get c.fix in
+          Picker.item (Doctor.describe_fix f) (Some f)
+            ~hint:(match c.severity with Doctor.Fail -> "✗" | _ -> "⚠")
+            ~detail:c.message) fixable
+        @ [Picker.item "leave it for now" None]
+      in
+      match Picker.select ~title:"Fix something?" ~filter:false items with
+      | None | Some None ->
+        if failed then println_ansi (bold (yellow "  Some checks failed — see hints above.\n"));
+        if failed then 1 else 0
+      | Some (Some f) ->
+        ignore (apply_fix f);
+        Config.reload ();
+        println_ansi (dim "\n  Re-checking…\n");
+        run_doctor ?net ~depth:(depth + 1) ()
+    end
+  end
+
 let handle_slash_command net clock st line =
   let parts = String.split_on_char ' ' (String.trim line) |> List.filter (fun s -> s <> "") in
   match parts with
@@ -1046,10 +1204,10 @@ let handle_slash_command net clock st line =
   | "/stop" :: rest -> cmd_stop st rest
 
   (* Pre-run commands, reachable from inside the REPL too — one command
-     surface instead of two. They run as subprocesses so their own event
-     loops don't nest inside ours. *)
-  | ["/doctor"] ->
-    ignore (Sys.command (Filename.quote Sys.executable_name ^ " doctor"))
+     surface instead of two.  Doctor runs in-process on the session's own
+     net; init still needs a subprocess, since its Ollama probe opens an
+     Eio loop that must not nest inside ours. *)
+  | ["/doctor"] -> ignore (run_doctor ~net ())
 
   | ["/init"] ->
     ignore (Sys.command (Filename.quote Sys.executable_name ^ " init"));
@@ -1532,66 +1690,27 @@ let init_cmd =
   let info = Cmd.info "init" ~doc in
   Cmd.v info Term.(const run_init $ const ())
 
-(* ── doctor command ───────────────────────────────────────────────────── *)
-
-let run_doctor () =
-  println_ansi (bold (cyan "\n  Caravan system diagnostics\n"));
-  
-  let checks = Doctor.run_checks
-    ~find_provider:(fun n ->
-      match Registry.find n with
-      | Some e -> Some Doctor.{
-          name = e.name;
-          kind = (match e.kind with Registry.Local -> Local | Registry.Cloud -> Cloud);
-          base_url = e.base_url;
-          requires_key = e.requires_key;
-          key_env = e.key_env;
-        }
-      | None -> None
-    )
-    ~api_key_for:(fun info ->
-      let e = Option.get (Registry.find info.name) in
-      Registry.api_key_for e
-    )
-    ~list_models:(fun info base_url ->
-      let e = Option.get (Registry.find info.name) in
-      let model = Config.get_string_opt (Some "CARAVAN_MODEL") "model" |> Option.value ~default:e.default_model in
-      Eio_main.run (fun env ->
-        let p = Registry.make_provider ?base_url ~model e.name in
-        Provider.list_models_packed env#net p
-      )
-    )
-    ~subagents_roster:(Subagents.describe ())
-    ~subagents_enabled:(Subagents.enabled ())
-    ()
-  in
-
-  let checks_passed = ref true in
-  List.iter (fun (c : Doctor.check) ->
-    let status_str = match c.severity with
-      | Pass -> green "  ✓ "
-      | Warn -> yellow "  ⚠ "
-      | Fail -> checks_passed := false; red "  ✗ "
-    in
-    let hint_str = match c.hint with
-      | Some h -> dim ("\n      " ^ h)
-      | None -> ""
-    in
-    println_ansi (Printf.sprintf "%s%s: %s%s" status_str (bold c.label) c.message hint_str)
-  ) checks;
-
-  print_newline ();
-  if !checks_passed then
-    println_ansi (bold (green "  All diagnostics passed. Caravan is ready.\n"))
-  else begin
-    println_ansi (bold (yellow "  Some checks failed — see hints above.\n"));
-    exit 1
-  end
-
 let doctor_cmd =
+  let json_arg =
+    let doc = "Emit the checks as one JSON object instead of a report." in
+    Arg.(value & flag & info ["json"] ~doc)
+  in
+  let fix_arg =
+    let doc = "Apply every fix that needs no input, then re-check." in
+    Arg.(value & flag & info ["fix"] ~doc)
+  in
   let doc = "Run system and configuration diagnostics." in
-  let info = Cmd.info "doctor" ~doc in
-  Cmd.v info Term.(const run_doctor $ const ())
+  let man = [
+    `S Manpage.s_description;
+    `P "Reports on the config file, the provider and its key, the transcript \
+        directory, subagents, and MCP servers. On a terminal it then offers to \
+        fix what it can: pick a failing check and the change is applied and the \
+        suite re-run.";
+    `P "Exits non-zero when any check fails, so it can gate a script.";
+  ] in
+  let info = Cmd.info "doctor" ~doc ~man in
+  let run json fix = exit (run_doctor ~json ~fix ()) in
+  Cmd.v info Term.(const run $ json_arg $ fix_arg)
 
 (* ── config command ───────────────────────────────────────────────────── *)
 

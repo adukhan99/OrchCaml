@@ -17,7 +17,7 @@ Every command accepts `-p/--provider`, `-m/--model`, `--base-url`,
 | `caravan config show\|path\|keys\|get K\|set K V` | inspect or edit the config |
 | `caravan mcp add\|remove\|list\|get` | manage Model Context Protocol (MCP) servers |
 | `caravan init` | setup wizard |
-| `caravan doctor` | diagnostics (exit 1 on failure) |
+| `caravan doctor` [`--fix`] [`--json`] | diagnostics, with fixes offered (exit 1 on failure) |
 
 ### `caravan mcp`
 

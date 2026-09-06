@@ -47,6 +47,22 @@ If a setting appears to do nothing, an environment variable is usually
 overriding it — `config set`, `config get`, and `caravan doctor` all say so
 when that is the case.
 
+## Diagnostics
+
+`caravan doctor` checks the config file, the provider and its key, the
+transcript directory, subagents and MCP servers — and then offers to fix what
+it can: arrow to a failing check, press Enter, and the change is applied and
+the suite re-run.
+
+```bash
+caravan doctor           # report, then offer fixes on a terminal
+caravan doctor --fix     # apply every fix that needs no input, then re-check
+caravan doctor --json    # one JSON object, for CI
+```
+
+It exits non-zero when any check fails, so it can gate a script. `/doctor`
+runs the same checks inside a session, against that session's own connection.
+
 ## Resolution order
 
 1. **CLI flags** — `-p/--provider`, `-m/--model`, `--base-url`, `-s/--system`;

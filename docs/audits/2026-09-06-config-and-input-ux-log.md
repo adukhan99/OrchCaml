@@ -19,7 +19,7 @@ per phase, so each stays independently reviewable.
 | **1** | A typed setting schema as the single source of truth | **Done** |
 | **5** | One command registry behind `/help`, the palette, and Tab | **Done** |
 | **2** | A picker primitive (`select` / `form` / `confirm`) in `bin/` | **Done** |
-| 4 | Doctor checks that carry a fix, applied from the picker | Planned |
+| **4** | Doctor checks that carry a fix, applied from the picker | **Done** |
 | 3 | The input line: multi-line, bracketed paste, no fork per keystroke | Planned |
 
 Phases 0 and 1 landed together because 1 has no user-visible value until 0
@@ -172,10 +172,35 @@ start of each widget. That was scheduled for phase 3, but the editor's redraw
 called `stty size` — a fork and an exec — on every keystroke, and the function
 moved in this phase anyway.
 
-## 6. For the next phase
+## 6. Phase 4 — a doctor that fixes things
 
-Phase 4 turns each doctor check's `hint` into a `fix` the picker can apply.
-Phase 3 is then the last one: the line editor itself.
+`Doctor.check` gains `fix : fix option`, where `fix` is data — `Set_setting`,
+`Edit_setting`, `Remove_key`, `Store_api_key`, `Fix_permissions`,
+`Edit_config`, `Run_init` — so `lib/doctor.ml` still neither prompts nor
+prints and each front-end decides how to apply one. `describe_fix` and
+`is_automatic` live beside the type, so every surface labels a fix identically
+and agrees on which ones need a human.
+
+On a terminal `caravan doctor` now reports and then offers: arrow to a failing
+check, press Enter, the change is applied and the suite re-runs. `--fix`
+applies only the automatic ones (a chmod, a key the schema rejects, a flag
+that contradicts the roster) and says plainly when something needs input.
+`--json` emits one object for CI. All three exit non-zero on a failure.
+
+`/doctor` no longer shells out to a subprocess. It shelled out because
+`run_doctor`'s model probe opened its own `Eio_main.run`, which cannot nest
+inside the REPL's; the probe now takes an optional `net`, so the session's own
+connection is used and a fix applied from inside the REPL updates the live
+session. `/init` still forks, for the same nesting reason.
+
+One thing the loop taught us: pre-filling the setting editor with the stored
+value is wrong when the stored value is what the doctor is complaining about.
+It pre-fills only values that would validate.
+
+## 7. For the next phase
+
+Phase 3 is the last one: the line editor itself — multi-line editing, bracketed
+paste, a gap buffer, and Ctrl-R.
 
 `bin/` is an executable, so `Commands` and `Picker` are not reachable from the
 test library; their behaviour is covered by driving the built binary through a

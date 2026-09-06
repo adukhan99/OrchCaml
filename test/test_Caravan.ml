@@ -1605,6 +1605,43 @@ let%test_unit "doctor_run_checks" =
     ~find_provider:(fun _ -> None)
     ~api_key_for:(fun _ -> Some "mock-key")))
 
+let%test_unit "doctor_offers_fixes" =
+  (* A config that is legal TOML and still wrong in three different ways:
+     a typo'd key, a value of the wrong type, and a workers/flag mismatch.
+     Each should come back with something the front-end can act on. *)
+  with_tmp_config ~name:"test_doctor_fixes" ~toml_content:"\
+provider = \"ollama\"\n\
+model = \"qwen3:8b\"\n\
+permisions = \"ask\"\n\
+max_turns = \"lots\"\n" (fun path ->
+    let checks =
+      Doctor.run_checks
+        ~find_provider:(fun n -> Some Doctor.{
+          name = n; kind = Cloud; base_url = "http://mock";
+          requires_key = true; key_env = Some "MOCK_KEY" })
+        ~api_key_for:(fun _ -> None)
+        ~list_models:(fun _ _ -> [])
+        ~subagents_roster:[] ~subagents_enabled:true ()
+    in
+    let fixes = List.filter_map (fun (c : Doctor.check) -> c.fix) checks in
+    let has p = List.exists p fixes in
+    (* The typo is removable; the mistyped value needs a human. *)
+    assert (has (function Doctor.Remove_key "permisions" -> true | _ -> false));
+    assert (has (function Doctor.Edit_setting "max_turns" -> true | _ -> false));
+    (* A cloud provider without a key knows whose key to ask for. *)
+    assert (has (function Doctor.Store_api_key _ -> true | _ -> false));
+    (* Everything that carries a fix carries a description of it, and only
+       the ones that need no input are automatic. *)
+    List.iter (fun f -> assert (String.length (Doctor.describe_fix f) > 0)) fixes;
+    assert (Doctor.is_automatic (Doctor.Remove_key "x"));
+    assert (Doctor.is_automatic (Doctor.Set_setting ("stream", "true")));
+    assert (not (Doctor.is_automatic (Doctor.Edit_setting "max_turns")));
+    assert (not (Doctor.is_automatic (Doctor.Store_api_key "openai")));
+    (* A check that passes never carries one. *)
+    List.iter (fun (c : Doctor.check) ->
+      if c.severity = Doctor.Pass then assert (c.fix = None)) checks;
+    ignore path)
+
 let%test_unit "chat_message_to_wire_json_preserves_content" =
   (* Args are now expected to be pre-sanitized via sanitize_json_args at
      provider ingestion time.  Simulate that: *)
