@@ -54,7 +54,7 @@ typed, its arguments — `/config set <Tab>` offers the settings,
 | `/system` `/temp` `/top_p` `/top_k` `/max_tokens` `/seed` `/stop` | generation |
 | `/memory <n>` · `/summarise` | context window / compact now |
 | `/history` · `/export [file]` · `/tools` | inspect the session |
-| `/mcp [list\|add\|get\|remove]` | manage MCP tool servers and dynamic tool bindings |
+| `/mcp [list\|add [--no-probe]\|get\|remove]` | manage MCP tool servers and dynamic tool bindings |
 | `/plugins [enable\|disable <id>]` | plugin composition and lifecycle states |
 | `/doctor` · `/init` | pre-run commands, callable in-session |
 | `/clear` · `/help` · `/quit` | housekeeping |

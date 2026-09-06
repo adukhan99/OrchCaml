@@ -130,37 +130,131 @@ let spawn_server_eio ~sw mgr name command args =
   | Eio.Cancel.Cancelled _ as exn -> raise exn
   | exn -> Error (Printf.sprintf "Failed to spawn Eio MCP server %s: %s" name (Printexc.to_string exn))
 
-let spawn_server_unix name command args =
-  let args_arr = Array.of_list (command :: args) in
+(** Read lines from a raw descriptor, with an optional per-read deadline.
+
+    [input_line] on a buffered channel cannot time out, so a server that
+    accepts the connection and then says nothing blocked forever — which
+    is what made [caravan mcp add] hang for as long as npx took to fetch
+    a package the first time, with no way out but Ctrl-C.  Reading the
+    descriptor directly means [Unix.select] can bound the wait; the
+    buffering that [input_line] was providing is done here instead.
+
+    [timeout = 0.] blocks, which is what long-lived tool calls want. *)
+let make_line_reader ?(timeout = 0.) fd =
+  let pending = Buffer.create 4096 in
+  let chunk = Bytes.create 4096 in
+  let eof = ref false in
+  fun () ->
+    let rec take () =
+      let s = Buffer.contents pending in
+      match String.index_opt s '\n' with
+      | Some i ->
+        Buffer.clear pending;
+        Buffer.add_string pending (String.sub s (i + 1) (String.length s - i - 1));
+        (* Tolerate CRLF from a server written for Windows. *)
+        let line = String.sub s 0 i in
+        let len = String.length line in
+        Some (if len > 0 && line.[len - 1] = '\r' then String.sub line 0 (len - 1) else line)
+      | None ->
+        if !eof then (if s = "" then None
+                      else (Buffer.clear pending; Some s))
+        else fill ()
+    and fill () =
+      let ready =
+        timeout <= 0. ||
+        (match Unix.select [fd] [] [] timeout with
+         | ([], _, _) -> false
+         | _ -> true
+         | exception Unix.Unix_error (Unix.EINTR, _, _) -> true)
+      in
+      if not ready then None
+      else
+        match Unix.read fd chunk 0 (Bytes.length chunk) with
+        | 0 -> eof := true; take ()
+        | n -> Buffer.add_subbytes pending chunk 0 n; take ()
+        | exception Unix.Unix_error (Unix.EINTR, _, _) -> fill ()
+        | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+        | exception _ -> eof := true; take ()
+    in
+    take ()
+
+(* [Unix.open_process_full cmd env] takes a shell command line and an
+   *environment* — this passed [| command; arg1; … |] as the environment,
+   so every stdio MCP server was started as `sh -c "<command>"` with no
+   arguments and a garbage environment.  `npx -y @modelcontextprotocol/…`
+   ran as bare `npx`, which waits for input, which is why adding a server
+   hung.  [create_process] takes argv properly and inherits the real
+   environment. *)
+let spawn_server_unix ?timeout name command args =
   try
-    let (in_chan, out_chan, err_chan) = Unix.open_process_full command args_arr in
+    (* Close-on-exec throughout: [create_process] dup2s its three
+       descriptors onto the child's 0/1/2, and dup2 clears the flag on the
+       copy.  Without it the child also inherits our *write* end of its own
+       stdin, never sees EOF when we close ours, and never exits. *)
+    let (stdin_r,  stdin_w)  = Unix.pipe ~cloexec:true () in
+    let (stdout_r, stdout_w) = Unix.pipe ~cloexec:true () in
+    let (stderr_r, stderr_w) = Unix.pipe ~cloexec:true () in
+    let argv = Array.of_list (command :: args) in
+    let pid =
+      Fun.protect
+        ~finally:(fun () ->
+          List.iter (fun fd -> try Unix.close fd with _ -> ())
+            [stdin_r; stdout_w; stderr_w])
+        (fun () -> Unix.create_process command argv stdin_r stdout_w stderr_w)
+    in
+    (* Drain stderr into the trace so a server's diagnostics are not lost
+       and cannot fill its pipe and wedge it. *)
+    let err_chan = Unix.in_channel_of_descr stderr_r in
     ignore (Thread.create (fun () ->
       try
-        let rec loop () =
-          let line = input_line err_chan in
-          Trace.log "warn" "[MCP stderr %s] %s" name line;
-          loop ()
-        in loop ()
-      with _ -> try close_in_noerr err_chan with _ -> ()
-    ) ());
-    let write_line str = output_string out_chan str; flush out_chan in
-    let read_line () =
-      try Some (input_line in_chan)
-      with
-      | Eio.Cancel.Cancelled _ as exn -> raise exn
-      | _ -> None
+        while true do
+          Trace.log "warn" "[MCP stderr %s] %s" name (input_line err_chan)
+        done
+      with _ -> (try close_in_noerr err_chan with _ -> ())) ());
+    let write_line str =
+      let b = Bytes.of_string str in
+      let rec go off =
+        if off < Bytes.length b then
+          go (off + Unix.write stdin_w b off (Bytes.length b - off))
+      in
+      go 0
     in
-    let close () = try ignore (Unix.close_process_full (in_chan, out_chan, err_chan)) with _ -> () in
+    let read_line = make_line_reader ?timeout stdout_r in
+    let close () =
+      (* Closing stdin is how a stdio MCP server is asked to stop. Give it
+         a moment, then insist, so one that ignores EOF cannot wedge us. *)
+      List.iter (fun fd -> try Unix.close fd with _ -> ()) [stdin_w; stdout_r];
+      let reaped =
+        try fst (Unix.waitpid [Unix.WNOHANG] pid) <> 0 with _ -> true
+      in
+      if not reaped then begin
+        let deadline = Unix.gettimeofday () +. 1.0 in
+        let rec wait () =
+          match Unix.waitpid [Unix.WNOHANG] pid with
+          | 0, _ when Unix.gettimeofday () < deadline ->
+            Thread.delay 0.02; wait ()
+          | 0, _ ->
+            (try Unix.kill pid Sys.sigterm with _ -> ());
+            (try ignore (Unix.waitpid [] pid) with _ -> ())
+          | _ -> ()
+          | exception _ -> ()
+        in
+        wait ()
+      end
+    in
     Ok { name; write_line; read_line; close; next_id = 1; mutex = Mutex.create () }
   with
   | Eio.Cancel.Cancelled _ as exn -> raise exn
-  | exn -> Error (Printf.sprintf "Failed to spawn Unix MCP server %s: %s" name (Printexc.to_string exn))
+  | Unix.Unix_error (Unix.ENOENT, _, _) ->
+    Error (Printf.sprintf "'%s' not found in PATH" command)
+  | exn ->
+    Error (Printf.sprintf "Failed to spawn MCP server %s: %s" name (Printexc.to_string exn))
 
-let connect ?mgr ?sw name command args =
+let connect ?mgr ?sw ?timeout name command args =
   let client_res =
     match mgr, sw with
     | Some mgr, Some sw -> spawn_server_eio ~sw mgr name command args
-    | _ -> spawn_server_unix name command args
+    | _ -> spawn_server_unix ?timeout name command args
   in
   match client_res with
   | Error err -> Error err
@@ -198,9 +292,25 @@ let list_tools client =
       Trace.log "error" "MCP: error parsing tools for %s: %s" client.name (Printexc.to_string exn);
       []
 
-let probe_server ?mgr ?sw name command args =
-  match connect ?mgr ?sw name command args with
-  | Error err -> Error err
+(** How long a probe waits for the server to say anything.  Generous
+    enough for a cold `npx` that has to fetch a package, short enough
+    that a wrong command reports rather than hangs. *)
+let default_probe_timeout = 45.
+
+(** Start [command], initialise, and list its tools.  Unlike a mounted
+    server this gives up: an unresponsive one fails with a message
+    instead of blocking the terminal. *)
+let probe_server ?mgr ?sw ?(timeout = default_probe_timeout) name command args =
+  let started = Unix.gettimeofday () in
+  match connect ?mgr ?sw ~timeout name command args with
+  | Error err ->
+    (* Distinguish "said nothing" from "failed to start": the first wants
+       --no-probe, the second wants a corrected command. *)
+    if Unix.gettimeofday () -. started >= timeout then
+      Error (Printf.sprintf
+               "'%s' did not respond within %gs — add it with --no-probe if it \
+                is just slow to start" name timeout)
+    else Error err
   | Ok client ->
     let tools = list_tools client in
     Ok (client, tools)

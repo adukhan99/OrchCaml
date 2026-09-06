@@ -1245,6 +1245,38 @@ let%test_unit "config_subagent_crud_preserves_comments" =
      | Error _ -> () | Ok _ -> failwith "removing a missing worker should fail");
     (try Sys.remove (path ^ ".bak") with _ -> ()))
 
+let%test_unit "mcp_stdio_transport" =
+  (* The Unix transport handed argv to [open_process_full] as its
+     *environment*, so every stdio MCP server started as `sh -c "<command>"`
+     with no arguments — `npx -y @modelcontextprotocol/…` ran as bare `npx`,
+     which waits for input, which is why adding a server hung. *)
+  let read_all client =
+    let rec go acc =
+      match client.Mcp.read_line () with
+      | Some l -> go (l :: acc)
+      | None -> List.rev acc
+    in go []
+  in
+  (* printf can only produce this if its arguments actually arrived. *)
+  (match Mcp.spawn_server_unix ~timeout:5.0 "t" "printf" ["%s\n%s\n"; "alpha"; "beta"] with
+   | Error e -> failwith ("spawn failed: " ^ e)
+   | Ok client ->
+     assert (read_all client = ["alpha"; "beta"]);
+     client.Mcp.close ());
+  (* A server that starts and then says nothing must give up, not block. *)
+  (match Mcp.spawn_server_unix ~timeout:0.2 "t" "sleep" ["30"] with
+   | Error e -> failwith ("spawn failed: " ^ e)
+   | Ok client ->
+     let started = Unix.gettimeofday () in
+     assert (client.Mcp.read_line () = None);
+     assert (Unix.gettimeofday () -. started < 5.0);
+     client.Mcp.close ());
+  (* A command that is not there says so, rather than reporting a closed
+     connection several seconds later. *)
+  (match Mcp.spawn_server_unix "t" "caravan-definitely-not-a-real-command" [] with
+   | Ok _ -> failwith "a missing command should not spawn"
+   | Error e -> assert (Re.execp (Re.compile (Re.str "not found in PATH")) e))
+
 let%test_unit "config_mcp_crud_preserves_comments" =
   with_tmp_config ~name:"test_cfg_mcp_comments" ~toml_content:annotated_config (fun path ->
     let contains needle =

@@ -246,7 +246,33 @@ through a pty. Splitting `bin` into a library plus a thin executable would make
 them testable directly, and is the obvious next structural move if that layer
 grows further.
 
-`caravan mcp add` probes the server by launching it before writing anything,
-which means it blocks for as long as `npx` takes to fetch a package the first
-time, with one line of output and no timeout. That is pre-existing and out of
-scope here, but it is the next thing in this area worth fixing.
+## 9. Addendum — the stdio MCP transport
+
+Chasing the `caravan mcp add` hang turned up something larger. The Unix
+transport spawned servers with `Unix.open_process_full cmd env`, passing
+`[| command; arg1; … |]` as the **environment**: every stdio MCP server was
+started as `sh -c "<command>"` with no arguments and a garbage environment.
+`npx -y @modelcontextprotocol/server-github` ran as bare `npx`, which waits for
+input — hence the hang. The whole stdio path was non-functional, and the mount
+path in `Plugin_host` used it too.
+
+It now uses `Unix.create_process`, which takes argv properly and inherits the
+real environment. Three things follow from that:
+
+- `make_line_reader` reads the descriptor directly with its own buffering,
+  because `input_line` on a buffered channel cannot time out. Reads take an
+  optional per-read deadline; `probe_server` passes 45s and reports it
+  plainly, pointing at `--no-probe` for a server that is genuinely slow to
+  start. A missing command now says "not found in PATH" instantly instead of
+  "Connection closed" after a wait.
+- The pipes are created close-on-exec. `create_process` dup2s its three
+  descriptors onto the child's 0/1/2 and dup2 clears the flag on the copy, so
+  the child gets exactly those — and, crucially, no longer inherits our *write*
+  end of its own stdin, which meant it never saw EOF and never exited.
+- `close` asks the server to stop by closing stdin, waits a second, and then
+  insists with SIGTERM, so a server that ignores EOF cannot wedge the caller.
+
+`/mcp add` gained `--no-probe` to match the CLI, and the CLI gained
+`--probe-timeout`. Covered by `mcp_stdio_transport`, which proves argv arrives
+(via `printf`), that a silent server times out, and that a missing command is
+reported as such.

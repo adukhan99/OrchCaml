@@ -649,26 +649,41 @@ let cmd_mcp net clock st rest =
               (dim (truncate_visible (Tool.description_of_packed t) 60)))
           ) mcp_tools)
      | "add" :: name :: rest_args ->
+       let no_probe = List.mem "--no-probe" rest_args in
+       let rest_args = List.filter (fun a -> a <> "--no-probe") rest_args in
        let (command, args) =
          match rest_args with
          | "--" :: cmd :: a -> (cmd, a)
          | cmd :: a -> (cmd, a)
          | [] -> ("", [])
        in
-       if command = "" then usage "/mcp add" "<name> [--transport stdio] -- <command> [args...]"
+       if command = "" then
+         usage "/mcp add" "<name> [--no-probe] -- <command> [args...]"
        else begin
-         println_ansi (dim (Printf.sprintf "  Probing MCP server '%s'..." name));
-         match Mcp.probe_server name command args with
-         | Error err -> println_ansi (red (Printf.sprintf "  ✗ Probe failed: %s" err))
-         | Ok (client, tools) ->
-           (try client.close () with _ -> ());
+         let save tools =
            let cfg = { Config.name; transport = "stdio"; command; args } in
-           (match Config.add_mcp_server cfg with
-            | Ok path ->
-              Plugin_host.load h;
-              st.session <- Session.with_tools st.session (Subagents.session_tools ~net ~clock ~host:h (all_tools ()));
-              confirm "MCP server '%s' added (%d tools registered, saved to %s)" name (List.length tools) path
-            | Error e -> println_ansi (red ("  ✗ " ^ e)))
+           match Config.add_mcp_server cfg with
+           | Ok path ->
+             Plugin_host.load h;
+             st.session <- Session.with_tools st.session
+                 (Subagents.session_tools ~net ~clock ~host:h (all_tools ()));
+             (match tools with
+              | Some n ->
+                confirm "MCP server '%s' added (%d tools registered, saved to %s)"
+                  name n path
+              | None -> confirm "MCP server '%s' added unchecked (saved to %s)" name path)
+           | Error e -> println_ansi (red ("  ✗ " ^ e))
+         in
+         if no_probe then save None
+         else begin
+           println_ansi (dim (Printf.sprintf
+             "  Probing MCP server '%s' (up to %gs)…" name Mcp.default_probe_timeout));
+           match Mcp.probe_server name command args with
+           | Error err -> println_ansi (red (Printf.sprintf "  ✗ Probe failed: %s" err))
+           | Ok (client, tools) ->
+             (try client.close () with _ -> ());
+             save (Some (List.length tools))
+         end
        end
      | ["remove"; name] | ["rm"; name] ->
        (match Config.delete_mcp_server name with
@@ -677,7 +692,9 @@ let cmd_mcp net clock st rest =
           st.session <- Session.with_tools st.session (Subagents.session_tools ~net ~clock ~host:h (all_tools ()));
           confirm "MCP server '%s' removed (saved to %s)" name path
         | Error e -> println_ansi (red ("  ✗ " ^ e)))
-     | _ -> usage "/mcp" "[list | get <name> | add <name> -- <cmd> [args...] | remove <name>]")
+     | _ ->
+       usage "/mcp"
+         "[list | get <name> | add <name> [--no-probe] -- <cmd> [args...] | remove <name>]")
 
 (** The value a key currently resolves to in the config file, as text. *)
 let config_value_string key =
@@ -1888,11 +1905,13 @@ let run_mcp_get name =
         (dim (truncate_visible (Tool.description_of_packed t) 60)))
     ) tools
 
-let run_mcp_add transport no_probe name command args =
+let run_mcp_add transport no_probe timeout name command args =
   let transport = Option.value ~default:"stdio" transport in
+  let timeout = Option.value ~default:Mcp.default_probe_timeout timeout in
   if not no_probe then begin
-    println_ansi (dim (Printf.sprintf "Probing MCP server '%s' (%s %s)..." name command (String.concat " " args)));
-    match Mcp.probe_server name command args with
+    println_ansi (dim (Printf.sprintf "Probing MCP server '%s' (%s %s), up to %gs..."
+                         name command (String.concat " " args) timeout));
+    match Mcp.probe_server ~timeout name command args with
     | Error err ->
       Printf.eprintf "Error: Probe failed for '%s': %s\n%!" name err;
       exit 1
@@ -1921,7 +1940,11 @@ let mcp_cmd =
   let cmd_pos = Arg.(required & pos 1 (some string) None & info [] ~docv:"COMMAND" ~doc:"Command to execute.") in
   let args_pos = Arg.(value & pos_right 1 string [] & info [] ~docv:"ARGS" ~doc:"Arguments to pass to command.") in
   let transport_opt = Arg.(value & opt (some string) None & info ["transport"] ~docv:"TRANSPORT" ~doc:"Transport type (stdio).") in
-  let no_probe_flag = Arg.(value & flag & info ["no-probe"] ~doc:"Skip probing connection before saving.") in
+  let no_probe_flag = Arg.(value & flag & info ["no-probe"] ~doc:"Skip probing the connection before saving.") in
+  let probe_timeout_opt =
+    let doc = "Seconds to wait for the server to respond while probing (default 45)." in
+    Arg.(value & opt (some float) None & info ["probe-timeout"] ~docv:"SECONDS" ~doc)
+  in
 
   let list_cmd =
     let doc = "List configured MCP servers and their health status." in
@@ -1941,7 +1964,8 @@ let mcp_cmd =
       `P "caravan mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp";
     ] in
     let info = Cmd.info "add" ~doc ~man in
-    Cmd.v info Term.(const run_mcp_add $ transport_opt $ no_probe_flag $ name_pos $ cmd_pos $ args_pos)
+    Cmd.v info Term.(const run_mcp_add $ transport_opt $ no_probe_flag
+                     $ probe_timeout_opt $ name_pos $ cmd_pos $ args_pos)
   in
   let remove_cmd =
     let doc = "Remove an MCP server configuration." in
