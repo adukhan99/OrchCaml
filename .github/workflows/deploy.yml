@@ -25,6 +25,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configure Git
+        run: |
+          git config --global gc.autoDetach false
+          git config --global maintenance.auto false
+
       - name: Setup mdBook
         uses: peaceiris/actions-mdbook@v2
         with:
@@ -37,7 +42,7 @@ jobs:
         uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: 5.2.0
-          apt-packages: libssl-dev libgmp-dev pkg-config
+          opam-disable-sandboxing: true
 
       - name: Install dependencies (with docs)
         run: |
