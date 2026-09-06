@@ -23,17 +23,52 @@ let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subag
     checks := { label; severity; message; hint } :: !checks
   in
 
-  (* 1. Config file *)
+  (* 1. Config file: parses, is private, and says what the schema means *)
   let path = Config.config_path () in
   if Sys.file_exists path then begin
-    (match Config.load_toml () with
-     | Some _ -> add ~label:"Config file" ~severity:Pass ~message:(Printf.sprintf "Config file valid TOML (%s)" path) ()
-     | None -> add ~label:"Config file" ~severity:Fail ~message:(Printf.sprintf "Config file has TOML syntax errors (%s)" path) ());
+    (match Config.parse_check () with
+     | Ok () ->
+       add ~label:"Config file" ~severity:Pass
+         ~message:(Printf.sprintf "Config file valid TOML (%s)" path) ()
+     | Error e ->
+       add ~label:"Config file" ~severity:Fail
+         ~message:(Printf.sprintf "Config file has TOML syntax errors (%s)" path)
+         ~hint:e ());
     (try
        let st = Unix.stat path in
        if st.Unix.st_perm land 0o077 <> 0 then
          add ~label:"Config permissions" ~severity:Warn ~message:(Printf.sprintf "Config is group/world-readable") ~hint:(Printf.sprintf "consider: chmod 600 %s" path) ()
-     with _ -> ())
+     with _ -> ());
+
+    (* A key no setting describes is a typo that will never take effect. *)
+    List.iter (fun key ->
+      add ~label:"Config key" ~severity:Warn
+        ~message:(Printf.sprintf "'%s' is not a Caravan setting — it is ignored" key)
+        ~hint:(match Config.suggest_key key with
+               | Some s -> Printf.sprintf "did you mean '%s'?  (caravan config keys)" s
+               | None -> "caravan config keys lists every setting") ()
+    ) (Config.unknown_keys ());
+
+    (* A value of the wrong TOML type reads back as nothing, so the
+       setting silently falls back to its default. *)
+    List.iter (fun (key, why) ->
+      add ~label:"Config value" ~severity:Fail
+        ~message:(Printf.sprintf "%s %s" key why)
+        ~hint:(Printf.sprintf "caravan config set %s <value>" key) ()
+    ) (Config.mistyped_keys ());
+
+    (* An environment variable beats the file, which is the usual reason a
+       saved setting appears to do nothing. *)
+    List.iter (fun (s : Config.setting) ->
+      match Config.env_shadow s.Config.key with
+      | Some (var, v) when Config.get_string s.Config.key <> None
+                        || Config.get_int s.Config.key <> None
+                        || Config.get_bool s.Config.key <> None ->
+        add ~label:"Config override" ~severity:Warn
+          ~message:(Printf.sprintf "%s=%s overrides '%s' from the config file" var v s.Config.key)
+          ~hint:(Printf.sprintf "unset %s to use the saved value" var) ()
+      | _ -> ()
+    ) Config.settings
   end else
     add ~label:"Config file" ~severity:Warn ~message:(Printf.sprintf "No config file at %s" path) ~hint:"run 'caravan init'" ();
 
@@ -72,7 +107,7 @@ let run_checks ~find_provider ~api_key_for ~list_models ~subagents_roster ~subag
   if Config.get_transcript_enabled () then begin
     let dir = Config.log_dir () in
     (try
-       if not (Sys.file_exists dir) then Unix.mkdir dir 0o700;
+       Config.mkdir_p dir;
        add ~label:"Transcript" ~severity:Pass ~message:(Printf.sprintf "Transcript directory writable (%s)" dir) ()
      with _ -> add ~label:"Transcript" ~severity:Warn ~message:(Printf.sprintf "Cannot create transcript directory %s" dir) ())
   end;

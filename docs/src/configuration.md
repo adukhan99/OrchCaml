@@ -10,6 +10,38 @@ caravan config set permissions ask     # CLI
 # web UI: ⚙ settings panel
 ```
 
+## Editing the file
+
+Every surface writes through the same schema, so a setting knows what it
+accepts before anything reaches disk:
+
+```bash
+caravan config keys                    # every setting, its value, what it accepts
+caravan config set max_turns 40
+caravan config unset base_url          # fall back to the provider default
+caravan config check                   # validate the file against the schema
+caravan config edit                    # $EDITOR, restored if the result won’t parse
+```
+
+A value that a setting cannot accept is refused rather than stored:
+
+```
+$ caravan config set model 3
+✓ model = "3"                          # free text stays text
+$ caravan config set permisions ask
+Error: unknown setting 'permisions' — did you mean 'permissions'?
+$ caravan config set max_turns 99999
+Error: max_turns must be between 1 and 1000 (got 99999)
+```
+
+Writes are surgical: your comments, key order, and table layout survive an
+edit untouched, and the previous contents are kept as `config.toml.bak`.
+Reading the config never modifies it.
+
+If a setting appears to do nothing, an environment variable is usually
+overriding it — `config set`, `config get`, and `caravan doctor` all say so
+when that is the case.
+
 ## Resolution order
 
 1. **CLI flags** — `-p/--provider`, `-m/--model`, `--base-url`, `-s/--system`;
@@ -65,8 +97,10 @@ The capability table drives the compaction threshold, the text
 tool-call fallback, the tool profile, and the system-prompt layers —
 see [Getting Started for Free](free-tier.md).
 
-`caravan config keys` (or `/config keys`) lists every editable key with
-accepted values.
+`caravan config keys` (or `/config keys`) lists every editable key with its
+current value, what it accepts, and when a change takes effect. It is
+generated from the same schema that validates writes, so it can never
+drift from what the code actually reads.
 
 ### Provider retries
 

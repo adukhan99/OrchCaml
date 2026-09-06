@@ -17,17 +17,62 @@ let reload () =
   cached_ast := None;
   current_loaded_path := None
 
-(** Rewrite the config TOML file from an updated AST with strict 0600 permissions. *)
-let write_ast ast =
+(* ââ Safe file writes âââââââââââââââââââââââââââââââââ
+   The config file holds API keys and is edited from four surfaces, so a
+   write goes to a sibling temp file and is renamed into place: an
+   interrupted write can never truncate it.  The previous contents are
+   kept as [config.toml.bak] â a config is hand-edited often enough that
+   one undo step is worth the inode. *)
+
+(** Create [path] and any missing parents, 0700.  Caravan's directories
+    hold transcripts and a config with API keys in it, so they are never
+    group- or world-readable. *)
+let rec mkdir_p path =
+  if not (Sys.file_exists path) then begin
+    let parent = Filename.dirname path in
+    if parent <> path then mkdir_p parent;
+    (try Unix.mkdir path 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
+  end
+
+let read_file_opt path =
+  try
+    let ic = open_in_bin path in
+    Fun.protect ~finally:(fun () -> close_in_noerr ic)
+      (fun () -> Some (really_input_string ic (in_channel_length ic)))
+  with _ -> None
+
+(** Write [text] as the config file, atomically and 0600, keeping the
+    previous contents alongside as [.bak].  Returns the path written. *)
+let write_config_text text : (string, string) result =
   let path = config_path () in
-  let dir = Filename.dirname path in
-  if not (Sys.file_exists dir) then (try Unix.mkdir dir 0o700 with _ -> ());
-  let oc = open_out_gen [Open_creat; Open_trunc; Open_wronly] 0o600 path in
-  output_string oc (Otoml.Printer.to_string ast);
-  close_out oc;
-  (try Unix.chmod path 0o600 with _ -> ());
-  reload ();
-  Ok path
+  mkdir_p (Filename.dirname path);
+  (match read_file_opt path with
+   | Some prev when prev <> text ->
+     (try
+        let oc = open_out_gen [Open_creat; Open_trunc; Open_wronly] 0o600 (path ^ ".bak") in
+        output_string oc prev;
+        close_out oc
+      with _ -> ())
+   | _ -> ());
+  let tmp = path ^ ".tmp" in
+  (try
+     let oc = open_out_gen [Open_creat; Open_trunc; Open_wronly] 0o600 tmp in
+     Fun.protect ~finally:(fun () -> try close_out oc with _ -> ())
+       (fun () -> output_string oc text);
+     (try Unix.chmod tmp 0o600 with _ -> ());
+     Sys.rename tmp path;
+     reload ();
+     Ok path
+   with exn ->
+     (try Sys.remove tmp with _ -> ());
+     Error (Printexc.to_string exn))
+
+(** Rewrite the config file from an AST.  Lossy â an otoml AST carries no
+    comments and reprints tables in its own order â so scalar writes go
+    through [set_toml_value]'s textual splice instead, and this remains the
+    fallback for structural edits (subagents, MCP servers) and for files
+    the splicer cannot reason about. *)
+let write_ast ast = write_config_text (Otoml.Printer.to_string ast)
 
 (* Helper: find a string value in AST at [keys]. *)
 let find_string_in_ast ast keys =
@@ -69,35 +114,6 @@ let ensure_orchestrator_in_ast ?fallback_provider ?fallback_model ast =
       Otoml.update ast' ["orchestrator"; "model"] (Some (Otoml.string m))
     | _ -> ast
 
-(** Automatically assign/ensure the [orchestrator] table in config.toml
-    from main fields or fallback inputs. *)
-let ensure_orchestrator ?fallback_provider ?fallback_model () =
-  let path = config_path () in
-  try
-    let ast =
-      if Sys.file_exists path then
-        (try Otoml.Parser.from_file path with _ -> Otoml.TomlTable [])
-      else Otoml.TomlTable []
-    in
-    let ast' = ensure_orchestrator_in_ast ?fallback_provider ?fallback_model ast in
-    if ast' <> ast then
-      ignore (write_ast ast')
-  with _ -> ()
-
-(** Create default config directory and file if missing, auto-populating [orchestrator]. *)
-let ensure_config_exists () =
-  let path = config_path () in
-  let dir = Filename.dirname path in
-  if not (Sys.file_exists dir) then
-    (try Unix.mkdir dir 0o755 with _ -> ());
-  if not (Sys.file_exists path) then
-    (try
-       let oc = open_out path in
-       output_string oc "# Caravan Configuration\n\n";
-       close_out oc
-     with _ -> ());
-  ensure_orchestrator ()
-
 let is_first_run () =
   let path = config_path () in
   not (Sys.file_exists path) ||
@@ -108,9 +124,13 @@ let is_first_run () =
      len < 50
    with _ -> true)
 
+(** Parse the config file, or [None] when there is none.  Reading is
+    pure: it creates no directory and writes no file.  (It used to
+    materialise a default config and an [orchestrator] table on every
+    read, which meant `caravan config get` rewrote the user's file and
+    stripped its comments.) *)
 let load_toml () =
   let path = config_path () in
-  ensure_config_exists ();
   if Sys.file_exists path then
     try Some (Otoml.Parser.from_file path)
     with exn ->
@@ -118,6 +138,16 @@ let load_toml () =
         path (Printexc.to_string exn);
       None
   else None
+
+(** Parse the config file, reporting the parse error rather than a
+    warning on stderr.  Used by `/config edit` to reject an edit that
+    would leave the file unreadable, and by the doctor. *)
+let parse_check () : (unit, string) result =
+  let path = config_path () in
+  if not (Sys.file_exists path) then Ok ()
+  else match Otoml.Parser.from_file_result path with
+    | Ok _ -> Ok ()
+    | Error e -> Error e
 
 let get_ast () =
   let path = config_path () in
@@ -558,21 +588,34 @@ let get_provider_config name =
        | _ -> None)
     with _ -> None
 
-(** Read the [orchestrator] table. Returns (provider_ref, model). *)
+(** Read the [orchestrator] table. Returns (provider_ref, model).
+
+    When the table is absent the pair is resolved from the top-level
+    [provider]/[model] keys â in memory.  Caravan used to write the
+    table out to disk to achieve the same thing, which is why a plain
+    read could rewrite the user's file. *)
 let get_orchestrator () =
-  match get_ast () with
-  | None -> None
-  | Some ast ->
-    try
-      let node = Otoml.find ast (fun x -> x) ["orchestrator"] in
-      (match node with
-       | Otoml.TomlTable fields | Otoml.TomlInlineTable fields ->
-         (match assoc_string_opt fields "provider",
-                assoc_string_opt fields "model" with
-          | Some p, Some m -> Some (p, m)
-          | _ -> None)
-       | _ -> None)
-    with _ -> None
+  let from_table =
+    match get_ast () with
+    | None -> None
+    | Some ast ->
+      try
+        let node = Otoml.find ast (fun x -> x) ["orchestrator"] in
+        (match node with
+         | Otoml.TomlTable fields | Otoml.TomlInlineTable fields ->
+           (match assoc_string_opt fields "provider",
+                  assoc_string_opt fields "model" with
+            | Some p, Some m -> Some (p, m)
+            | _ -> None)
+         | _ -> None)
+      with _ -> None
+  in
+  match from_table with
+  | Some _ as r -> r
+  | None ->
+    match get_string "provider", get_string "model" with
+    | Some p, Some m when String.trim p <> "" && String.trim m <> "" -> Some (p, m)
+    | _ -> None
 
 let get_stream () =
   get_bool_opt (Some "CARAVAN_STREAM") "stream" |> Option.value ~default:true
@@ -743,25 +786,298 @@ let toml_value_of_string s =
       | "false" -> Otoml.boolean false
       | _ -> Otoml.string s
 
-(** Set a (dotted) key to a TOML value in the config file, creating the
-    file/directories as needed. The file is (re)written 0600 and the
-    in-memory cache is refreshed. Returns the config path. *)
-let set_toml_value dotted_key (value : Otoml.t) : (string, string) result =
-  let path = config_path () in
-  try
-    let ast =
-      if Sys.file_exists path then
-        (try Otoml.Parser.from_file path with _ -> Otoml.TomlTable [])
-      else Otoml.TomlTable []
+(* ── Comment-preserving TOML writes ─────────────────────────────────────
+   Reprinting the file from an otoml AST loses every comment and reorders
+   the user's tables.  A scalar write is therefore applied as a textual
+   splice: find the assignment line for the key inside its table and
+   replace only the value span, leaving indentation, ordering, and
+   trailing comments exactly as the user wrote them.
+
+   The spliced text is re-parsed and the value read back before anything
+   is written, so a splice that cannot be expressed — a multi-line value,
+   a quoted table path, a key living inside an array-of-tables — degrades
+   to the lossy AST printer rather than corrupting the file. *)
+
+let toml_string_literal s =
+  let buf = Buffer.create (String.length s + 2) in
+  Buffer.add_char buf '"';
+  String.iter (fun c ->
+    match c with
+    | '"'  -> Buffer.add_string buf "\\\""
+    | '\\' -> Buffer.add_string buf "\\\\"
+    | '\n' -> Buffer.add_string buf "\\n"
+    | '\r' -> Buffer.add_string buf "\\r"
+    | '\t' -> Buffer.add_string buf "\\t"
+    | c when Char.code c < 0x20 ->
+      Buffer.add_string buf (Printf.sprintf "\\u%04X" (Char.code c))
+    | c -> Buffer.add_char buf c) s;
+  Buffer.add_char buf '"';
+  Buffer.contents buf
+
+(** TOML distinguishes [1] (integer) from [1.0] (float), so a float
+    literal must keep a fraction or an exponent. *)
+let toml_float_literal f =
+  let s = Printf.sprintf "%.12g" f in
+  let marked =
+    String.exists (fun c -> c = '.' || c = 'e' || c = 'E' || c = 'n' || c = 'i') s
+  in
+  if marked then s else s ^ ".0"
+
+(** Render a scalar as TOML source.  [None] for composite values, which
+    the splicer leaves to the AST printer. *)
+let toml_scalar_literal (v : Otoml.t) =
+  match v with
+  | Otoml.TomlString s  -> Some (toml_string_literal s)
+  | Otoml.TomlInteger i -> Some (string_of_int i)
+  | Otoml.TomlFloat f   -> Some (toml_float_literal f)
+  | Otoml.TomlBoolean b -> Some (string_of_bool b)
+  | _ -> None
+
+(** A bare TOML key needs no quoting, and is the only shape the splicer
+    walks; anything else falls back to the AST. *)
+let is_bare_key k =
+  k <> "" &&
+  String.for_all (fun c ->
+    ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
+    || ('0' <= c && c <= '9') || c = '_' || c = '-') k
+
+type toml_header = {
+  th_path  : string list option;  (** [None] when the path is not bare *)
+  th_array : bool;                (** [[array of tables]] *)
+}
+
+(** [Some header] when the line opens a table.  A header we cannot read
+    still closes the previous table, so the walker must see it. *)
+let parse_table_header line =
+  let s = String.trim line in
+  let n = String.length s in
+  if n < 3 || s.[0] <> '[' then None
+  else begin
+    let is_array = s.[1] = '[' in
+    let open_len = if is_array then 2 else 1 in
+    let close = if is_array then "]]" else "]" in
+    let close_len = String.length close in
+    let rec find i =
+      if i + close_len > n then None
+      else if String.sub s i close_len = close then Some i
+      else find (i + 1)
     in
-    let keys = String.split_on_char '.' dotted_key |> List.filter (fun k -> k <> "") in
-    if keys = [] then Error "empty key"
+    match find open_len with
+    | None -> None
+    | Some i ->
+      let inner = String.trim (String.sub s open_len (i - open_len)) in
+      if inner = "" then None
+      else
+        let parts = String.split_on_char '.' inner |> List.map String.trim in
+        let bare = parts <> [] && List.for_all is_bare_key parts in
+        Some { th_path = (if bare then Some parts else None); th_array = is_array }
+  end
+
+(** Matches an assignment to [key] at the start of a line, bare or quoted. *)
+let assignment_re key =
+  let open Re in
+  compile (seq [ bos; rep (set " \t");
+                 alt [ str key;
+                       seq [char '"';  str key; char '"'];
+                       seq [char '\''; str key; char '\''] ];
+                 rep (set " \t"); char '=' ])
+
+(** Index of the line assigning [key] directly inside table [path].
+    Array-of-tables sections are skipped: a key inside one is ambiguous
+    (which element?), so those writes go to the AST. *)
+let locate_assignment lines ~path ~key =
+  let re = assignment_re key in
+  let cur = ref (Some []) in
+  let found = ref None in
+  List.iteri (fun i line ->
+    match parse_table_header line with
+    | Some h -> cur := (if h.th_array then None else h.th_path)
+    | None ->
+      if !found = None && !cur = Some path && Re.execp re line then found := Some i
+  ) lines;
+  !found
+
+(** Replace the value in an assignment line, keeping its indentation and
+    any trailing comment.  [None] when the value runs past the end of the
+    line (a multi-line string or array), which the splicer will not touch. *)
+let replace_value_in_line line ~literal =
+  match String.index_opt line '=' with
+  | None -> None
+  | Some eq ->
+    let n = String.length line in
+    (* Walk the value span tracking string and bracket state, so a '#'
+       inside a string is not mistaken for the start of a comment. *)
+    let rec scan i ~basic ~lit ~depth =
+      if i >= n then (if basic || lit || depth > 0 then None else Some n)
+      else
+        let c = line.[i] in
+        if basic then
+          if c = '\\' then scan (i + 2) ~basic ~lit ~depth
+          else scan (i + 1) ~basic:(c <> '"') ~lit ~depth
+        else if lit then scan (i + 1) ~basic ~lit:(c <> '\'') ~depth
+        else match c with
+          | '"'       -> scan (i + 1) ~basic:true ~lit ~depth
+          | '\''      -> scan (i + 1) ~basic ~lit:true ~depth
+          | '[' | '{' -> scan (i + 1) ~basic ~lit ~depth:(depth + 1)
+          | ']' | '}' -> scan (i + 1) ~basic ~lit ~depth:(depth - 1)
+          | '#' when depth = 0 -> Some i
+          | _         -> scan (i + 1) ~basic ~lit ~depth
+    in
+    match scan (eq + 1) ~basic:false ~lit:false ~depth:0 with
+    | None -> None
+    | Some stop ->
+      let comment = String.sub line stop (n - stop) in
+      let span = String.sub line (eq + 1) (stop - eq - 1) in
+      let gap =
+        if comment = "" then ""
+        else begin
+          let j = ref (String.length span) in
+          while !j > 0 && (span.[!j - 1] = ' ' || span.[!j - 1] = '\t') do decr j done;
+          let ws = String.sub span !j (String.length span - !j) in
+          if ws = "" then "  " else ws
+        end
+      in
+      Some (String.sub line 0 (eq + 1) ^ " " ^ literal ^ gap ^ comment)
+
+(** Add [line] to table [path], after the table's last existing entry so
+    it lands under the right header, creating the header if needed. *)
+let insert_assignment lines ~path ~line =
+  let arr = Array.of_list lines in
+  let n = Array.length arr in
+  let cur = ref (Some []) in
+  let header_seen = ref (path = []) in
+  let last = ref None in
+  let first_header = ref None in
+  for i = 0 to n - 1 do
+    match parse_table_header arr.(i) with
+    | Some h ->
+      if !first_header = None then first_header := Some i;
+      cur := (if h.th_array then None else h.th_path);
+      if !cur = Some path then (header_seen := true; last := Some i)
+    | None ->
+      let t = String.trim arr.(i) in
+      if !cur = Some path && t <> "" && t.[0] <> '#' then last := Some i
+  done;
+  let insert_before =
+    match !last with
+    | Some i -> Some (i + 1)
+    | None ->
+      if not !header_seen then None
+      else match !first_header with
+        | Some i when path = [] -> Some i   (* keep top-level keys above tables *)
+        | _ -> Some n
+  in
+  match insert_before with
+  | Some i ->
+    Array.to_list (Array.sub arr 0 i) @ [line] @ Array.to_list (Array.sub arr i (n - i))
+  | None ->
+    let rec drop_trailing = function
+      | l :: rest when String.trim l = "" -> drop_trailing rest
+      | rest -> rest
+    in
+    let body = List.rev (drop_trailing (List.rev lines)) in
+    let sep = if body = [] then [] else [""] in
+    body @ sep @ ["[" ^ String.concat "." path ^ "]"; line; ""]
+
+(** Apply a scalar write to the config file's text.  [None] when the edit
+    is not expressible as a splice, or when the result does not read back
+    as the value asked for. *)
+let splice_scalar ~text ~keys ~key ~path (value : Otoml.t) =
+  match toml_scalar_literal value with
+  | None -> None
+  | Some literal ->
+    if not (List.for_all is_bare_key (key :: path)) then None
     else begin
-      let ast' = Otoml.update ast keys (Some value) in
-      let ast'' = ensure_orchestrator_in_ast ast' in
-      write_ast ast''
+      let lines = if String.trim text = "" then [] else String.split_on_char '\n' text in
+      let lines' =
+        match locate_assignment lines ~path ~key with
+        | Some i ->
+          (match replace_value_in_line (List.nth lines i) ~literal with
+           | Some l -> Some (List.mapi (fun j x -> if j = i then l else x) lines)
+           | None -> None)
+        | None ->
+          Some (insert_assignment lines ~path
+                  ~line:(Printf.sprintf "%s = %s" key literal))
+      in
+      match lines' with
+      | None -> None
+      | Some ls ->
+        let text' = String.concat "\n" ls in
+        let text' = if text' <> "" && text'.[String.length text' - 1] <> '\n'
+                    then text' ^ "\n" else text' in
+        (* Never write a file we cannot read back as what was asked for. *)
+        (match Otoml.Parser.from_string_result text' with
+         | Error _ -> None
+         | Ok ast ->
+           (try if Otoml.find ast (fun x -> x) keys = value then Some text' else None
+            with _ -> None))
     end
-  with exn -> Error (Printexc.to_string exn)
+
+(** Remove the assignment line for [keys] from the config text. *)
+let splice_removal ~text ~keys ~key ~path =
+  if not (List.for_all is_bare_key (key :: path)) then None
+  else begin
+    let lines = String.split_on_char '\n' text in
+    match locate_assignment lines ~path ~key with
+    | None -> None
+    | Some i ->
+      let text' = String.concat "\n" (List.filteri (fun j _ -> j <> i) lines) in
+      (match Otoml.Parser.from_string_result text' with
+       | Error _ -> None
+       | Ok ast ->
+         (try ignore (Otoml.find ast (fun x -> x) keys); None   (* still there *)
+          with _ -> Some text'))
+  end
+
+(** Read the config file as text, or [""] when there is none. *)
+let config_text () = Option.value ~default:"" (read_file_opt (config_path ()))
+
+(** The AST as last written, for the fallback paths. *)
+let config_ast_for_write text =
+  if String.trim text = "" then Otoml.TomlTable []
+  else (try Otoml.Parser.from_string text with _ -> Otoml.TomlTable [])
+
+let split_dotted dotted_key =
+  String.split_on_char '.' dotted_key |> List.filter (fun k -> k <> "")
+
+(** Set a (dotted) key to a TOML value in the config file, creating the
+    file and its directory as needed.  The user's comments, ordering and
+    indentation survive whenever the edit can be expressed as a splice;
+    otherwise the AST printer takes over.  Returns the config path. *)
+let set_toml_value dotted_key (value : Otoml.t) : (string, string) result =
+  let keys = split_dotted dotted_key in
+  match List.rev keys with
+  | [] -> Error "empty key"
+  | key :: rev_path ->
+    let path = List.rev rev_path in
+    let text = config_text () in
+    (match splice_scalar ~text ~keys ~key ~path value with
+     | Some text' -> write_config_text text'
+     | None ->
+       (try write_ast (Otoml.update (config_ast_for_write text) keys (Some value))
+        with exn -> Error (Printexc.to_string exn)))
+
+(** Remove a (dotted) key from the config file, so a setting falls back to
+    its default instead of being pinned to whatever was typed once. *)
+let unset_toml_value dotted_key : (string, string) result =
+  let keys = split_dotted dotted_key in
+  match List.rev keys with
+  | [] -> Error "empty key"
+  | key :: rev_path ->
+    let path = List.rev rev_path in
+    let text = config_text () in
+    let present =
+      match Otoml.Parser.from_string_result text with
+      | Error _ -> false
+      | Ok ast -> (try ignore (Otoml.find ast (fun x -> x) keys); true with _ -> false)
+    in
+    if not present then Error (Printf.sprintf "'%s' is not set" dotted_key)
+    else
+      (match splice_removal ~text ~keys ~key ~path with
+       | Some text' -> write_config_text text'
+       | None ->
+         (try write_ast (Otoml.update (config_ast_for_write text) keys None)
+          with exn -> Error (Printexc.to_string exn)))
 
 (** [set_value "model" "llama3.2"] — string input variant with type
     sniffing (ints, floats, bools become typed TOML values). *)
@@ -774,30 +1090,301 @@ let set_value dotted_key raw_value =
 let set_api_key provider key =
   set_toml_value ("api_keys." ^ provider) (Otoml.string key)
 
-(** Keys a settings UI should offer, with short descriptions and the
-    values they accept. Single source of truth for the REPL and web
-    settings surfaces. *)
-let editable_keys : (string * string * string) list = [
-  ("provider",    "Backend to talk to",                 "see `caravan providers`");
-  ("model",       "Model name",                         "provider-specific");
-  ("base_url",    "Endpoint override",                  "URL");
-  ("system",      "Extra system prompt (appended to the shipped default)", "text");
-  ("system_replace", "system replaces the shipped default instead of appending", "true | false");
-  ("stream",      "Stream tokens as they arrive",       "true | false");
-  ("max_turns",   "Agent turn budget",                  "integer");
-  ("nudge",       "Budget nudges in agent loops",       "true | false");
-  ("tool_call_mode", "Tool-call recognition",           "auto | native | text");
-  ("require_finish", "Agent runs must call finish to complete", "true | false");
-  ("summarize_model", "Model for compaction summaries",     "model name (default: session model)");
-  ("tool_profile", "Tool surface exposed to the model",     "auto | core | full");
-  ("permissions", "Mutating-tool policy",               "auto | ask | readonly");
-  ("provider_retry", "Provider error retry aggression", "off | low | medium | high");
-  ("provider_retry_base_delay", "Base backoff seconds between provider retries", "float");
-  ("transcript",  "JSONL session logs",                 "true | false");
-  ("strict_mode", "bash tool discipline",               "0 | 1 | 2");
-  ("enable_subagents", "Offer the delegate tool when [[subagents]] exist", "true | false");
-  ("verbose",     "Verbose tool call & trace output",   "true | false");
+(* ── The setting schema ─────────────────────────────────────────────────
+   One typed description of every user-editable setting.  It is the single
+   source of truth for `/config keys`, write validation, the web cockpit
+   form, and the doctor's config checks, so a new setting is declared once
+   and every surface picks it up.
+
+   The point of the types is that a setting knows what it accepts: writing
+   [model 3] used to store the integer 3, after which every read of the
+   model fell silently back to the provider default. *)
+
+type setting_kind =
+  | Bool
+  | Int   of int * int        (** inclusive bounds *)
+  | Float of float * float    (** inclusive bounds *)
+  | Enum  of string list      (** matched case-insensitively, stored canonical *)
+  | Str                       (** free text — never coerced to a number *)
+
+(** When a change takes effect, so a UI can say so instead of leaving the
+    user wondering why nothing happened. *)
+type setting_scope =
+  | Live         (** the running session picks it up on the next turn *)
+  | New_session  (** applies when the next session is created *)
+  | Restart      (** applies on the next process start *)
+
+type setting = {
+  key     : string;
+  kind    : setting_kind;
+  doc     : string;
+  default : string;          (** rendered default, for display only *)
+  env     : string option;   (** environment variable that shadows this key *)
+  scope   : setting_scope;
+}
+
+let settings : setting list = [
+  { key = "provider"; kind = Str; scope = New_session;
+    doc = "Backend to talk to"; default = "ollama";
+    env = Some "CARAVAN_PROVIDER" };
+  { key = "model"; kind = Str; scope = New_session;
+    doc = "Model name"; default = "provider default";
+    env = Some "CARAVAN_MODEL" };
+  { key = "base_url"; kind = Str; scope = New_session;
+    doc = "Endpoint override"; default = "provider default";
+    env = Some "CARAVAN_BASE_URL" };
+  { key = "system"; kind = Str; scope = New_session;
+    doc = "Extra system prompt (appended to the shipped default)"; default = "none";
+    env = None };
+  { key = "system_replace"; kind = Bool; scope = New_session;
+    doc = "system replaces the shipped default instead of appending";
+    default = "false"; env = Some "CARAVAN_SYSTEM_REPLACE" };
+  { key = "stream"; kind = Bool; scope = Live;
+    doc = "Stream tokens as they arrive"; default = "true";
+    env = Some "CARAVAN_STREAM" };
+  { key = "max_turns"; kind = Int (1, 1000); scope = Live;
+    doc = "Agent turn budget"; default = "24";
+    env = Some "CARAVAN_MAX_TURNS" };
+  { key = "nudge"; kind = Bool; scope = Live;
+    doc = "Budget nudges in agent loops"; default = "true";
+    env = Some "CARAVAN_NUDGE" };
+  { key = "tool_call_mode"; kind = Enum ["auto"; "native"; "text"]; scope = New_session;
+    doc = "Tool-call recognition"; default = "auto";
+    env = Some "CARAVAN_TOOL_CALL_MODE" };
+  { key = "require_finish"; kind = Bool; scope = Live;
+    doc = "Agent runs must call finish to complete"; default = "true";
+    env = Some "CARAVAN_REQUIRE_FINISH" };
+  { key = "summarize_model"; kind = Str; scope = Live;
+    doc = "Model for compaction summaries"; default = "session model";
+    env = Some "CARAVAN_SUMMARIZE_MODEL" };
+  { key = "tool_profile"; kind = Enum ["auto"; "core"; "full"]; scope = New_session;
+    doc = "Tool surface exposed to the model"; default = "auto";
+    env = Some "CARAVAN_TOOL_PROFILE" };
+  { key = "permissions"; kind = Enum ["auto"; "ask"; "readonly"]; scope = Live;
+    doc = "Mutating-tool policy"; default = "auto";
+    env = Some "CARAVAN_PERMISSIONS" };
+  { key = "provider_retry"; kind = Enum ["off"; "low"; "medium"; "high"];
+    scope = New_session; doc = "Provider error retry aggression"; default = "medium";
+    env = Some "CARAVAN_PROVIDER_RETRY" };
+  { key = "provider_retry_base_delay"; kind = Float (0.0, 30.0); scope = New_session;
+    doc = "Base backoff seconds between provider retries"; default = "0.5";
+    env = Some "CARAVAN_PROVIDER_RETRY_BASE_DELAY" };
+  { key = "transcript"; kind = Bool; scope = Restart;
+    doc = "JSONL session logs"; default = "true";
+    env = Some "CARAVAN_TRANSCRIPT" };
+  { key = "strict_mode"; kind = Int (0, 2); scope = Live;
+    doc = "bash tool discipline"; default = "0";
+    env = Some "CARAVAN_STRICT_MODE" };
+  { key = "enable_subagents"; kind = Bool; scope = Restart;
+    doc = "Offer the delegate tool when [[subagents]] exist"; default = "true";
+    env = Some "CARAVAN_SUBAGENTS" };
+  { key = "verbose"; kind = Bool; scope = Live;
+    doc = "Verbose tool call & trace output"; default = "false";
+    env = Some "CARAVAN_VERBOSE" };
 ]
+
+let find_setting key = List.find_opt (fun s -> s.key = key) settings
+
+(** The "accepts" column shown by `/config keys` and the web form. *)
+let accepts_of_kind = function
+  | Bool           -> "true | false"
+  | Int (lo, hi)   -> Printf.sprintf "integer %d-%d" lo hi
+  | Float (lo, hi) -> Printf.sprintf "number %g-%g" lo hi
+  | Enum vs        -> String.concat " | " vs
+  | Str            -> "text"
+
+let scope_note = function
+  | Live        -> "applies immediately"
+  | New_session -> "applies to new sessions"
+  | Restart     -> "applies on restart"
+
+(** Display triple kept for the surfaces that only render a table.
+    Derived from [settings] — never edited on its own. *)
+let editable_keys : (string * string * string) list =
+  List.map (fun s -> (s.key, s.doc, accepts_of_kind s.kind)) settings
+
+(** Parse [raw] against a setting's kind.  Errors are addressed to whoever
+    typed the value, not to a log. *)
+let validate_value s raw : (Otoml.t, string) result =
+  let raw = String.trim raw in
+  match s.kind with
+  | Bool ->
+    (match String.lowercase_ascii raw with
+     | "true"  | "1" | "yes" | "on"  -> Ok (Otoml.boolean true)
+     | "false" | "0" | "no"  | "off" -> Ok (Otoml.boolean false)
+     | _ -> Error (Printf.sprintf "%s expects true or false (got %s)" s.key raw))
+  | Int (lo, hi) ->
+    (match int_of_string_opt raw with
+     | Some i when i >= lo && i <= hi -> Ok (Otoml.integer i)
+     | Some i -> Error (Printf.sprintf "%s must be between %d and %d (got %d)" s.key lo hi i)
+     | None   -> Error (Printf.sprintf "%s expects a whole number (got %s)" s.key raw))
+  | Float (lo, hi) ->
+    (match float_of_string_opt raw with
+     | Some f when f >= lo && f <= hi -> Ok (Otoml.float f)
+     | Some f -> Error (Printf.sprintf "%s must be between %g and %g (got %g)" s.key lo hi f)
+     | None   -> Error (Printf.sprintf "%s expects a number (got %s)" s.key raw))
+  | Enum vs ->
+    let low = String.lowercase_ascii raw in
+    (match List.find_opt (fun v -> String.lowercase_ascii v = low) vs with
+     | Some v -> Ok (Otoml.string v)
+     | None ->
+       Error (Printf.sprintf "%s expects one of: %s (got %s)"
+                s.key (String.concat ", " vs) raw))
+  | Str ->
+    if raw = "" then
+      Error (Printf.sprintf "%s expects a value (use 'unset %s' to clear it)" s.key s.key)
+    else Ok (Otoml.string raw)   (* verbatim: a model named "3" is a string *)
+
+(** Levenshtein distance, used only to turn a typo into a suggestion. *)
+let edit_distance a b =
+  let la = String.length a and lb = String.length b in
+  if la = 0 then lb else if lb = 0 then la
+  else begin
+    let prev = Array.init (lb + 1) (fun j -> j) in
+    let cur = Array.make (lb + 1) 0 in
+    for i = 1 to la do
+      cur.(0) <- i;
+      for j = 1 to lb do
+        let cost = if a.[i - 1] = b.[j - 1] then 0 else 1 in
+        cur.(j) <- min (min (cur.(j - 1) + 1) (prev.(j) + 1)) (prev.(j - 1) + cost)
+      done;
+      Array.blit cur 0 prev 0 (lb + 1)
+    done;
+    prev.(lb)
+  end
+
+(** The closest known setting to a misspelling, if one is close enough. *)
+let suggest_key key =
+  let scored = List.map (fun s -> (edit_distance key s.key, s.key)) settings in
+  match List.sort compare scored with
+  | (d, k) :: _ when d <= 3 && d < String.length k -> Some k
+  | _ -> None
+
+(** Sections that hold user-chosen names rather than fixed settings, so a
+    dotted write into them is legitimate even though the leaf is not in
+    [settings]. *)
+let open_sections = ["api_keys"; "providers"; "spinner"; "orchestrator"; "capabilities"]
+
+(** Validate a write against the schema, then apply it.
+
+    An unknown bare key is refused with a suggestion.  Previously the typo
+    was written happily and every later read fell back to the default —
+    the setting simply never took effect, with nothing to show why. *)
+let set_checked dotted_key raw : (string, string) result =
+  match split_dotted dotted_key with
+  | [] -> Error "empty key"
+  | [bare] ->
+    (match find_setting bare with
+     | Some s -> Result.bind (validate_value s raw) (set_toml_value bare)
+     | None ->
+       Error (Printf.sprintf "unknown setting '%s'%s" bare
+                (match suggest_key bare with
+                 | Some k -> Printf.sprintf " — did you mean '%s'?" k
+                 | None   -> " (see /config keys for the list)")))
+  | section :: _ as parts ->
+    if not (List.mem section open_sections) then
+      Error (Printf.sprintf "unknown section '%s' (see /config keys for the list)" section)
+    else if section = "api_keys" then
+      (* Keys are stored verbatim: a numeric-looking key is still a string. *)
+      set_toml_value dotted_key (Otoml.string raw)
+    else
+      match find_setting (List.nth parts (List.length parts - 1)) with
+      | Some s -> Result.bind (validate_value s raw) (set_toml_value dotted_key)
+      | None   -> set_toml_value dotted_key (toml_value_of_string raw)
+
+(** Clear a setting so it falls back to its default. *)
+let unset_checked dotted_key : (string, string) result =
+  match split_dotted dotted_key with
+  | [] -> Error "empty key"
+  | [bare] when find_setting bare = None ->
+    Error (Printf.sprintf "unknown setting '%s'%s" bare
+             (match suggest_key bare with
+              | Some k -> Printf.sprintf " — did you mean '%s'?" k
+              | None   -> " (see /config keys for the list)"))
+  | _ -> unset_toml_value dotted_key
+
+(** [Some (var, value)] when an environment variable currently overrides
+    [key].  This is the usual answer to "I saved it, why is it not
+    taking effect?". *)
+let env_shadow key =
+  match find_setting key with
+  | Some { env = Some var; _ } ->
+    (match Sys.getenv_opt var with
+     | Some v when v <> "" -> Some (var, v)
+     | _ -> None)
+  | _ -> None
+
+(** The TOML type of a stored value, for diagnostics. *)
+let toml_type_name (v : Otoml.t) =
+  match v with
+  | Otoml.TomlString _ -> "string"       | Otoml.TomlInteger _ -> "integer"
+  | Otoml.TomlFloat _ -> "float"         | Otoml.TomlBoolean _ -> "boolean"
+  | Otoml.TomlArray _ -> "array"         | Otoml.TomlTable _ -> "table"
+  | Otoml.TomlInlineTable _ -> "inline table"
+  | Otoml.TomlTableArray _ -> "array of tables"
+  | _ -> "value"
+
+(** Top-level keys in the file that no setting describes — typos, or
+    settings that have been renamed. *)
+let unknown_keys () : string list =
+  match get_ast () with
+  | None -> []
+  | Some (Otoml.TomlTable fields) ->
+    List.filter_map (fun (k, v) ->
+      match v with
+      | Otoml.TomlTable _ | Otoml.TomlInlineTable _ | Otoml.TomlTableArray _ -> None
+      | _ -> if find_setting k = None then Some k else None) fields
+  | Some _ -> []
+
+(** Stored values whose TOML type the schema cannot accept, with an
+    explanation.  [model = 3] is the motivating case: legal TOML, read as
+    nothing, silently replaced by the default. *)
+let mistyped_keys () : (string * string) list =
+  let check_scalar s (v : Otoml.t) =
+    let bad expected =
+      let got = toml_type_name v in
+      let article = if String.contains "aeiou" got.[0] then "an" else "a" in
+      Some (Printf.sprintf "is %s %s; %s expects %s" article got s.key expected)
+    in
+    match s.kind, v with
+    | Bool, Otoml.TomlBoolean _ -> None
+    | Bool, _ -> bad "true or false"
+    | Int _, Otoml.TomlInteger _ -> None
+    | Int _, _ -> bad "a whole number"
+    | Float _, (Otoml.TomlFloat _ | Otoml.TomlInteger _) -> None
+    | Float _, _ -> bad "a number"
+    | (Str | Enum _), Otoml.TomlString _ -> None
+    | (Str | Enum _), _ -> bad "text"
+  in
+  let of_table fields =
+    List.filter_map (fun (k, v) ->
+      match find_setting k with
+      | None -> None
+      | Some s ->
+        match check_scalar s v with
+        | Some why -> Some (k, why)
+        | None ->
+          (* An enum also has to name one of its values. *)
+          match s.kind, v with
+          | Enum vs, Otoml.TomlString got
+            when not (List.exists (fun x ->
+                        String.lowercase_ascii x = String.lowercase_ascii got) vs) ->
+            Some (k, Printf.sprintf "is \"%s\"; %s expects one of: %s"
+                       got s.key (String.concat ", " vs))
+          | _ -> None) fields
+  in
+  match get_ast () with
+  | None -> []
+  | Some (Otoml.TomlTable fields) ->
+    let top = of_table fields in
+    let orch =
+      match List.assoc_opt "orchestrator" fields with
+      | Some (Otoml.TomlTable f) | Some (Otoml.TomlInlineTable f) ->
+        List.map (fun (k, why) -> ("orchestrator." ^ k, why)) (of_table f)
+      | _ -> []
+    in
+    top @ orch
+  | Some _ -> []
 
 (** Field descriptors for the subagent creation UI — single source of truth
     shared by the REPL and web cockpit.

@@ -34,7 +34,9 @@ let with_tmp_config ~name ~toml_content f =
   Config.reload ();
   Fun.protect
     ~finally:(fun () ->
-      (if Sys.file_exists path then Sys.remove path);
+      (* Writes are atomic and keep a backup, so clear the sidecars too. *)
+      List.iter (fun p -> if Sys.file_exists p then Sys.remove p)
+        [path; path ^ ".bak"; path ^ ".tmp"];
       Unix.putenv "CARAVAN_CONFIG" "";
       Config.reload ())
     (fun () -> f path)
@@ -1131,6 +1133,190 @@ let%test_unit "config_orchestrator_auto_population" =
   Sys.remove tmp;
   Unix.putenv "CARAVAN_CONFIG" "";
   Config.reload ()
+
+(* ── Config schema and comment-preserving writes ─────────────────────── *)
+
+(** A config as a user would actually write one: comments above keys,
+    comments beside them, a blank line, and tables in a chosen order. *)
+let annotated_config = "\
+# Caravan configuration\n\
+provider = \"ollama\"\n\
+model = \"qwen3:8b\"\n\
+\n\
+# Keep transcripts for auditing\n\
+transcript = true\n\
+permissions = \"auto\"    # auto | ask | readonly\n\
+\n\
+[api_keys]\n\
+openai = \"sk-1234\"\n\
+\n\
+[[subagents]]\n\
+name = \"coder\"\n\
+provider = \"ollama\"\n\
+model = \"qwen3:8b\"\n"
+
+let%test_unit "config_reads_never_write" =
+  with_tmp_config ~name:"test_cfg_pure_read" ~toml_content:annotated_config (fun path ->
+    let before = In_channel.with_open_bin path In_channel.input_all in
+    (* Every getter that a command might touch on the way to doing nothing. *)
+    ignore (Config.get_string "provider");
+    ignore (Config.get_int "max_turns");
+    ignore (Config.get_bool "stream");
+    ignore (Config.get_orchestrator ());
+    ignore (Config.get_subagents ());
+    ignore (Config.get_permission_mode ());
+    let after = In_channel.with_open_bin path In_channel.input_all in
+    (* Reading the config used to materialise an [orchestrator] table and
+       reprint the file, stripping every comment on the way through. *)
+    assert (before = after))
+
+let%test_unit "config_orchestrator_falls_back_without_writing" =
+  with_tmp_config ~name:"test_cfg_orch_mem"
+    ~toml_content:"provider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\n" (fun path ->
+    let before = In_channel.with_open_bin path In_channel.input_all in
+    assert (Config.get_orchestrator () = Some ("anthropic", "claude-haiku-4-5"));
+    assert (In_channel.with_open_bin path In_channel.input_all = before))
+
+let%test_unit "config_write_preserves_comments" =
+  with_tmp_config ~name:"test_cfg_comments" ~toml_content:annotated_config (fun path ->
+    let read () = In_channel.with_open_bin path In_channel.input_all in
+    let contains hay needle = Re.execp (Re.compile (Re.str needle)) hay in
+    (* An in-place edit keeps the line's comment and its neighbours. *)
+    (match Config.set_checked "permissions" "ask" with
+     | Ok _ -> () | Error e -> failwith e);
+    let text = read () in
+    assert (contains text "permissions = \"ask\"    # auto | ask | readonly");
+    assert (contains text "# Caravan configuration");
+    assert (contains text "# Keep transcripts for auditing");
+    (* Tables keep the order the user put them in. *)
+    let idx needle =
+      Re.Group.start (Re.exec (Re.compile (Re.str needle)) text) 0
+    in
+    assert (idx "[api_keys]" < idx "[[subagents]]");
+    (* A brand-new key lands among the top-level keys, above the tables. *)
+    (match Config.set_checked "max_turns" "40" with
+     | Ok _ -> () | Error e -> failwith e);
+    let text = read () in
+    assert (contains text "max_turns = 40");
+    assert (Config.get_int "max_turns" = Some 40);
+    assert (contains text "# Keep transcripts for auditing");
+    (* A key inside a table lands under that table's header. *)
+    (match Config.set_checked "api_keys.groq" "gsk_9" with
+     | Ok _ -> () | Error e -> failwith e);
+    assert (Config.get_api_key ~env_var:"NO_SUCH_ENV_VAR_XX" ~name:"groq" () = Some "gsk_9");
+    assert (Config.get_api_key ~env_var:"NO_SUCH_ENV_VAR_XX" ~name:"openai" () = Some "sk-1234");
+    (* The previous contents are recoverable. *)
+    assert (Sys.file_exists (path ^ ".bak"));
+    (try Sys.remove (path ^ ".bak") with _ -> ()))
+
+let%test_unit "config_set_checked_validation" =
+  with_tmp_config ~name:"test_cfg_validate" ~toml_content:"" (fun _ ->
+    (* [stored] is what the file should hold afterwards, read back through
+       the ordinary getters; [None] means the write must be refused. *)
+    let ok ~key ~value ~check =
+      match Config.set_checked key value with
+      | Error e -> failwith (Printf.sprintf "%s = %s rejected: %s" key value e)
+      | Ok _ -> assert (check ())
+    in
+    let refused ~key ~value =
+      match Config.set_checked key value with
+      | Ok _ -> failwith (Printf.sprintf "%s = %s should have been refused" key value)
+      | Error _ -> ()
+    in
+    (* Free text is never coerced to a number: a model named "3" is a
+       string, not the integer 3 that every later read would miss. *)
+    ok ~key:"model" ~value:"3" ~check:(fun () -> Config.get_string "model" = Some "3");
+    ok ~key:"model" ~value:"qwen3:8b"
+      ~check:(fun () -> Config.get_string "model" = Some "qwen3:8b");
+    (* Enums are canonicalised, not stored as typed. *)
+    ok ~key:"permissions" ~value:"ASK"
+      ~check:(fun () -> Config.get_string "permissions" = Some "ask");
+    (* Bools accept the spellings people actually type. *)
+    ok ~key:"stream" ~value:"no" ~check:(fun () -> Config.get_bool "stream" = Some false);
+    ok ~key:"stream" ~value:"yes" ~check:(fun () -> Config.get_bool "stream" = Some true);
+    ok ~key:"max_turns" ~value:"40" ~check:(fun () -> Config.get_int "max_turns" = Some 40);
+    ok ~key:"provider_retry_base_delay" ~value:"1.5"
+      ~check:(fun () -> Config.get_float "provider_retry_base_delay" = Some 1.5);
+    (* Floats accept an integer literal but stay floats in the file. *)
+    ok ~key:"provider_retry_base_delay" ~value:"2"
+      ~check:(fun () -> Config.get_float "provider_retry_base_delay" = Some 2.0);
+    (* API keys are verbatim strings whatever they look like. *)
+    ok ~key:"api_keys.openai" ~value:"12345"
+      ~check:(fun () ->
+        Config.get_api_key ~env_var:"NO_SUCH_ENV_VAR_XX" ~name:"openai" () = Some "12345");
+    (* Dotted writes into open sections still get schema types. *)
+    ok ~key:"orchestrator.max_turns" ~value:"7" ~check:(fun () -> true);
+    refused ~key:"permisions" ~value:"ask";       (* typo *)
+    refused ~key:"" ~value:"x";                   (* empty *)
+    refused ~key:"max_turns" ~value:"lots";       (* not a number *)
+    refused ~key:"max_turns" ~value:"0";          (* below the range *)
+    refused ~key:"max_turns" ~value:"99999";      (* above the range *)
+    refused ~key:"strict_mode" ~value:"3";        (* above the range *)
+    refused ~key:"permissions" ~value:"paranoid"; (* not one of the enum *)
+    refused ~key:"stream" ~value:"maybe";         (* not a bool *)
+    refused ~key:"model" ~value:"";               (* empty text *)
+    refused ~key:"nonsense.thing" ~value:"1")     (* unknown section *)
+
+let%test_unit "config_unset_restores_default" =
+  with_tmp_config ~name:"test_cfg_unset"
+    ~toml_content:"# keep me\nmax_turns = 40\npermissions = \"ask\"\n" (fun path ->
+    assert (Config.get_int "max_turns" = Some 40);
+    (match Config.unset_checked "max_turns" with
+     | Ok _ -> () | Error e -> failwith e);
+    assert (Config.get_int "max_turns" = None);
+    let text = In_channel.with_open_bin path In_channel.input_all in
+    assert (Re.execp (Re.compile (Re.str "# keep me")) text);
+    assert (Re.execp (Re.compile (Re.str "permissions = \"ask\"")) text);
+    (* Clearing something that is not set, or is not a setting at all. *)
+    (match Config.unset_checked "max_turns" with
+     | Error _ -> () | Ok _ -> failwith "unset of an unset key should fail");
+    (match Config.unset_checked "permisions" with
+     | Error _ -> () | Ok _ -> failwith "unset of an unknown key should fail");
+    (try Sys.remove (path ^ ".bak") with _ -> ()))
+
+let%test_unit "config_schema_diagnostics" =
+  with_tmp_config ~name:"test_cfg_diag" ~toml_content:"\
+provider = \"ollama\"\n\
+model = 3\n\
+permisions = \"ask\"\n\
+max_turns = \"lots\"\n\
+tool_profile = \"everything\"\n\
+transcript = true\n\
+[api_keys]\n\
+openai = \"sk\"\n" (fun _ ->
+    let unknown = Config.unknown_keys () in
+    assert (List.mem "permisions" unknown);
+    assert (not (List.mem "provider" unknown));
+    (* Tables are structure, not settings, so they are never "unknown". *)
+    assert (not (List.mem "api_keys" unknown));
+    let bad = List.map fst (Config.mistyped_keys ()) in
+    let check ~key ~expected = assert (List.mem key bad = expected) in
+    check ~key:"model" ~expected:true;          (* integer where text is wanted *)
+    check ~key:"max_turns" ~expected:true;      (* string where a number is wanted *)
+    check ~key:"tool_profile" ~expected:true;   (* not one of the enum values *)
+    check ~key:"provider" ~expected:false;
+    check ~key:"transcript" ~expected:false;
+    (* Every mistyped key comes with a sentence explaining itself. *)
+    List.iter (fun (_, why) -> assert (String.length why > 0)) (Config.mistyped_keys ()))
+
+let%test_unit "config_schema_is_well_formed" =
+  (* One source of truth: the display triple and the env-shadow lookup are
+     both derived from [settings], so they cannot drift out of step. *)
+  assert (List.length Config.editable_keys = List.length Config.settings);
+  List.iter (fun (s : Config.setting) ->
+    assert (s.Config.key <> "" && s.Config.doc <> "" && s.Config.default <> "");
+    assert (Config.find_setting s.Config.key = Some s);
+    assert (Config.accepts_of_kind s.Config.kind <> "");
+    (* A declared default must be a value the setting would itself accept. *)
+    (match s.Config.kind, Config.validate_value s s.Config.default with
+     | (Config.Str | Config.Float _), _ -> ()   (* prose defaults, e.g. "provider default" *)
+     | _, Ok _ -> ()
+     | _, Error e -> failwith (s.Config.key ^ ": " ^ e))
+  ) Config.settings;
+  (* Suggestions catch the near misses and stay quiet on the rest. *)
+  assert (Config.suggest_key "permisions" = Some "permissions");
+  assert (Config.suggest_key "max_turn" = Some "max_turns");
+  assert (Config.suggest_key "zzzzzzzzzzzz" = None)
 
 (* ── Cli_resolve tests ───────────────────────────────────────────────── *)
 

@@ -599,13 +599,7 @@ let of_json ~provider ?(tools = []) json =
 
 let default_checkpoint_path () =
   let dir = Config.log_dir () in
-  let rec mkdir_p path =
-    if not (Sys.file_exists path) then begin
-      mkdir_p (Filename.dirname path);
-      (try Unix.mkdir path 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
-    end
-  in
-  mkdir_p dir;
+  Config.mkdir_p dir;
   Filename.concat dir "last_checkpoint.json"
 
 let save_checkpoint ?path sess =

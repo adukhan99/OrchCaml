@@ -47,7 +47,7 @@ Typing `/` opens a live palette (Tab completes). Highlights:
 | `/model` · `/models` · `/provider` · `/providers` | switching |
 | `/subagents` | configured worker roster |
 | `/permissions [mode]` | `auto` \| `ask` \| `readonly`, live |
-| `/config` · `/config set k v` · `/config get k` · `/config keys` | settings |
+| `/config` · `/config keys` · `/config set k v` · `/config unset k` · `/config get k` · `/config edit` | settings |
 | `/key <provider>` | store an API key (hidden input) |
 | `/system` `/temp` `/top_p` `/top_k` `/max_tokens` `/seed` `/stop` | generation |
 | `/memory <n>` · `/summarise` | context window / compact now |

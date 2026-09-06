@@ -117,13 +117,7 @@ let jsonl_sink oc : sink =
     under [dir], register a JSONL sink for it, and return its path.
     Registers an [at_exit] close. *)
 let open_transcript ~dir =
-  let rec mkdir_p path =
-    if not (Sys.file_exists path) then begin
-      mkdir_p (Filename.dirname path);
-      (try Unix.mkdir path 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
-    end
-  in
-  mkdir_p dir;
+  Config.mkdir_p dir;
   let tm = Unix.localtime (Unix.gettimeofday ()) in
   let name =
     Printf.sprintf "session-%04d%02d%02d-%02d%02d%02d-%d.jsonl"

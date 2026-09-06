@@ -451,13 +451,22 @@ let config_snapshot () =
         | None -> `Null
   in
   let settings =
-    List.map (fun (key, desc, accepts) ->
+    List.map (fun (s : Config.setting) ->
       `Assoc [
-        ("key", `String key);
-        ("description", `String desc);
-        ("accepts", `String accepts);
-        ("value", value_of key);
-      ]) Config.editable_keys
+        ("key", `String s.Config.key);
+        ("description", `String s.Config.doc);
+        ("accepts", `String (Config.accepts_of_kind s.Config.kind));
+        ("default", `String s.Config.default);
+        ("effect", `String (Config.scope_note s.Config.scope));
+        ("choices", (match s.Config.kind with
+           | Config.Enum vs -> `List (List.map (fun v -> `String v) vs)
+           | Config.Bool -> `List [`String "true"; `String "false"]
+           | _ -> `Null));
+        ("env_shadow", (match Config.env_shadow s.Config.key with
+           | Some (var, _) -> `String var
+           | None -> `Null));
+        ("value", value_of s.Config.key);
+      ]) Config.settings
   in
   let providers =
     List.filter_map (fun (e : CaravanProviders.Registry.entry) ->
@@ -509,18 +518,20 @@ let callback st net clock _conn request body =
        let open Yojson.Safe.Util in
        let key = json |> member "key" |> to_string in
        let value = json |> member "value" |> to_string in
-       (* Only whitelisted keys are editable over HTTP. *)
-       if not (List.exists (fun (k, _, _) -> k = key) Config.editable_keys) then
+       (* Only schema settings are editable over HTTP: API keys have their
+          own endpoint, and nothing else is reachable from the browser. *)
+       if Config.find_setting key = None then
          json_response ~status:`Forbidden
            (`Assoc [("error", `String (key ^ " is not editable here"))])
        else
-         (match Config.set_value key value with
+         (match Config.set_checked key value with
           | Ok _ ->
             Trace.log "info" "web: config %s updated" key;
             json_response (`Assoc [("ok", `Bool true); ("note", `String
               "Saved. provider/model/base_url apply when the server restarts.")])
           | Error e ->
-            json_response ~status:`Internal_server_error
+            (* A rejected value is the caller's mistake, not the server's. *)
+            json_response ~status:`Bad_request
               (`Assoc [("error", `String e)]))
      with _ ->
        json_response ~status:`Bad_request

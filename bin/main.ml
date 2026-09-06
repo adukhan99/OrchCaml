@@ -192,8 +192,11 @@ let help_groups = [
        Some "Example: /mcp add github -- npx -y @modelcontextprotocol/server-github");
       ("/plugins", "List composed plugins; enable/disable by id", None);
       ("/config", "Show current settings", None);
+      ("/config keys", "Every editable setting, its value, and what it accepts", None);
       ("/config set <k> <v>", "Change a setting, saved to the config file",
        Some "Example: /config set permissions ask   (/config keys lists them)");
+      ("/config unset <k>", "Clear a setting, restoring its default", None);
+      ("/config edit", "Open the config file in $EDITOR (validated on save)", None);
       ("/key <provider>", "Store an API key (input hidden, file 0600)", None);
     ] };
   { title = "Exit";
@@ -667,41 +670,148 @@ let cmd_mcp net clock st rest =
         | Error e -> println_ansi (red ("  ✗ " ^ e)))
      | _ -> usage "/mcp" "[list | get <name> | add <name> -- <cmd> [args...] | remove <name>]")
 
-let cmd_config_set st key rest =
+(** Pad to a visible column width; [s] may already carry ANSI escapes. *)
+let pad_visible n s = s ^ String.make (max 0 (n - visible_width s)) ' '
+
+(** The value a key currently resolves to in the config file, as text. *)
+let config_value_string key =
+  match Config.get_string key with
+  | Some v -> Some v
+  | None ->
+    match Config.get_int key with
+    | Some i -> Some (string_of_int i)
+    | None ->
+      match Config.get_bool key with
+      | Some b -> Some (string_of_bool b)
+      | None -> Option.map (Printf.sprintf "%g") (Config.get_float key)
+
+(* Settings the running REPL can adopt without being restarted. *)
+let apply_live_setting key =
+  match key with
+  | "permissions" -> permission_mode := Config.get_permission_mode ()
+  | "verbose" | "spinner.verbose" ->
+    render_opts := { !render_opts with Render.verbose = Config.get_spinner_verbose () }
+  | _ -> ()
+
+(** Say when a change takes effect, and warn when the environment is
+    quietly overriding the file — the usual reason a saved setting
+    appears to do nothing at all. *)
+let report_effect key =
+  (match Config.find_setting key with
+   | Some { Config.scope = Config.Live; _ } | None -> ()
+   | Some { Config.scope = Config.New_session; _ } ->
+     println_ansi (dim "  Applies to new sessions — /provider and /model switch live.")
+   | Some { Config.scope = Config.Restart; _ } ->
+     println_ansi (dim "  Applies the next time Caravan starts."));
+  match Config.env_shadow key with
+  | Some (var, v) ->
+    println_ansi (yellow (Printf.sprintf
+      "  ⚠ %s=%s is set in your environment and overrides the config file." var v))
+  | None -> ()
+
+(** Report anything in the file the schema disagrees with. *)
+let report_config_problems () =
+  List.iter (fun k ->
+    println_ansi (yellow (Printf.sprintf "  ⚠ unknown setting '%s' in the config file%s" k
+      (match Config.suggest_key k with
+       | Some s -> Printf.sprintf " — did you mean '%s'?" s
+       | None -> ""))))
+    (Config.unknown_keys ());
+  List.iter (fun (k, why) ->
+    println_ansi (yellow (Printf.sprintf "  ⚠ %s %s" k why)))
+    (Config.mistyped_keys ())
+
+let cmd_config_set _st key rest =
     let value = String.concat " " rest in
-    (match Config.set_value key value with
+    (match Config.set_checked key value with
      | Ok path ->
        confirm "%s = %s  (saved to %s)" key value path;
-       (match key with
-        | "provider" | "model" | "base_url" ->
-          println_ansi (dim "  Applies to new sessions — use /provider or /model to switch live.")
-        | "permissions" ->
-          permission_mode := Config.get_permission_mode ()
-        | "verbose" | "spinner.verbose" ->
-          render_opts := { !render_opts with Render.verbose = Config.get_spinner_verbose () }
-        | _ -> ())
+       apply_live_setting key;
+       report_effect key
+     | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
+
+let cmd_config_unset key =
+    (match Config.unset_checked key with
+     | Ok path ->
+       let back =
+         match Config.find_setting key with
+         | Some s -> Printf.sprintf " — back to the default (%s)" s.Config.default
+         | None -> ""
+       in
+       confirm "%s cleared%s  (saved to %s)" key back path;
+       apply_live_setting key
      | Error e -> println_ansi (red (Printf.sprintf "  ✗ %s" e)))
 
 let cmd_config_get key =
-    (match Config.get_string key with
-     | Some v -> println_ansi (kv_line key (white v))
-     | None ->
-       match Config.get_int key with
-       | Some v -> println_ansi (kv_line key (white (string_of_int v)))
-       | None ->
-         match Config.get_bool key with
-         | Some b -> println_ansi (kv_line key (white (string_of_bool b)))
-         | None -> println_ansi (yellow (Printf.sprintf "  '%s' is not set" key)))
+    match config_value_string key with
+    | Some v ->
+      println_ansi (kv_line key (white v));
+      (match Config.env_shadow key with
+       | Some (var, ev) ->
+         println_ansi (yellow (Printf.sprintf
+           "  ⚠ overridden by %s=%s in your environment." var ev))
+       | None -> ())
+    | None ->
+      match Config.find_setting key with
+      | Some s ->
+        println_ansi (kv_line key (dim (Printf.sprintf "%s (default)" s.Config.default)))
+      | None -> println_ansi (yellow (Printf.sprintf "  '%s' is not set" key))
 
+(** Every editable setting, its current value, and what it accepts —
+    rendered straight from [Config.settings]. *)
 let cmd_config_keys () =
-    println_ansi (rule ~title:"Editable keys" ());
-    List.iter (fun (k, desc, accepts) ->
-      println_ansi (Printf.sprintf "  %s %s %s"
-        (cyan (Printf.sprintf "%-17s" k))
-        (Printf.sprintf "%-42s" (dim desc))
-        (dim accepts))
-    ) Config.editable_keys;
-    println_ansi (dim "\n  /config set <key> <value>   ·   /key <provider> to store an API key")
+    println_ansi (rule ~title:"Settings" ());
+    List.iter (fun (s : Config.setting) ->
+      let value =
+        match config_value_string s.Config.key with
+        | Some v -> white v
+        | None   -> dim s.Config.default
+      in
+      println_ansi (Printf.sprintf "  %s %s %s%s"
+        (pad_visible 28 (cyan s.Config.key))
+        (pad_visible 22 value)
+        (dim s.Config.doc)
+        (if Config.env_shadow s.Config.key <> None then yellow "  ⚠ env" else ""));
+      println_ansi (Printf.sprintf "  %s%s"
+        (String.make 28 ' ')
+        (dim (Config.accepts_of_kind s.Config.kind ^ "  ·  "
+              ^ Config.scope_note s.Config.scope)))
+    ) Config.settings;
+    println_ansi (dim "\n  /config set <key> <value>  ·  /config unset <key>  ·  /config edit");
+    println_ansi (dim "  Dim values are defaults — they are not in the file.  ⚠ env = shadowed.")
+
+(** Open the config in $EDITOR and refuse to keep an edit that no longer
+    parses: the previous contents go back and the error is reported.
+    Returns whether the file on disk is now valid. *)
+let cmd_config_edit () =
+    let path = Config.config_path () in
+    let editor =
+      match Sys.getenv_opt "VISUAL", Sys.getenv_opt "EDITOR" with
+      | Some e, _ when e <> "" -> e
+      | _, Some e when e <> "" -> e
+      | _ -> "nano"
+    in
+    if not (Sys.file_exists path) then
+      ignore (Config.write_config_text
+                "# Caravan configuration — see `caravan config keys`\n");
+    let before = Config.config_text () in
+    let rc = Sys.command (Printf.sprintf "%s %s" editor (Filename.quote path)) in
+    if rc <> 0 then
+      println_ansi (yellow (Printf.sprintf "  %s exited with status %d" editor rc));
+    Config.reload ();
+    (match Config.parse_check () with
+     | Error e ->
+       println_ansi (red (Printf.sprintf "  ✗ %s no longer parses: %s" path e));
+       (match Config.write_config_text before with
+        | Ok _    -> println_ansi (yellow "  Your previous config has been restored.")
+        | Error e -> println_ansi (red (Printf.sprintf "  ✗ could not restore it: %s" e)));
+       false
+     | Ok () ->
+       confirm "Reloaded %s" path;
+       report_config_problems ();
+       permission_mode := Config.get_permission_mode ();
+       render_opts := { !render_opts with Render.verbose = Config.get_spinner_verbose () };
+       true)
 
 let cmd_key rest =
     (match rest with
@@ -812,9 +922,13 @@ let handle_slash_command net clock st line =
 
   | "/config" :: "set" :: key :: rest when rest <> [] -> cmd_config_set st key rest
 
+  | ["/config"; "unset"; key] | ["/config"; "clear"; key] -> cmd_config_unset key
+
   | ["/config"; "get"; key] -> cmd_config_get key
 
-  | ["/config"; "keys"] -> cmd_config_keys ()
+  | ["/config"; "keys"] | ["/config"; "list"] -> cmd_config_keys ()
+
+  | ["/config"; "edit"] -> ignore (cmd_config_edit ())
 
   | "/key" :: rest -> cmd_key rest
 
@@ -878,7 +992,7 @@ let palette : Editor.command_info list =
     c "/tools" "" "available tools (✎ = mutating)";
     c "/mcp" "[list|add|get|remove]" "manage MCP tool servers";
     c "/plugins" "[enable|disable <id>]" "plugin composition and lifecycle states";
-    c "/config" "[set k v | get k | keys]" "show or edit settings";
+    c "/config" "[keys|set k v|unset k|get k|edit]" "show or edit settings";
     c "/key" "<provider>" "store an API key (hidden input)";
     c "/doctor" "" "run diagnostics";
     c "/init" "" "re-run the setup wizard";
@@ -1434,40 +1548,82 @@ let run_config args =
       let ic = open_in path in
       (try
          while true do print_endline (input_line ic) done
-       with End_of_file -> close_in ic)
+       with End_of_file -> close_in ic);
+      report_config_problems ()
     end else
       println_ansi (yellow (Printf.sprintf "No config file at %s (run 'caravan init')" path))
   | ["path"] -> print_endline path
   | ["get"; key] ->
-    (match Config.get_string key with
+    (match config_value_string key with
      | Some v -> print_endline v
      | None ->
-       match Config.get_int key with
-       | Some v -> print_endline (string_of_int v)
-       | None ->
-         match Config.get_bool key with
-         | Some b -> print_endline (string_of_bool b)
-         | None -> Printf.eprintf "Key '%s' not set.\n%!" key; exit 1)
-  | ["set"; key; value] ->
-    (match Config.set_value key value with
-     | Ok _ -> println_ansi (green (Printf.sprintf "✓ %s = %s" key value))
+       match Config.find_setting key with
+       | Some s -> print_endline s.Config.default
+       | None -> Printf.eprintf "Key '%s' not set.\n%!" key; exit 1)
+  | "set" :: key :: (_ :: _ as rest) ->
+    let value = String.concat " " rest in
+    (match Config.set_checked key value with
+     | Ok _ ->
+       println_ansi (green (Printf.sprintf "✓ %s = %s" key value));
+       (match Config.env_shadow key with
+        | Some (var, v) ->
+          println_ansi (yellow (Printf.sprintf
+            "⚠ %s=%s is set in your environment and overrides the config file." var v))
+        | None -> ())
+     | Error e -> Printf.eprintf "Error: %s\n%!" e; exit 1)
+  | ["unset"; key] ->
+    (match Config.unset_checked key with
+     | Ok _ -> println_ansi (green (Printf.sprintf "✓ %s cleared" key))
      | Error e -> Printf.eprintf "Error: %s\n%!" e; exit 1)
   | ["keys"] ->
-    List.iter (fun (k, desc, accepts) ->
-      Printf.printf "%-18s %-44s %s\n" k desc accepts
-    ) Config.editable_keys
+    List.iter (fun (s : Config.setting) ->
+      Printf.printf "%-28s %-22s %s\n"
+        s.Config.key
+        (Option.value ~default:s.Config.default (config_value_string s.Config.key))
+        s.Config.doc;
+      Printf.printf "%-28s %s  ·  %s\n" ""
+        (Config.accepts_of_kind s.Config.kind)
+        (Config.scope_note s.Config.scope)
+    ) Config.settings
+  | ["edit"] -> if not (cmd_config_edit ()) then exit 1
+  | ["check"] ->
+    (match Config.parse_check () with
+     | Error e -> Printf.eprintf "%s: %s\n%!" path e; exit 1
+     | Ok () ->
+       let unknown = Config.unknown_keys () and bad = Config.mistyped_keys () in
+       List.iter (fun k ->
+         Printf.eprintf "unknown setting '%s'%s\n" k
+           (match Config.suggest_key k with
+            | Some s -> Printf.sprintf " (did you mean '%s'?)" s
+            | None -> "")) unknown;
+       List.iter (fun (k, why) -> Printf.eprintf "%s %s\n" k why) bad;
+       if unknown = [] && bad = [] then
+         println_ansi (green (Printf.sprintf "✓ %s is valid" path))
+       else exit 1)
   | _ ->
-    Printf.eprintf "Usage: caravan config [show|path|keys|get KEY|set KEY VALUE]\n%!";
+    Printf.eprintf
+      "Usage: caravan config \
+       [show|path|keys|check|edit|get KEY|set KEY VALUE|unset KEY]\n%!";
     exit 2
 
 let config_cmd =
   let args = Arg.(value & pos_all string [] & info [] ~docv:"ACTION") in
-  let doc = "Show or edit the configuration file (show | path | get | set)." in
+  let doc = "Show or edit the configuration file (show | keys | check | get | set | unset)." in
   let man = [
     `S Manpage.s_examples;
+    `P "caravan config keys                       # every setting, its value, what it accepts"; `Noblank;
     `P "caravan config set model claude-sonnet-5"; `Noblank;
     `P "caravan config set permissions ask"; `Noblank;
+    `P "caravan config unset base_url             # fall back to the provider default"; `Noblank;
+    `P "caravan config check                      # validate the file against the schema"; `Noblank;
+    `P "caravan config edit                       # $EDITOR, restored if it stops parsing"; `Noblank;
     `P "caravan config get provider";
+    `S Manpage.s_description;
+    `P "Values are checked against the setting they are written to, so a \
+        mistyped key or an out-of-range value is refused instead of being \
+        stored and silently ignored. Edits preserve the file's comments, \
+        ordering, and layout, and the previous contents are kept as \
+        $(b,config.toml.bak).";
   ] in
   let info = Cmd.info "config" ~doc ~man in
   Cmd.v info Term.(const run_config $ args)
