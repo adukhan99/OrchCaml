@@ -1245,6 +1245,43 @@ let%test_unit "config_subagent_crud_preserves_comments" =
      | Error _ -> () | Ok _ -> failwith "removing a missing worker should fail");
     (try Sys.remove (path ^ ".bak") with _ -> ()))
 
+let%test_unit "config_mcp_crud_preserves_comments" =
+  with_tmp_config ~name:"test_cfg_mcp_comments" ~toml_content:annotated_config (fun path ->
+    let contains needle =
+      Re.execp (Re.compile (Re.str needle))
+        (In_channel.with_open_bin path In_channel.input_all)
+    in
+    let add name command args =
+      Config.add_mcp_server
+        { Config.name; transport = "stdio"; command; args }
+    in
+    (match add "github" "npx" ["-y"; "@modelcontextprotocol/server-github"] with
+     | Ok _ -> () | Error e -> failwith e);
+    (match add "files" "npx" ["-y"; "@modelcontextprotocol/server-filesystem"] with
+     | Ok _ -> () | Error e -> failwith e);
+    assert (contains "# Caravan configuration");
+    assert (contains "# Keep transcripts for auditing");
+    assert (List.map (fun (s : Config.mcp_server_config) -> s.name)
+              (Config.get_mcp_servers ()) = ["github"; "files"]);
+    (* Argument arrays survive the text round-trip. *)
+    (match Config.get_mcp_server "github" with
+     | Some s -> assert (s.args = ["-y"; "@modelcontextprotocol/server-github"])
+     | None -> failwith "github not readable back");
+    (match add "github" "npx" [] with
+     | Error _ -> () | Ok _ -> failwith "duplicate name should be refused");
+    (match Config.delete_mcp_server "github" with
+     | Ok _ -> () | Error e -> failwith e);
+    assert (List.map (fun (s : Config.mcp_server_config) -> s.name)
+              (Config.get_mcp_servers ()) = ["files"]);
+    assert (contains "# Caravan configuration");
+    assert (contains "openai = \"sk-1234\"");
+    (* The subagent that was already in the file is untouched. *)
+    assert (List.map (fun (c : Config.subagent_config) -> c.name)
+              (Config.get_subagents ()) = ["coder"]);
+    (match Config.delete_mcp_server "nobody" with
+     | Error _ -> () | Ok _ -> failwith "removing a missing server should fail");
+    (try Sys.remove (path ^ ".bak") with _ -> ()))
+
 let%test_unit "config_set_checked_validation" =
   with_tmp_config ~name:"test_cfg_validate" ~toml_content:"" (fun _ ->
     (* [stored] is what the file should hold afterwards, read back through

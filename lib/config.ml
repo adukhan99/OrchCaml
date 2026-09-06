@@ -74,6 +74,358 @@ let write_config_text text : (string, string) result =
     the splicer cannot reason about. *)
 let write_ast ast = write_config_text (Otoml.Printer.to_string ast)
 
+(* ── Comment-preserving TOML writes ─────────────────────────────────────
+   Reprinting the file from an otoml AST loses every comment and reorders
+   the user's tables.  A scalar write is therefore applied as a textual
+   splice: find the assignment line for the key inside its table and
+   replace only the value span, leaving indentation, ordering, and
+   trailing comments exactly as the user wrote them.
+
+   The spliced text is re-parsed and the value read back before anything
+   is written, so a splice that cannot be expressed — a multi-line value,
+   a quoted table path, a key living inside an array-of-tables — degrades
+   to the lossy AST printer rather than corrupting the file. *)
+
+let toml_string_literal s =
+  let buf = Buffer.create (String.length s + 2) in
+  Buffer.add_char buf '"';
+  String.iter (fun c ->
+    match c with
+    | '"'  -> Buffer.add_string buf "\\\""
+    | '\\' -> Buffer.add_string buf "\\\\"
+    | '\n' -> Buffer.add_string buf "\\n"
+    | '\r' -> Buffer.add_string buf "\\r"
+    | '\t' -> Buffer.add_string buf "\\t"
+    | c when Char.code c < 0x20 ->
+      Buffer.add_string buf (Printf.sprintf "\\u%04X" (Char.code c))
+    | c -> Buffer.add_char buf c) s;
+  Buffer.add_char buf '"';
+  Buffer.contents buf
+
+(** TOML distinguishes [1] (integer) from [1.0] (float), so a float
+    literal must keep a fraction or an exponent. *)
+let toml_float_literal f =
+  let s = Printf.sprintf "%.12g" f in
+  let marked =
+    String.exists (fun c -> c = '.' || c = 'e' || c = 'E' || c = 'n' || c = 'i') s
+  in
+  if marked then s else s ^ ".0"
+
+(** Render a scalar as TOML source.  [None] for composite values, which
+    the splicer leaves to the AST printer. *)
+let toml_scalar_literal (v : Otoml.t) =
+  match v with
+  | Otoml.TomlString s  -> Some (toml_string_literal s)
+  | Otoml.TomlInteger i -> Some (string_of_int i)
+  | Otoml.TomlFloat f   -> Some (toml_float_literal f)
+  | Otoml.TomlBoolean b -> Some (string_of_bool b)
+  | _ -> None
+
+(** A bare TOML key needs no quoting, and is the only shape the splicer
+    walks; anything else falls back to the AST. *)
+let is_bare_key k =
+  k <> "" &&
+  String.for_all (fun c ->
+    ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
+    || ('0' <= c && c <= '9') || c = '_' || c = '-') k
+
+type toml_header = {
+  th_path  : string list option;  (** [None] when the path is not bare *)
+  th_array : bool;                (** [[array of tables]] *)
+}
+
+(** [Some header] when the line opens a table.  A header we cannot read
+    still closes the previous table, so the walker must see it. *)
+let parse_table_header line =
+  let s = String.trim line in
+  let n = String.length s in
+  if n < 3 || s.[0] <> '[' then None
+  else begin
+    let is_array = s.[1] = '[' in
+    let open_len = if is_array then 2 else 1 in
+    let close = if is_array then "]]" else "]" in
+    let close_len = String.length close in
+    let rec find i =
+      if i + close_len > n then None
+      else if String.sub s i close_len = close then Some i
+      else find (i + 1)
+    in
+    match find open_len with
+    | None -> None
+    | Some i ->
+      let inner = String.trim (String.sub s open_len (i - open_len)) in
+      if inner = "" then None
+      else
+        let parts = String.split_on_char '.' inner |> List.map String.trim in
+        let bare = parts <> [] && List.for_all is_bare_key parts in
+        Some { th_path = (if bare then Some parts else None); th_array = is_array }
+  end
+
+(** Matches an assignment to [key] at the start of a line, bare or quoted. *)
+let assignment_re key =
+  let open Re in
+  compile (seq [ bos; rep (set " \t");
+                 alt [ str key;
+                       seq [char '"';  str key; char '"'];
+                       seq [char '\''; str key; char '\''] ];
+                 rep (set " \t"); char '=' ])
+
+(** Index of the line assigning [key] directly inside table [path].
+    Array-of-tables sections are skipped: a key inside one is ambiguous
+    (which element?), so those writes go to the AST. *)
+let locate_assignment lines ~path ~key =
+  let re = assignment_re key in
+  let cur = ref (Some []) in
+  let found = ref None in
+  List.iteri (fun i line ->
+    match parse_table_header line with
+    | Some h -> cur := (if h.th_array then None else h.th_path)
+    | None ->
+      if !found = None && !cur = Some path && Re.execp re line then found := Some i
+  ) lines;
+  !found
+
+(** Replace the value in an assignment line, keeping its indentation and
+    any trailing comment.  [None] when the value runs past the end of the
+    line (a multi-line string or array), which the splicer will not touch. *)
+let replace_value_in_line line ~literal =
+  match String.index_opt line '=' with
+  | None -> None
+  | Some eq ->
+    let n = String.length line in
+    (* Walk the value span tracking string and bracket state, so a '#'
+       inside a string is not mistaken for the start of a comment. *)
+    let rec scan i ~basic ~lit ~depth =
+      if i >= n then (if basic || lit || depth > 0 then None else Some n)
+      else
+        let c = line.[i] in
+        if basic then
+          if c = '\\' then scan (i + 2) ~basic ~lit ~depth
+          else scan (i + 1) ~basic:(c <> '"') ~lit ~depth
+        else if lit then scan (i + 1) ~basic ~lit:(c <> '\'') ~depth
+        else match c with
+          | '"'       -> scan (i + 1) ~basic:true ~lit ~depth
+          | '\''      -> scan (i + 1) ~basic ~lit:true ~depth
+          | '[' | '{' -> scan (i + 1) ~basic ~lit ~depth:(depth + 1)
+          | ']' | '}' -> scan (i + 1) ~basic ~lit ~depth:(depth - 1)
+          | '#' when depth = 0 -> Some i
+          | _         -> scan (i + 1) ~basic ~lit ~depth
+    in
+    match scan (eq + 1) ~basic:false ~lit:false ~depth:0 with
+    | None -> None
+    | Some stop ->
+      let comment = String.sub line stop (n - stop) in
+      let span = String.sub line (eq + 1) (stop - eq - 1) in
+      let gap =
+        if comment = "" then ""
+        else begin
+          let j = ref (String.length span) in
+          while !j > 0 && (span.[!j - 1] = ' ' || span.[!j - 1] = '\t') do decr j done;
+          let ws = String.sub span !j (String.length span - !j) in
+          if ws = "" then "  " else ws
+        end
+      in
+      Some (String.sub line 0 (eq + 1) ^ " " ^ literal ^ gap ^ comment)
+
+(** Add [line] to table [path], after the table's last existing entry so
+    it lands under the right header, creating the header if needed. *)
+let insert_assignment lines ~path ~line =
+  let arr = Array.of_list lines in
+  let n = Array.length arr in
+  let cur = ref (Some []) in
+  let header_seen = ref (path = []) in
+  let last = ref None in
+  let first_header = ref None in
+  for i = 0 to n - 1 do
+    match parse_table_header arr.(i) with
+    | Some h ->
+      if !first_header = None then first_header := Some i;
+      cur := (if h.th_array then None else h.th_path);
+      if !cur = Some path then (header_seen := true; last := Some i)
+    | None ->
+      let t = String.trim arr.(i) in
+      if !cur = Some path && t <> "" && t.[0] <> '#' then last := Some i
+  done;
+  let insert_before =
+    match !last with
+    | Some i -> Some (i + 1)
+    | None ->
+      if not !header_seen then None
+      else match !first_header with
+        | Some i when path = [] -> Some i   (* keep top-level keys above tables *)
+        | _ -> Some n
+  in
+  match insert_before with
+  | Some i ->
+    Array.to_list (Array.sub arr 0 i) @ [line] @ Array.to_list (Array.sub arr i (n - i))
+  | None ->
+    let rec drop_trailing = function
+      | l :: rest when String.trim l = "" -> drop_trailing rest
+      | rest -> rest
+    in
+    let body = List.rev (drop_trailing (List.rev lines)) in
+    let sep = if body = [] then [] else [""] in
+    body @ sep @ ["[" ^ String.concat "." path ^ "]"; line; ""]
+
+(** Apply a scalar write to the config file's text.  [None] when the edit
+    is not expressible as a splice, or when the result does not read back
+    as the value asked for. *)
+let splice_scalar ~text ~keys ~key ~path (value : Otoml.t) =
+  match toml_scalar_literal value with
+  | None -> None
+  | Some literal ->
+    if not (List.for_all is_bare_key (key :: path)) then None
+    else begin
+      let lines = if String.trim text = "" then [] else String.split_on_char '\n' text in
+      let lines' =
+        match locate_assignment lines ~path ~key with
+        | Some i ->
+          (match replace_value_in_line (List.nth lines i) ~literal with
+           | Some l -> Some (List.mapi (fun j x -> if j = i then l else x) lines)
+           | None -> None)
+        | None ->
+          Some (insert_assignment lines ~path
+                  ~line:(Printf.sprintf "%s = %s" key literal))
+      in
+      match lines' with
+      | None -> None
+      | Some ls ->
+        let text' = String.concat "\n" ls in
+        let text' = if text' <> "" && text'.[String.length text' - 1] <> '\n'
+                    then text' ^ "\n" else text' in
+        (* Never write a file we cannot read back as what was asked for. *)
+        (match Otoml.Parser.from_string_result text' with
+         | Error _ -> None
+         | Ok ast ->
+           (try if Otoml.find ast (fun x -> x) keys = value then Some text' else None
+            with _ -> None))
+    end
+
+(** Remove the assignment line for [keys] from the config text. *)
+let splice_removal ~text ~keys ~key ~path =
+  if not (List.for_all is_bare_key (key :: path)) then None
+  else begin
+    let lines = String.split_on_char '\n' text in
+    match locate_assignment lines ~path ~key with
+    | None -> None
+    | Some i ->
+      let text' = String.concat "\n" (List.filteri (fun j _ -> j <> i) lines) in
+      (match Otoml.Parser.from_string_result text' with
+       | Error _ -> None
+       | Ok ast ->
+         (try ignore (Otoml.find ast (fun x -> x) keys); None   (* still there *)
+          with _ -> Some text'))
+  end
+
+(** Read the config file as text, or [""] when there is none. *)
+let config_text () = Option.value ~default:"" (read_file_opt (config_path ()))
+
+(** The AST as last written, for the fallback paths. *)
+let config_ast_for_write text =
+  if String.trim text = "" then Otoml.TomlTable []
+  else (try Otoml.Parser.from_string text with _ -> Otoml.TomlTable [])
+
+let split_dotted dotted_key =
+  String.split_on_char '.' dotted_key |> List.filter (fun k -> k <> "")
+
+(** Render a value as TOML source for a freshly written block: scalars,
+    plus arrays of scalars (a subagent's tool list). *)
+let toml_inline_literal (v : Otoml.t) =
+  match toml_scalar_literal v with
+  | Some _ as s -> s
+  | None ->
+    match v with
+    | Otoml.TomlArray items ->
+      let parts = List.map toml_scalar_literal items in
+      if List.for_all Option.is_some parts then
+        Some ("[" ^ String.concat ", " (List.filter_map Fun.id parts) ^ "]")
+      else None
+    | _ -> None
+
+(** Append a [[path]] block with [pairs] to the config, as text.
+
+    Structural edits used to go through the AST printer, which meant
+    declaring a subagent silently deleted every comment in the file.
+    Appending is the one structural edit that is trivially expressible as
+    text, and it is the common one. [None] if any value cannot be
+    rendered, leaving the caller to fall back. *)
+let append_table_array ~path (pairs : (string * Otoml.t) list) =
+  let rendered = List.map (fun (k, v) -> (k, toml_inline_literal v)) pairs in
+  if path = [] || not (List.for_all is_bare_key path)
+  || not (List.for_all (fun (k, v) -> is_bare_key k && v <> None) rendered)
+  then None
+  else begin
+    let text = config_text () in
+    let lines = if String.trim text = "" then [] else String.split_on_char '\n' text in
+    let rec drop_trailing = function
+      | l :: rest when String.trim l = "" -> drop_trailing rest
+      | rest -> rest
+    in
+    let body = List.rev (drop_trailing (List.rev lines)) in
+    let block =
+      Printf.sprintf "[[%s]]" (String.concat "." path)
+      :: List.filter_map
+           (fun (k, v) -> Option.map (Printf.sprintf "%s = %s" k) v) rendered
+    in
+    let sep = if body = [] then [] else [""] in
+    let text' = String.concat "\n" (body @ sep @ block) ^ "\n" in
+    match Otoml.Parser.from_string_result text' with
+    | Error _ -> None
+    | Ok _ -> Some text'
+  end
+
+(** Remove the [[path]] block whose [name] field matches, as text: from
+    its header down to the line before the next table header. *)
+let remove_table_array ~path ~name =
+  let text = config_text () in
+  if String.trim text = "" then None
+  else begin
+    let arr = Array.of_list (String.split_on_char '\n' text) in
+    let n = Array.length arr in
+    let name_re = assignment_re "name" in
+    (* Walk the array-of-tables blocks, looking for the matching name. *)
+    let target = ref None in
+    let block_start = ref None in
+    let matched = ref false in
+    let close i =
+      match !block_start with
+      | Some s when !matched && !target = None -> target := Some (s, i)
+      | _ -> ()
+    in
+    for i = 0 to n - 1 do
+      match parse_table_header arr.(i) with
+      | Some h ->
+        close i;
+        if h.th_array && h.th_path = Some path then begin
+          block_start := Some i; matched := false
+        end else block_start := None
+      | None ->
+        if !block_start <> None && Re.execp name_re arr.(i) then
+          (* Compare the parsed value, so quoting style does not matter. *)
+          (match Otoml.Parser.from_string_result (String.trim arr.(i)) with
+           | Ok ast ->
+             (try if Otoml.find ast Otoml.get_string ["name"] = name then matched := true
+              with _ -> ())
+           | Error _ -> ())
+    done;
+    close n;
+    match !target with
+    | None -> None
+    | Some (s, e) ->
+      let keep i = i < s || i >= e in
+      let kept = List.filteri (fun i _ -> keep i) (Array.to_list arr) in
+      (* Collapse the blank line the removed block left behind. *)
+      let rec squeeze = function
+        | a :: b :: rest when String.trim a = "" && String.trim b = "" -> squeeze (b :: rest)
+        | x :: rest -> x :: squeeze rest
+        | [] -> []
+      in
+      let text' = String.concat "\n" (squeeze kept) in
+      (match Otoml.Parser.from_string_result text' with
+       | Error _ -> None
+       | Ok _ -> Some text')
+  end
+
 (* Helper: find a string value in AST at [keys]. *)
 let find_string_in_ast ast keys =
   try Some (Otoml.find ast Otoml.get_string keys)
@@ -405,10 +757,18 @@ let add_mcp_server (cfg : mcp_server_config) : (string, string) result =
             | _ -> []
           with _ -> []
         in
-        let new_arr = Otoml.TomlTableArray (existing_nodes @ [entry]) in
-        let ast' = Otoml.update ast ["mcp"; "servers"] (Some new_arr) in
-        let ast'' = ensure_orchestrator_in_ast ast' in
-        write_ast ast''
+        let pairs = [
+          ("name",      Otoml.string cfg.name);
+          ("transport", Otoml.string cfg.transport);
+          ("command",   Otoml.string cfg.command);
+          ("args",      Otoml.TomlArray (List.map Otoml.string cfg.args));
+        ] in
+        match append_table_array ~path:["mcp"; "servers"] pairs with
+        | Some text -> write_config_text text
+        | None ->
+          (* Fall back to the AST printer, which loses comments. *)
+          let new_arr = Otoml.TomlTableArray (existing_nodes @ [entry]) in
+          write_ast (Otoml.update ast ["mcp"; "servers"] (Some new_arr))
       end
     with exn -> Error (Printexc.to_string exn)
   end
@@ -438,14 +798,12 @@ let delete_mcp_server name : (string, string) result =
     in
     if List.length filtered = List.length existing_nodes then
       Error (Printf.sprintf "mcp server '%s' not found" name)
-    else begin
-      let value =
-        if filtered = [] then None
-        else Some (Otoml.TomlTableArray filtered)
-      in
-      let ast' = Otoml.update ast ["mcp"; "servers"] value in
-      write_ast ast'
-    end
+    else
+      match remove_table_array ~path:["mcp"; "servers"] ~name with
+      | Some text -> write_config_text text
+      | None ->
+        let value = if filtered = [] then None else Some (Otoml.TomlTableArray filtered) in
+        write_ast (Otoml.update ast ["mcp"; "servers"] value)
   with exn -> Error (Printexc.to_string exn)
 
 (** Read a TOML float field. Accepts both TomlFloat and TomlInteger. *)
@@ -785,358 +1143,6 @@ let toml_value_of_string s =
       | "true" -> Otoml.boolean true
       | "false" -> Otoml.boolean false
       | _ -> Otoml.string s
-
-(* ── Comment-preserving TOML writes ─────────────────────────────────────
-   Reprinting the file from an otoml AST loses every comment and reorders
-   the user's tables.  A scalar write is therefore applied as a textual
-   splice: find the assignment line for the key inside its table and
-   replace only the value span, leaving indentation, ordering, and
-   trailing comments exactly as the user wrote them.
-
-   The spliced text is re-parsed and the value read back before anything
-   is written, so a splice that cannot be expressed — a multi-line value,
-   a quoted table path, a key living inside an array-of-tables — degrades
-   to the lossy AST printer rather than corrupting the file. *)
-
-let toml_string_literal s =
-  let buf = Buffer.create (String.length s + 2) in
-  Buffer.add_char buf '"';
-  String.iter (fun c ->
-    match c with
-    | '"'  -> Buffer.add_string buf "\\\""
-    | '\\' -> Buffer.add_string buf "\\\\"
-    | '\n' -> Buffer.add_string buf "\\n"
-    | '\r' -> Buffer.add_string buf "\\r"
-    | '\t' -> Buffer.add_string buf "\\t"
-    | c when Char.code c < 0x20 ->
-      Buffer.add_string buf (Printf.sprintf "\\u%04X" (Char.code c))
-    | c -> Buffer.add_char buf c) s;
-  Buffer.add_char buf '"';
-  Buffer.contents buf
-
-(** TOML distinguishes [1] (integer) from [1.0] (float), so a float
-    literal must keep a fraction or an exponent. *)
-let toml_float_literal f =
-  let s = Printf.sprintf "%.12g" f in
-  let marked =
-    String.exists (fun c -> c = '.' || c = 'e' || c = 'E' || c = 'n' || c = 'i') s
-  in
-  if marked then s else s ^ ".0"
-
-(** Render a scalar as TOML source.  [None] for composite values, which
-    the splicer leaves to the AST printer. *)
-let toml_scalar_literal (v : Otoml.t) =
-  match v with
-  | Otoml.TomlString s  -> Some (toml_string_literal s)
-  | Otoml.TomlInteger i -> Some (string_of_int i)
-  | Otoml.TomlFloat f   -> Some (toml_float_literal f)
-  | Otoml.TomlBoolean b -> Some (string_of_bool b)
-  | _ -> None
-
-(** A bare TOML key needs no quoting, and is the only shape the splicer
-    walks; anything else falls back to the AST. *)
-let is_bare_key k =
-  k <> "" &&
-  String.for_all (fun c ->
-    ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
-    || ('0' <= c && c <= '9') || c = '_' || c = '-') k
-
-type toml_header = {
-  th_path  : string list option;  (** [None] when the path is not bare *)
-  th_array : bool;                (** [[array of tables]] *)
-}
-
-(** [Some header] when the line opens a table.  A header we cannot read
-    still closes the previous table, so the walker must see it. *)
-let parse_table_header line =
-  let s = String.trim line in
-  let n = String.length s in
-  if n < 3 || s.[0] <> '[' then None
-  else begin
-    let is_array = s.[1] = '[' in
-    let open_len = if is_array then 2 else 1 in
-    let close = if is_array then "]]" else "]" in
-    let close_len = String.length close in
-    let rec find i =
-      if i + close_len > n then None
-      else if String.sub s i close_len = close then Some i
-      else find (i + 1)
-    in
-    match find open_len with
-    | None -> None
-    | Some i ->
-      let inner = String.trim (String.sub s open_len (i - open_len)) in
-      if inner = "" then None
-      else
-        let parts = String.split_on_char '.' inner |> List.map String.trim in
-        let bare = parts <> [] && List.for_all is_bare_key parts in
-        Some { th_path = (if bare then Some parts else None); th_array = is_array }
-  end
-
-(** Matches an assignment to [key] at the start of a line, bare or quoted. *)
-let assignment_re key =
-  let open Re in
-  compile (seq [ bos; rep (set " \t");
-                 alt [ str key;
-                       seq [char '"';  str key; char '"'];
-                       seq [char '\''; str key; char '\''] ];
-                 rep (set " \t"); char '=' ])
-
-(** Index of the line assigning [key] directly inside table [path].
-    Array-of-tables sections are skipped: a key inside one is ambiguous
-    (which element?), so those writes go to the AST. *)
-let locate_assignment lines ~path ~key =
-  let re = assignment_re key in
-  let cur = ref (Some []) in
-  let found = ref None in
-  List.iteri (fun i line ->
-    match parse_table_header line with
-    | Some h -> cur := (if h.th_array then None else h.th_path)
-    | None ->
-      if !found = None && !cur = Some path && Re.execp re line then found := Some i
-  ) lines;
-  !found
-
-(** Replace the value in an assignment line, keeping its indentation and
-    any trailing comment.  [None] when the value runs past the end of the
-    line (a multi-line string or array), which the splicer will not touch. *)
-let replace_value_in_line line ~literal =
-  match String.index_opt line '=' with
-  | None -> None
-  | Some eq ->
-    let n = String.length line in
-    (* Walk the value span tracking string and bracket state, so a '#'
-       inside a string is not mistaken for the start of a comment. *)
-    let rec scan i ~basic ~lit ~depth =
-      if i >= n then (if basic || lit || depth > 0 then None else Some n)
-      else
-        let c = line.[i] in
-        if basic then
-          if c = '\\' then scan (i + 2) ~basic ~lit ~depth
-          else scan (i + 1) ~basic:(c <> '"') ~lit ~depth
-        else if lit then scan (i + 1) ~basic ~lit:(c <> '\'') ~depth
-        else match c with
-          | '"'       -> scan (i + 1) ~basic:true ~lit ~depth
-          | '\''      -> scan (i + 1) ~basic ~lit:true ~depth
-          | '[' | '{' -> scan (i + 1) ~basic ~lit ~depth:(depth + 1)
-          | ']' | '}' -> scan (i + 1) ~basic ~lit ~depth:(depth - 1)
-          | '#' when depth = 0 -> Some i
-          | _         -> scan (i + 1) ~basic ~lit ~depth
-    in
-    match scan (eq + 1) ~basic:false ~lit:false ~depth:0 with
-    | None -> None
-    | Some stop ->
-      let comment = String.sub line stop (n - stop) in
-      let span = String.sub line (eq + 1) (stop - eq - 1) in
-      let gap =
-        if comment = "" then ""
-        else begin
-          let j = ref (String.length span) in
-          while !j > 0 && (span.[!j - 1] = ' ' || span.[!j - 1] = '\t') do decr j done;
-          let ws = String.sub span !j (String.length span - !j) in
-          if ws = "" then "  " else ws
-        end
-      in
-      Some (String.sub line 0 (eq + 1) ^ " " ^ literal ^ gap ^ comment)
-
-(** Add [line] to table [path], after the table's last existing entry so
-    it lands under the right header, creating the header if needed. *)
-let insert_assignment lines ~path ~line =
-  let arr = Array.of_list lines in
-  let n = Array.length arr in
-  let cur = ref (Some []) in
-  let header_seen = ref (path = []) in
-  let last = ref None in
-  let first_header = ref None in
-  for i = 0 to n - 1 do
-    match parse_table_header arr.(i) with
-    | Some h ->
-      if !first_header = None then first_header := Some i;
-      cur := (if h.th_array then None else h.th_path);
-      if !cur = Some path then (header_seen := true; last := Some i)
-    | None ->
-      let t = String.trim arr.(i) in
-      if !cur = Some path && t <> "" && t.[0] <> '#' then last := Some i
-  done;
-  let insert_before =
-    match !last with
-    | Some i -> Some (i + 1)
-    | None ->
-      if not !header_seen then None
-      else match !first_header with
-        | Some i when path = [] -> Some i   (* keep top-level keys above tables *)
-        | _ -> Some n
-  in
-  match insert_before with
-  | Some i ->
-    Array.to_list (Array.sub arr 0 i) @ [line] @ Array.to_list (Array.sub arr i (n - i))
-  | None ->
-    let rec drop_trailing = function
-      | l :: rest when String.trim l = "" -> drop_trailing rest
-      | rest -> rest
-    in
-    let body = List.rev (drop_trailing (List.rev lines)) in
-    let sep = if body = [] then [] else [""] in
-    body @ sep @ ["[" ^ String.concat "." path ^ "]"; line; ""]
-
-(** Apply a scalar write to the config file's text.  [None] when the edit
-    is not expressible as a splice, or when the result does not read back
-    as the value asked for. *)
-let splice_scalar ~text ~keys ~key ~path (value : Otoml.t) =
-  match toml_scalar_literal value with
-  | None -> None
-  | Some literal ->
-    if not (List.for_all is_bare_key (key :: path)) then None
-    else begin
-      let lines = if String.trim text = "" then [] else String.split_on_char '\n' text in
-      let lines' =
-        match locate_assignment lines ~path ~key with
-        | Some i ->
-          (match replace_value_in_line (List.nth lines i) ~literal with
-           | Some l -> Some (List.mapi (fun j x -> if j = i then l else x) lines)
-           | None -> None)
-        | None ->
-          Some (insert_assignment lines ~path
-                  ~line:(Printf.sprintf "%s = %s" key literal))
-      in
-      match lines' with
-      | None -> None
-      | Some ls ->
-        let text' = String.concat "\n" ls in
-        let text' = if text' <> "" && text'.[String.length text' - 1] <> '\n'
-                    then text' ^ "\n" else text' in
-        (* Never write a file we cannot read back as what was asked for. *)
-        (match Otoml.Parser.from_string_result text' with
-         | Error _ -> None
-         | Ok ast ->
-           (try if Otoml.find ast (fun x -> x) keys = value then Some text' else None
-            with _ -> None))
-    end
-
-(** Remove the assignment line for [keys] from the config text. *)
-let splice_removal ~text ~keys ~key ~path =
-  if not (List.for_all is_bare_key (key :: path)) then None
-  else begin
-    let lines = String.split_on_char '\n' text in
-    match locate_assignment lines ~path ~key with
-    | None -> None
-    | Some i ->
-      let text' = String.concat "\n" (List.filteri (fun j _ -> j <> i) lines) in
-      (match Otoml.Parser.from_string_result text' with
-       | Error _ -> None
-       | Ok ast ->
-         (try ignore (Otoml.find ast (fun x -> x) keys); None   (* still there *)
-          with _ -> Some text'))
-  end
-
-(** Read the config file as text, or [""] when there is none. *)
-let config_text () = Option.value ~default:"" (read_file_opt (config_path ()))
-
-(** The AST as last written, for the fallback paths. *)
-let config_ast_for_write text =
-  if String.trim text = "" then Otoml.TomlTable []
-  else (try Otoml.Parser.from_string text with _ -> Otoml.TomlTable [])
-
-let split_dotted dotted_key =
-  String.split_on_char '.' dotted_key |> List.filter (fun k -> k <> "")
-
-(** Render a value as TOML source for a freshly written block: scalars,
-    plus arrays of scalars (a subagent's tool list). *)
-let toml_inline_literal (v : Otoml.t) =
-  match toml_scalar_literal v with
-  | Some _ as s -> s
-  | None ->
-    match v with
-    | Otoml.TomlArray items ->
-      let parts = List.map toml_scalar_literal items in
-      if List.for_all Option.is_some parts then
-        Some ("[" ^ String.concat ", " (List.filter_map Fun.id parts) ^ "]")
-      else None
-    | _ -> None
-
-(** Append a [[table]] block with [pairs] to the config, as text.
-
-    Structural edits used to go through the AST printer, which meant
-    declaring a subagent silently deleted every comment in the file.
-    Appending is the one structural edit that is trivially expressible as
-    text, and it is the common one. [None] if any value cannot be
-    rendered, leaving the caller to fall back. *)
-let append_table_array ~table (pairs : (string * Otoml.t) list) =
-  let rendered = List.map (fun (k, v) -> (k, toml_inline_literal v)) pairs in
-  if not (is_bare_key table)
-  || not (List.for_all (fun (k, v) -> is_bare_key k && v <> None) rendered)
-  then None
-  else begin
-    let text = config_text () in
-    let lines = if String.trim text = "" then [] else String.split_on_char '\n' text in
-    let rec drop_trailing = function
-      | l :: rest when String.trim l = "" -> drop_trailing rest
-      | rest -> rest
-    in
-    let body = List.rev (drop_trailing (List.rev lines)) in
-    let block =
-      Printf.sprintf "[[%s]]" table
-      :: List.filter_map
-           (fun (k, v) -> Option.map (Printf.sprintf "%s = %s" k) v) rendered
-    in
-    let sep = if body = [] then [] else [""] in
-    let text' = String.concat "\n" (body @ sep @ block) ^ "\n" in
-    match Otoml.Parser.from_string_result text' with
-    | Error _ -> None
-    | Ok _ -> Some text'
-  end
-
-(** Remove the [[table]] block whose [name] field matches, as text: from
-    its header down to the line before the next table header. *)
-let remove_table_array ~table ~name =
-  let text = config_text () in
-  if String.trim text = "" then None
-  else begin
-    let arr = Array.of_list (String.split_on_char '\n' text) in
-    let n = Array.length arr in
-    let name_re = assignment_re "name" in
-    (* Walk the array-of-tables blocks, looking for the matching name. *)
-    let target = ref None in
-    let block_start = ref None in
-    let matched = ref false in
-    let close i =
-      match !block_start with
-      | Some s when !matched && !target = None -> target := Some (s, i)
-      | _ -> ()
-    in
-    for i = 0 to n - 1 do
-      match parse_table_header arr.(i) with
-      | Some h ->
-        close i;
-        if h.th_array && h.th_path = Some [table] then begin
-          block_start := Some i; matched := false
-        end else block_start := None
-      | None ->
-        if !block_start <> None && Re.execp name_re arr.(i) then
-          (* Compare the parsed value, so quoting style does not matter. *)
-          (match Otoml.Parser.from_string_result (String.trim arr.(i)) with
-           | Ok ast ->
-             (try if Otoml.find ast Otoml.get_string ["name"] = name then matched := true
-              with _ -> ())
-           | Error _ -> ())
-    done;
-    close n;
-    match !target with
-    | None -> None
-    | Some (s, e) ->
-      let keep i = i < s || i >= e in
-      let kept = List.filteri (fun i _ -> keep i) (Array.to_list arr) in
-      (* Collapse the blank line the removed block left behind. *)
-      let rec squeeze = function
-        | a :: b :: rest when String.trim a = "" && String.trim b = "" -> squeeze (b :: rest)
-        | x :: rest -> x :: squeeze rest
-        | [] -> []
-      in
-      let text' = String.concat "\n" (squeeze kept) in
-      (match Otoml.Parser.from_string_result text' with
-       | Error _ -> None
-       | Ok _ -> Some text')
-  end
 
 (** Set a (dotted) key to a TOML value in the config file, creating the
     file and its directory as needed.  The user's comments, ordering and
@@ -1595,7 +1601,7 @@ let add_subagent (fields : (string * string) list) : (string, string) result =
         if dupe then Error (Printf.sprintf "subagent '%s' already exists" name)
         else begin
           let written =
-            match append_table_array ~table:"subagents" !pairs with
+            match append_table_array ~path:["subagents"] !pairs with
             | Some text -> write_config_text text
             | None ->
               (* Fall back to the AST printer, which loses comments. *)
@@ -1637,7 +1643,7 @@ let delete_subagent name : (string, string) result =
     if List.length filtered = List.length existing then
       Error (Printf.sprintf "subagent '%s' not found" name)
     else
-      match remove_table_array ~table:"subagents" ~name with
+      match remove_table_array ~path:["subagents"] ~name with
       | Some text -> write_config_text text
       | None ->
         let value = if filtered = [] then None else Some (Otoml.TomlTableArray filtered) in

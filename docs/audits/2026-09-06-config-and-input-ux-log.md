@@ -75,11 +75,13 @@ string, a multi-line array, and the same key present at top level, in
 `[orchestrator]`, and in `[[subagents]]`: the right one changed, and nothing
 else moved.
 
-Structural CRUD was left on the AST printer at first, and closed in phase 2
-once `/subagents add` made the loss reachable from the REPL:
-`append_table_array` writes a `[[subagents]]` block as text and
-`remove_table_array` deletes one by walking to the next header, both verified
-by re-parsing. The MCP commands still fall back to the AST printer.
+Structural CRUD was left on the AST printer at first, and closed once
+`/subagents add` made the loss reachable from the REPL: `append_table_array`
+writes a `[[path]]` block as text and `remove_table_array` deletes one by
+walking to the next header, both verified by re-parsing before anything is
+written. `[[subagents]]` and `[[mcp.servers]]` both go through them, so no
+command in the harness rewrites a config from the AST any more except as a
+fallback for something the text path cannot express.
 
 ### 2.2 The schema as the spine
 
@@ -244,7 +246,7 @@ through a pty. Splitting `bin` into a library plus a thin executable would make
 them testable directly, and is the obvious next structural move if that layer
 grows further.
 
-Still on the AST printer, and so still comment-destroying: the MCP add/remove
-commands. `append_table_array` and `remove_table_array` already do the work for
-`[[subagents]]`; pointing `add_mcp_server` and `delete_mcp_server` at them is a
-small, contained follow-up.
+`caravan mcp add` probes the server by launching it before writing anything,
+which means it blocks for as long as `npx` takes to fetch a package the first
+time, with one line of output and no timeout. That is pre-existing and out of
+scope here, but it is the next thing in this area worth fixing.
