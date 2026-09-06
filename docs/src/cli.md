@@ -36,7 +36,9 @@ Every command accepts `-p/--provider`, `-m/--model`, `--base-url`,
 
 ## REPL slash commands
 
-Typing `/` opens a live palette (Tab completes). Highlights:
+Typing `/` opens a live palette; Tab completes the command, and once one is
+typed, its arguments — `/config set <Tab>` offers the settings,
+`/provider <Tab>` the registry. Highlights:
 
 | Command | Effect |
 |---------|--------|
@@ -45,7 +47,7 @@ Typing `/` opens a live palette (Tab completes). Highlights:
 | `/nudge <text>` | steering note injected before the next model call |
 | `/lisp <program>` | evaluate a [Slip](slip.md) expression |
 | `/model` · `/models` · `/provider` · `/providers` | switching |
-| `/subagents` | configured worker roster |
+| `/subagents` · `/subagents add` · `/subagents remove [name]` | worker roster and CRUD |
 | `/permissions [mode]` | `auto` \| `ask` \| `readonly`, live |
 | `/config` · `/config keys` · `/config set k v` · `/config unset k` · `/config get k` · `/config edit` | settings |
 | `/key <provider>` | store an API key (hidden input) |
@@ -59,7 +61,15 @@ Typing `/` opens a live palette (Tab completes). Highlights:
 
 ## Line editor
 
-Arrows / Home / End / Delete edit the line; Up/Down recall persistent
-history (`~/.caravan/history`); Ctrl-A/E jump, Ctrl-K/U kill, Ctrl-W
-deletes a word, Ctrl-L clears the screen, Ctrl-C cancels the line
-(session survives), Ctrl-D on an empty line exits.
+| Keys | Effect |
+|------|--------|
+| `alt+enter` · `ctrl+o` | insert a line break — `enter` submits |
+| `ctrl+r` | search history; `enter` runs the match, `esc` cancels |
+| `tab` · `↑` `↓` | complete a command or its argument |
+| `↑` `↓` | move between rows, or walk history |
+| `ctrl+a` `ctrl+e` · `ctrl+k` `ctrl+u` `ctrl+w` | line start/end · kill to end, to start, previous word |
+| `ctrl+c` · `ctrl+d` | clear the line · exit on an empty one |
+
+Input is multi-line and soft-wraps, and pasting is bracketed: a pasted block
+arrives as **one** message and one history entry, however many lines it has.
+`/help` lists these in-session.

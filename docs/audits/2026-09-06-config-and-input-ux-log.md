@@ -20,7 +20,7 @@ per phase, so each stays independently reviewable.
 | **5** | One command registry behind `/help`, the palette, and Tab | **Done** |
 | **2** | A picker primitive (`select` / `form` / `confirm`) in `bin/` | **Done** |
 | **4** | Doctor checks that carry a fix, applied from the picker | **Done** |
-| 3 | The input line: multi-line, bracketed paste, no fork per keystroke | Planned |
+| **3** | The input line: multi-line, bracketed paste, no fork per keystroke | **Done** |
 
 Phases 0 and 1 landed together because 1 has no user-visible value until 0
 stops the file being rewritten underneath it. The remaining order puts the
@@ -197,12 +197,54 @@ One thing the loop taught us: pre-filling the setting editor with the stored
 value is wrong when the stored value is what the doctor is complaining about.
 It pre-fills only values that would validate.
 
-## 7. For the next phase
+## 7. Phase 3 — the input line
 
-Phase 3 is the last one: the line editor itself — multi-line editing, bracketed
-paste, a gap buffer, and Ctrl-R.
+The editor was a single row scrolled horizontally, with the buffer held as a
+`string list` rebuilt by two `List.filteri` calls per keystroke and indexed
+with `List.nth` inside loops. For an agentic harness that is the wrong shape
+twice over: what people type at one is long, and what they paste is longer.
 
-`bin/` is an executable, so `Commands` and `Picker` are not reachable from the
-test library; their behaviour is covered by driving the built binary through a
-pty. Splitting `bin` into a library plus a thin executable would make them
-testable directly, and is worth doing if that layer grows further.
+- **Multi-line.** The buffer lays out into display rows — an explicit newline
+  always breaks, and a row breaks when the next character will not fit — with
+  continuation rows indented to the prompt's width. `alt+enter` (or `ctrl+o`,
+  for terminals that swallow it) inserts a break; `enter` still submits.
+  Redrawing is anchored on the row the cursor was left on, so the widget
+  repaints in place however tall it has grown.
+- **Bracketed paste.** `ESC[?2004h` on entry, and a paste arrives as one
+  `Paste` event that `Tty.read_key` reads to its closing marker, normalising
+  line endings. Pasting a three-line block used to submit line 1 as a turn and
+  fire the other two at the model as further turns; it is now one message and
+  one history entry. History gained newline escaping so a multi-line entry
+  still occupies one line of the file, and old history files still load.
+- **A real buffer.** `Buf` is a growable array of UTF-8 characters with
+  capacity doubling — inserting at the end is amortised O(1), and everything
+  else is an `Array.blit` rather than two list rebuilds.
+- **`ctrl+r`** reverse history search, with `enter` running the match as
+  readline does and `esc` restoring what was being typed.
+- **Cursor arithmetic that survives wide characters.** `Ui.visible_width`
+  deliberately counts every three-byte sequence as one column so box-drawing
+  characters line up in tables; a cursor needs the real answer, so `Tty` has
+  its own `char_width` that decodes the codepoint and applies the East Asian
+  Wide ranges.
+
+One rule needed care: the plan said Up/Down should drive the palette when it
+is open and history otherwise, but recalling *any* slash command from history
+opens its palette, which then trapped Up. The palette takes the arrows only
+while `hist_pos = -1` — once you have stepped into history, Up keeps walking
+back. Tab completes either way.
+
+The new keys are listed by `/help` and named on the startup line, since
+nothing about `alt+enter` is discoverable otherwise.
+
+## 8. Notes for whoever is next
+
+`bin/` is an executable, so `Commands`, `Picker` and `Editor` are not reachable
+from the test library; their behaviour is covered by driving the built binary
+through a pty. Splitting `bin` into a library plus a thin executable would make
+them testable directly, and is the obvious next structural move if that layer
+grows further.
+
+Still on the AST printer, and so still comment-destroying: the MCP add/remove
+commands. `append_table_array` and `remove_table_array` already do the work for
+`[[subagents]]`; pointing `add_mcp_server` and `delete_mcp_server` at them is a
+small, contained follow-up.

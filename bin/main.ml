@@ -166,6 +166,14 @@ let print_help_grouped () =
       | None -> ()
     ) cmds
   ) (Commands.grouped ());
+  println_ansi (bold (yellow "\n  Keys"));
+  List.iter (fun (k, doc) ->
+    println_ansi (Printf.sprintf "    %s  %s" (cyan (pad_visible 30 k)) (dim doc)))
+    [ "alt+enter · ctrl+o",   "insert a line break (enter submits)";
+      "ctrl+r",               "search history; enter runs the match";
+      "tab · ↑↓",             "complete a command or its argument";
+      "ctrl+a/e · ctrl+k/u/w", "start/end of line · kill to end/start/word";
+      "ctrl+c · ctrl+d",      "clear the line · exit on an empty one" ];
   print_newline ()
 
 (* ── Interactive input helpers (shared by wizard and slash commands) ──── *)
@@ -1360,6 +1368,8 @@ let run_repl model_cli provider_cli base_url_cli system verbose =
       println_ansi (dim "  Type a message to chat, " ^ cyan "/help" ^
                     dim " for commands, " ^ cyan "/agent <task>" ^
                     dim " for autonomy.");
+      println_ansi (dim "  " ^ cyan "alt+enter" ^ dim " for a new line · " ^
+                    cyan "ctrl+r" ^ dim " to search history · paste is one message.");
       println_ansi (Printf.sprintf "  %s %s %s %s"
         (dim "Model") (bold (white model)) (dim "on") (bold (white provider_name)));
       (match transcript with
