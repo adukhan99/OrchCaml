@@ -168,6 +168,12 @@ let term_width () =
   | Some c -> (try max 40 (int_of_string c) with _ -> 80)
   | None -> 80
 
+(** Pad [s] on the right to [n] visible columns.  Unlike ["%-ns"] this
+    counts columns rather than bytes, so ANSI escapes and multi-byte
+    characters do not knock a table out of alignment. *)
+let pad_visible n s =
+  s ^ String.make (max 0 (n - visible_width s)) ' '
+
 (** Truncate [s] to [n] visible columns, appending an ellipsis. *)
 let truncate_visible s n =
   if visible_width s <= n then s

@@ -17,7 +17,7 @@ per phase, so each stays independently reviewable.
 |---|---|---|
 | **0** | Stop the data loss: pure reads, comment-preserving writes | **Done** |
 | **1** | A typed setting schema as the single source of truth | **Done** |
-| 5 | One command registry behind `/help`, the palette, and Tab | Planned |
+| **5** | One command registry behind `/help`, the palette, and Tab | **Done** |
 | 2 | A picker primitive (`select` / `form` / `confirm`) in `bin/` | Planned |
 | 4 | Doctor checks that carry a fix, applied from the picker | Planned |
 | 3 | The input line: multi-line, bracketed paste, no fork per keystroke | Planned |
@@ -111,12 +111,29 @@ from 82 test units to 89 — seven new ones, table-driven per AGENTS.md §7.3:
 `with_tmp_config` was extended to clear the `.bak`/`.tmp` sidecars the new
 writer leaves.
 
-## 4. For the next phase
+## 4. Phase 5 — one command registry
 
-Phase 5 (one command registry) is the cheapest remaining win and removes a
-live drift: `help_groups` and `palette` in `bin/main.ml` are separate
-hand-maintained lists, and `/help` currently omits `/doctor`, `/init`, `/web`,
-`/stop`, `/top_p`, `/top_k`, `/max_tokens` and `/seed`.
+`help_groups` and `palette` in `bin/main.ml` were two hand-maintained lists of
+the same thing, and they had drifted: `/help` no longer mentioned `/doctor`,
+`/init`, `/web`, `/stop`, `/top_p`, `/top_k`, `/max_tokens` or `/seed`. Both
+are gone, replaced by `bin/commands.ml` — one record per command carrying its
+name, aliases, argument sketch, doc, help group, example, and a completer.
+
+`/help` and the palette are now rendered from it, and `Editor.command_info`
+was deleted in favour of `Commands.t`, so the editor completes arguments as
+well as command names: the completer is called with the argument tokens typed
+so far and returns candidates for the last one. `/config set <Tab>` offers the
+settings, `/config set tool_profile <Tab>` offers `auto | core | full`,
+`/provider <Tab>` the registry, `/permissions <Tab>` the three modes, and
+`/mcp remove <Tab>` the configured servers — all read live, none of it
+hand-listed.
+
+Two smaller things fell out of having a registry: an unknown command now
+suggests the nearest real one, and a *known* command used with arguments it
+does not take answers with its usage line instead of "Unknown command:
+/config".
+
+## 5. For the next phase
 
 Phase 2's picker should take its value lists straight from
 `Config.setting_kind` — `Enum` is a list to arrow through, `Bool` a toggle,

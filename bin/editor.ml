@@ -10,17 +10,12 @@
     - arrow keys / Home / End / Delete / Backspace, Ctrl/Alt-Left/Right, Alt-B/F, Ctrl-A/E/K/U/W/L
     - Up/Down history, persisted to ~/.caravan/history (0600)
     - a fish-style palette: typing '/' filters commands live below the
-      input; Tab completes (cycling on ambiguity); Esc hides it
+      input, and once a command is typed it offers that command's own
+      argument candidates; Tab completes (cycling on ambiguity); Esc hides it
     - single-row horizontal scrolling (robust under any terminal width)
     - graceful fallback to [input_line] when stdin is not a TTY. *)
 
 open Caravan
-
-type command_info = {
-  name : string;   (** e.g. "/agent" *)
-  args : string;   (** e.g. "<task>" — display only *)
-  doc  : string;
-}
 
 (* ── Terminal plumbing ────────────────────────────────────────────────── *)
 
@@ -232,24 +227,57 @@ let word_right st =
   done;
   !i
 
-let matching_commands commands (line : string) =
+(* ── The completion palette ───────────────────────────────────────────── *)
+
+(** One row under the input: a command while the command is being typed,
+    a candidate value once its arguments are.  [pr_insert] is the whole
+    line Tab would write, or [""] for a row that is only a reminder. *)
+type palette_row = {
+  pr_label  : string;
+  pr_args   : string;
+  pr_doc    : string;
+  pr_insert : string;
+}
+
+let starts_with ~prefix s =
+  String.length s >= String.length prefix
+  && String.sub s 0 (String.length prefix) = prefix
+
+(** Rows for the line as typed so far.  Argument candidates come from the
+    command's own completer, so the palette knows about settings,
+    providers and MCP servers without knowing what any of them are. *)
+let palette_rows commands line =
   if String.length line = 0 || line.[0] <> '/' then []
   else
-    let first_token =
-      match String.index_opt line ' ' with
-      | Some i -> String.sub line 0 i
-      | None -> line
-    in
-    (* Once arguments are being typed, the palette has done its job. *)
-    if String.contains line ' ' then
-      List.filter (fun c -> c.name = first_token) commands
-    else
-      List.filter (fun c ->
-        String.length c.name >= String.length first_token
-        && String.sub c.name 0 (String.length first_token) = first_token
-      ) commands
+    match String.split_on_char ' ' line with
+    | [] -> []
+    | [name] ->
+      List.filter (fun (c : Commands.t) -> starts_with ~prefix:name c.Commands.name)
+        commands
+      |> List.map (fun (c : Commands.t) ->
+        { pr_label = c.Commands.name; pr_args = c.Commands.args;
+          pr_doc = c.Commands.doc; pr_insert = c.Commands.name ^ " " })
+    | name :: args ->
+      match List.find_opt (fun (c : Commands.t) ->
+              c.Commands.name = name || List.mem name c.Commands.aliases) commands with
+      | None -> []
+      | Some c ->
+        let n = List.length args in
+        let prefix = List.nth args (n - 1) in
+        let typed = List.filteri (fun i _ -> i < n - 1) args in
+        (match List.filter (starts_with ~prefix) (c.Commands.complete args) with
+         | [] ->
+           (* Nothing to offer: leave the command's own row as a reminder
+              of what it takes. *)
+           [ { pr_label = c.Commands.name; pr_args = c.Commands.args;
+               pr_doc = c.Commands.doc; pr_insert = "" } ]
+         | cands ->
+           List.map (fun v ->
+             { pr_label = v; pr_args = ""; pr_doc = "";
+               pr_insert = String.concat " " ((name :: typed) @ [v]) ^ " " })
+             cands)
 
-let max_palette = 6
+let max_palette = 8
 
 (** Redraw prompt + input (single row, horizontally scrolled) and the
     palette below; leave the cursor inside the input line. *)
@@ -279,17 +307,17 @@ let render ~prompt st ~commands =
     shown
     (if right_more then Ui.dim "…" else "");
   (* Palette below. *)
-  let matches = matching_commands commands (string_of_chars st.chars) in
+  let matches = palette_rows commands (string_of_chars st.chars) in
   let matches = List.filteri (fun i _ -> i < max_palette) matches in
   let rows = List.length matches in
-  List.iteri (fun i c ->
+  List.iteri (fun i r ->
     let selected = (st.tab_idx > 0) && ((st.tab_idx - 1) mod rows = i) in
     let marker = if selected then Ui.cyan "▸" else " " in
     Printf.printf "\n%s %s %s %s"
       marker
-      (if selected then Ui.bold (Ui.cyan c.name) else Ui.cyan c.name)
-      (Ui.yellow c.args)
-      (Ui.dim c.doc)
+      (if selected then Ui.bold (Ui.cyan r.pr_label) else Ui.cyan r.pr_label)
+      (Ui.yellow r.pr_args)
+      (Ui.dim r.pr_doc)
   ) matches;
   st.palette_rows <- rows;
   (* Return the cursor to its spot in the input row. *)
@@ -308,7 +336,7 @@ let cleanup st =
   flush stdout
 
 (** Read one line. Returns [None] on EOF (Ctrl-D on empty line). *)
-let read_line ~prompt ~(commands : command_info list) () : string option =
+let read_line ~prompt ~(commands : Commands.t list) () : string option =
   if not (Unix.isatty Unix.stdin) then
     (try Some (input_line stdin) with End_of_file -> None)
   else begin
@@ -402,17 +430,20 @@ let read_line ~prompt ~(commands : command_info list) () : string option =
            end
          | Tab ->
            let line = string_of_chars st.chars in
-           let matches = matching_commands commands line in
+           let matches = palette_rows commands line in
            let matches = List.filteri (fun i _ -> i < max_palette) matches in
-           (match matches with
+           (* Reminder rows carry nothing to insert. *)
+           (match List.filter (fun r -> r.pr_insert <> "") matches with
             | [] -> ()
             | [only] ->
-              set_line (only.name ^ " ");
+              set_line only.pr_insert;
               st.tab_idx <- 0
             | many ->
+              (* Cycle without the trailing space, so the next Tab keeps
+                 cycling this same set instead of starting a new argument. *)
               st.tab_idx <- st.tab_idx + 1;
               let pick = List.nth many ((st.tab_idx - 1) mod List.length many) in
-              set_line pick.name)
+              set_line (String.trim pick.pr_insert))
          | Esc -> st.tab_idx <- 0
          | Ctrl _ -> ());
         if not !finished then render ~prompt st ~commands

@@ -149,73 +149,23 @@ type repl_state = {
   mutable pending_nudge    : string option;
 }
 
-type help_group = {
-  title : string;
-  commands : (string * string * string option) list;
-}
-
-let help_groups = [
-  { title = "Chat";
-    commands = [
-      ("/agent <task>", "Let the AI work autonomously on a task",
-       Some "Example: /agent summarize the files in this directory");
-      ("/nudge <text>", "Queue a steering note for the next model call", None);
-      ("/lisp <program>", "Evaluate a Slip expression (the model's calculator)",
-       Some "Example: /lisp (mean (list 4 8 15 16 23 42))");
-      ("/system [text]", "Set instructions for the AI's personality", None);
-      ("/clear", "Start a fresh conversation", None);
-    ] };
-  { title = "Model and Provider";
-    commands = [
-      ("/model <name>", "Switch AI model",
-       Some "Example: /model claude-sonnet-5");
-      ("/provider <p> [url]", "Switch AI provider",
-       Some "Example: /provider anthropic");
-      ("/models", "Browse available models", None);
-      ("/providers", "List supported providers and key status", None);
-      ("/subagents", "Show configured subagent workers", None);
-    ] };
-  { title = "Safety and Tuning";
-    commands = [
-      ("/permissions <mode>", "Tool policy: auto | ask | readonly", None);
-      ("/temp <0.0-2.0>", "Creativity level (higher = more creative)", None);
-      ("/memory <n>", "How many messages to remember (0 = unlimited)", None);
-      ("/summarise", "Compress conversation to save memory", None);
-    ] };
-  { title = "Session";
-    commands = [
-      ("/history", "Show conversation so far", None);
-      ("/export [file]", "Save conversation to a file", None);
-      ("/resume [file]", "Restore conversation from a checkpoint", None);
-      ("/tools", "List available tools for the agent", None);
-      ("/mcp [list|add|get|remove]", "Manage MCP server connections and tools",
-       Some "Example: /mcp add github -- npx -y @modelcontextprotocol/server-github");
-      ("/plugins", "List composed plugins; enable/disable by id", None);
-      ("/config", "Show current settings", None);
-      ("/config keys", "Every editable setting, its value, and what it accepts", None);
-      ("/config set <k> <v>", "Change a setting, saved to the config file",
-       Some "Example: /config set permissions ask   (/config keys lists them)");
-      ("/config unset <k>", "Clear a setting, restoring its default", None);
-      ("/config edit", "Open the config file in $EDITOR (validated on save)", None);
-      ("/key <provider>", "Store an API key (input hidden, file 0600)", None);
-    ] };
-  { title = "Exit";
-    commands = [
-      ("/quit", "Exit Caravan", None);
-    ] };
-]
-
-let print_help_grouped groups =
-  List.iter (fun g ->
-    println_ansi (bold (yellow (Printf.sprintf "\n  %s" g.title)));
-    List.iter (fun (cmd, desc, ex) ->
+(** [/help], rendered from [Commands] so it can never fall behind the
+    commands the REPL actually accepts. *)
+let print_help_grouped () =
+  List.iter (fun (title, cmds) ->
+    println_ansi (bold (yellow (Printf.sprintf "\n  %s" title)));
+    List.iter (fun (c : Commands.t) ->
+      let label =
+        if c.Commands.args = "" then c.Commands.name
+        else c.Commands.name ^ " " ^ c.Commands.args
+      in
       println_ansi (Printf.sprintf "    %s  %s"
-        (cyan (Printf.sprintf "%-24s" cmd)) (dim desc));
-      match ex with
+        (cyan (pad_visible 30 label)) (dim c.Commands.doc));
+      match c.Commands.example with
       | Some e -> println_ansi (Printf.sprintf "      %s" (green e))
       | None -> ()
-    ) g.commands
-  ) groups;
+    ) cmds
+  ) (Commands.grouped ());
   print_newline ()
 
 (* ── Interactive input helpers (shared by wizard and slash commands) ──── *)
@@ -670,9 +620,6 @@ let cmd_mcp net clock st rest =
         | Error e -> println_ansi (red ("  ✗ " ^ e)))
      | _ -> usage "/mcp" "[list | get <name> | add <name> -- <cmd> [args...] | remove <name>]")
 
-(** Pad to a visible column width; [s] may already carry ANSI escapes. *)
-let pad_visible n s = s ^ String.make (max 0 (n - visible_width s)) ' '
-
 (** The value a key currently resolves to in the config file, as text. *)
 let config_value_string key =
   match Config.get_string key with
@@ -879,7 +826,7 @@ let handle_slash_command net clock st line =
     exit 0
 
   | ["/help"] | ["/?"] ->
-    print_help_grouped help_groups
+    print_help_grouped ()
 
   | "/agent" :: rest -> cmd_agent net clock st rest
 
@@ -959,47 +906,21 @@ let handle_slash_command net clock st line =
 
   | cmd :: _ ->
     if String.length cmd > 0 && cmd.[0] = '/' then
-      println_ansi (red (Printf.sprintf "  Unknown command: %s  (try /help)" cmd))
+      (match Commands.find cmd with
+       (* A command that exists, used with arguments it does not take:
+          answer with what it does take, not "unknown command". *)
+       | Some c -> usage c.Commands.name c.Commands.args
+       | None ->
+         println_ansi (red (Printf.sprintf "  Unknown command: %s%s" cmd
+           (match Commands.suggest cmd with
+            | Some s -> Printf.sprintf "  (did you mean %s?)" s
+            | None -> "  (try /help)"))))
     else ()
 
 (* ── REPL loop ────────────────────────────────────────────────────────── *)
 
-(** Every REPL command, for the live completion palette (and /help). *)
-let palette : Editor.command_info list =
-  let c name args doc = Editor.{ name; args; doc } in
-  [ c "/agent" "<task>" "run the agent autonomously on a task";
-    c "/nudge" "<text>" "queue a steering note for the next model call";
-    c "/lisp" "<program>" "evaluate a Slip expression, e.g. (sum (range 1 11))";
-    c "/system" "[text]" "set (or clear) the system prompt";
-    c "/clear" "" "start a fresh conversation";
-    c "/model" "<name>" "switch model";
-    c "/models" "" "browse models on this provider";
-    c "/provider" "<name> [url]" "switch provider";
-    c "/providers" "" "provider table with key status";
-    c "/subagents" "" "configured subagent workers";
-    c "/permissions" "[mode]" "tool policy: auto | ask | readonly";
-    c "/temp" "<0.0-2.0>" "sampling temperature";
-    c "/top_p" "<0.0-1.0>" "nucleus sampling";
-    c "/top_k" "<n>" "top-k sampling";
-    c "/max_tokens" "<n>" "response token cap";
-    c "/seed" "<n>" "sampling seed";
-    c "/stop" "[seq …]" "stop sequences (empty clears)";
-    c "/memory" "<n>" "context window in messages (0 = unlimited)";
-    c "/summarise" "" "compact the conversation now";
-    c "/history" "" "show the conversation so far";
-    c "/export" "[file]" "save the conversation as JSON";
-    c "/resume" "[file]" "restore conversation from a checkpoint";
-    c "/tools" "" "available tools (✎ = mutating)";
-    c "/mcp" "[list|add|get|remove]" "manage MCP tool servers";
-    c "/plugins" "[enable|disable <id>]" "plugin composition and lifecycle states";
-    c "/config" "[keys|set k v|unset k|get k|edit]" "show or edit settings";
-    c "/key" "<provider>" "store an API key (hidden input)";
-    c "/doctor" "" "run diagnostics";
-    c "/init" "" "re-run the setup wizard";
-    c "/web" "" "how to launch the web UI";
-    c "/help" "" "all commands, grouped";
-    c "/quit" "" "exit Caravan";
-  ]
+(* The command table lives in [Commands]; /help, the palette and Tab all
+   read it, so they cannot drift. *)
 
 let repl net clock st =
   let status_line () =
@@ -1019,7 +940,7 @@ let repl net clock st =
   let prompt_str = Printf.sprintf "%s " (bold (cyan "❯")) in
   let rec loop () =
     status_line ();
-    let line_opt = Editor.read_line ~prompt:prompt_str ~commands:palette () in
+    let line_opt = Editor.read_line ~prompt:prompt_str ~commands:Commands.all () in
     let line = match line_opt with
       | Some l -> String.trim l
       | None -> "/quit"
