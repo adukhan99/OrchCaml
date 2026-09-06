@@ -830,7 +830,7 @@ let edit_setting (s : Config.setting) =
        | Some `Clear -> clear ())
     | Config.Int _ | Config.Float _ | Config.Str ->
       let label =
-        Printf.sprintf "%s  %s" key (dim (Config.accepts_of_kind s.Config.kind))
+        Printf.sprintf "%s (%s)" key (Config.accepts_of_kind s.Config.kind)
       in
       (* Only offer the stored value for editing when it is one the
          setting would accept — when the stored value is itself the

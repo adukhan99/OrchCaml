@@ -181,7 +181,8 @@ let confirm ?(default = true) question =
 (* ── prompt ───────────────────────────────────────────────────────────── *)
 
 (** Read one line, offering [initial] as an editable starting value.
-    [None] if the user cancels. *)
+    [label] is plain text — it is styled here, so callers must not
+    pre-style it. [None] if the user cancels. *)
 let prompt ?(initial = "") label =
   let p = Printf.sprintf "  %s " (cyan (label ^ ":")) in
   match Editor.read_line ~initial ~prompt:p ~commands:[] () with
@@ -230,11 +231,14 @@ let form (fields : (string * string * string * bool) list) =
   let rec go acc = function
     | [] -> Some (List.rev acc)
     | (key, label, placeholder, required) :: rest ->
+      (* Plain text: [prompt] styles the whole label, and a nested style
+         would end the outer one at its own reset. *)
       let label =
         if placeholder = "" then label
-        else Printf.sprintf "%s %s" label (dim ("(" ^ placeholder ^ ")"))
+        else Printf.sprintf "%s (%s)" label placeholder
       in
-      (match prompt (if required then label else label ^ dim " ·optional") with
+      let label = if required then label else label ^ " — optional" in
+      (match prompt label with
        | None -> None
        | Some "" when required ->
          println_ansi (red (Printf.sprintf "  %s is required — cancelled." key));
